@@ -18,11 +18,17 @@ public class UpscalingImageProcessorKernel: CIImageProcessorKernel {
         output: any CIImageProcessorOutput
     ) throws {
         #if canImport(MetalFX)
-        guard let spatialScaler = arguments?["spatialScaler"] as? MTLFXSpatialScaler,
-              let inputTexture = inputs?.first?.metalTexture,
-              let outputTexture = output.metalTexture,
-              let commandBuffer = output.metalCommandBuffer else {
-            return
+        guard let spatialScaler = arguments?["spatialScaler"] as? MTLFXSpatialScaler else {
+            throw Error.missingSpatialScaler
+        }
+        guard let inputTexture = inputs?.first?.metalTexture else {
+            throw Error.missingInputTexture
+        }
+        guard let outputTexture = output.metalTexture else {
+            throw Error.missingOutputTexture
+        }
+        guard let commandBuffer = output.metalCommandBuffer else {
+            throw Error.missingCommandBuffer
         }
         spatialScaler.colorTexture = inputTexture
         if outputTexture.storageMode == .private {
@@ -30,13 +36,15 @@ public class UpscalingImageProcessorKernel: CIImageProcessorKernel {
             spatialScaler.encode(commandBuffer: commandBuffer)
         } else {
             guard let intermediateOutputTexture = arguments?["intermediateOutputTexture"] as? MTLTexture else {
-                return
+                throw Error.missingIntermediateOutputTexture
             }
             spatialScaler.outputTexture = intermediateOutputTexture
             spatialScaler.encode(commandBuffer: commandBuffer)
-            let blitCommandEncoder = commandBuffer.makeBlitCommandEncoder()
-            blitCommandEncoder?.copy(from: intermediateOutputTexture, to: outputTexture)
-            blitCommandEncoder?.endEncoding()
+            guard let blitCommandEncoder = commandBuffer.makeBlitCommandEncoder() else {
+                throw Error.couldNotMakeBlitCommandEncoder
+            }
+            blitCommandEncoder.copy(from: intermediateOutputTexture, to: outputTexture)
+            blitCommandEncoder.endEncoding()
         }
         #endif
     }
@@ -54,5 +62,18 @@ public class UpscalingImageProcessorKernel: CIImageProcessorKernel {
         #else
         return outputRect
         #endif
+    }
+}
+
+// MARK: - UpscalingImageProcessorKernel.Error
+
+extension UpscalingImageProcessorKernel {
+    enum Error: Swift.Error {
+        case missingSpatialScaler
+        case missingInputTexture
+        case missingOutputTexture
+        case missingCommandBuffer
+        case missingIntermediateOutputTexture
+        case couldNotMakeBlitCommandEncoder
     }
 }

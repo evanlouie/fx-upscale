@@ -50,6 +50,10 @@ public class UpscalingExportSession {
     public let progress: Progress
 
     public func export() async throws {
+        #if os(macOS)
+        defer { progress.unpublish() }
+        #endif
+
         guard !FileManager.default.fileExists(atPath: outputURL.path(percentEncoded: false)) else {
             throw Error.outputURLAlreadyExists
         }

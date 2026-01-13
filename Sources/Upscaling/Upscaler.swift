@@ -57,11 +57,13 @@ public final class Upscaler {
     ) async -> CVPixelBuffer {
         #if canImport(MetalFX)
         do {
-            let (commandBuffer, outputPixelBuffer) = try upscaleCommandBuffer(
-                pixelBuffer,
-                pixelBufferPool: pixelBufferPool,
-                outputPixelBuffer: outputPixelBuffer
-            )
+            let (commandBuffer, outputPixelBuffer) = try synchronizationQueue.sync {
+                try upscaleCommandBuffer(
+                    pixelBuffer,
+                    pixelBufferPool: pixelBufferPool,
+                    outputPixelBuffer: outputPixelBuffer
+                )
+            }
             try await withCheckedThrowingContinuation { continuation in
                 commandBuffer.addCompletedHandler { commandBuffer in
                     if let error = commandBuffer.error {
@@ -88,15 +90,17 @@ public final class Upscaler {
     ) -> CVPixelBuffer {
         #if canImport(MetalFX)
         do {
-            let (commandBuffer, outputPixelBuffer) = try upscaleCommandBuffer(
-                pixelBuffer,
-                pixelBufferPool: pixelBufferPool,
-                outputPixelBuffer: outputPixelBuffer
-            )
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            if commandBuffer.error != nil { return pixelBuffer }
-            return outputPixelBuffer
+            return try synchronizationQueue.sync {
+                let (commandBuffer, outputPixelBuffer) = try upscaleCommandBuffer(
+                    pixelBuffer,
+                    pixelBufferPool: pixelBufferPool,
+                    outputPixelBuffer: outputPixelBuffer
+                )
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                if commandBuffer.error != nil { return pixelBuffer }
+                return outputPixelBuffer
+            }
         } catch {
             return pixelBuffer
         }
@@ -113,11 +117,13 @@ public final class Upscaler {
     ) {
         #if canImport(MetalFX)
         do {
-            let (commandBuffer, outputPixelBuffer) = try upscaleCommandBuffer(
-                pixelBuffer,
-                pixelBufferPool: pixelBufferPool,
-                outputPixelBuffer: outputPixelBuffer
-            )
+            let (commandBuffer, outputPixelBuffer) = try synchronizationQueue.sync {
+                try upscaleCommandBuffer(
+                    pixelBuffer,
+                    pixelBufferPool: pixelBufferPool,
+                    outputPixelBuffer: outputPixelBuffer
+                )
+            }
             commandBuffer.addCompletedHandler { commandBuffer in
                 if commandBuffer.error != nil {
                     completionHandler(pixelBuffer)
@@ -142,6 +148,7 @@ public final class Upscaler {
     private let intermediateOutputTexture: MTLTexture
     private let textureCache: CVMetalTextureCache
     private let pixelBufferPool: CVPixelBufferPool
+    private let synchronizationQueue = DispatchQueue(label: "com.upscaling.Upscaler")
 
     private func upscaleCommandBuffer(
         _ pixelBuffer: CVPixelBuffer,
@@ -198,9 +205,11 @@ public final class Upscaler {
         spatialScaler.outputTexture = intermediateOutputTexture
         spatialScaler.encode(commandBuffer: commandBuffer)
 
-        let blitCommandEncoder = commandBuffer.makeBlitCommandEncoder()
-        blitCommandEncoder?.copy(from: intermediateOutputTexture, to: upscaledTexture)
-        blitCommandEncoder?.endEncoding()
+        guard let blitCommandEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw Error.couldNotMakeBlitCommandEncoder
+        }
+        blitCommandEncoder.copy(from: intermediateOutputTexture, to: upscaledTexture)
+        blitCommandEncoder.endEncoding()
 
         return (commandBuffer, outputPixelBuffer)
     }
@@ -215,5 +224,6 @@ extension Upscaler {
         case couldNotCreatePixelBuffer
         case couldNotCreateMetalTexture
         case couldNotMakeCommandBuffer
+        case couldNotMakeBlitCommandEncoder
     }
 }

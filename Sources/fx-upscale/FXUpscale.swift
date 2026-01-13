@@ -51,6 +51,10 @@ import Upscaling
         let height = height ??
             Int(inputSize.height * (CGFloat(width) / inputSize.width))
 
+        guard width > 0, height > 0 else {
+            throw ValidationError("Width and height must be positive integers")
+        }
+
         guard width <= UpscalingExportSession.maxOutputSize,
               height <= UpscalingExportSession.maxOutputSize else {
             throw ValidationError("Maximum supported width/height: 16384")
@@ -97,8 +101,8 @@ import Upscaling
             "using codec: \(effectiveCodec?.rawValue ?? "hevc")\(qualityInfo)"
         ].joined())
         ProgressBar.start(progress: exportSession.progress)
+        defer { ProgressBar.stop() }
         try await exportSession.export()
-        ProgressBar.stop()
         CommandLine.success("Video successfully upscaled!")
     }
 }
