@@ -11,7 +11,8 @@ import Upscaling
 
     @Option(name: .shortAndLong, help: "The output file width") var width: Int?
     @Option(name: .shortAndLong, help: "The output file height") var height: Int?
-    @Option(name: .shortAndLong, help: "Output codec: 'hevc', 'prores', or 'h264' (default: hevc)") var codec: String = "hevc"
+    @Option(name: .shortAndLong, help: "Output codec: 'hevc', 'prores', or 'h264' (default: h264)") var codec: String = "h264"
+    @Option(name: .shortAndLong, help: "Output quality: 1-100 (default: encoder default)") var quality: Int?
 
     mutating func run() async throws {
         guard ["mov", "m4v", "mp4"].contains(url.pathExtension.lowercased()) else {
@@ -20,6 +21,10 @@ import Upscaling
 
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ValidationError("File does not exist at \(url.path(percentEncoded: false))")
+        }
+
+        if let quality, !(1...100).contains(quality) {
+            throw ValidationError("Quality must be between 1 and 100")
         }
 
         let asset = AVAsset(url: url)
@@ -65,18 +70,31 @@ import Upscaling
             CommandLine.info("Forced ProRes conversion due to output size being larger than 14.5K (will fail otherwise)")
         }
 
+        let effectiveCodec = convertToProRes ? AVVideoCodecType.proRes422 : outputCodec
+        if quality != nil, effectiveCodec?.isProRes ?? false {
+            CommandLine.info("Quality setting is ignored for ProRes codec (ProRes uses fixed quality profiles)")
+        }
+
+        let normalizedQuality: Double? = if let quality, !(effectiveCodec?.isProRes ?? false) {
+            Double(quality) / 100.0
+        } else {
+            nil
+        }
+
         let exportSession = UpscalingExportSession(
             asset: asset,
-            outputCodec: convertToProRes ? .proRes422 : outputCodec,
+            outputCodec: effectiveCodec,
             preferredOutputURL: url.renamed { "\($0) Upscaled" },
             outputSize: outputSize,
+            quality: normalizedQuality,
             creator: ProcessInfo.processInfo.processName
         )
 
+        let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
         CommandLine.info([
             "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) ",
             "to \(Int(outputSize.width))x\(Int(outputSize.height)) ",
-            "using codec: \(outputCodec?.rawValue ?? "hevc")"
+            "using codec: \(effectiveCodec?.rawValue ?? "hevc")\(qualityInfo)"
         ].joined())
         ProgressBar.start(progress: exportSession.progress)
         try await exportSession.export()

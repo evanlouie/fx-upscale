@@ -11,10 +11,12 @@ public class UpscalingExportSession {
         outputCodec: AVVideoCodecType? = nil,
         preferredOutputURL: URL,
         outputSize: CGSize,
+        quality: Double? = nil,
         creator: String? = nil
     ) {
         self.asset = asset
         self.outputCodec = outputCodec
+        self.quality = quality
         if preferredOutputURL.pathExtension.lowercased() != "mov", outputCodec?.isProRes ?? false {
             outputURL = preferredOutputURL
                 .deletingPathExtension()
@@ -42,6 +44,7 @@ public class UpscalingExportSession {
     public let outputCodec: AVVideoCodecType?
     public let outputURL: URL
     public let outputSize: CGSize
+    public let quality: Double?
     public let creator: String?
 
     public let progress: Progress
@@ -78,7 +81,8 @@ public class UpscalingExportSession {
                     for: track,
                     formatDescription: formatDescription,
                     outputSize: outputSize,
-                    outputCodec: outputCodec
+                    outputCodec: outputCodec,
+                    quality: quality
                 ) else { continue }
 
             if assetReader.canAdd(assetReaderOutput) {
@@ -273,7 +277,8 @@ public class UpscalingExportSession {
         for track: AVAssetTrack,
         formatDescription: CMFormatDescription?,
         outputSize: CGSize,
-        outputCodec: AVVideoCodecType?
+        outputCodec: AVVideoCodecType?,
+        quality: Double?
     ) async throws -> AVAssetWriterInput? {
         switch track.mediaType {
         case .video:
@@ -291,10 +296,13 @@ public class UpscalingExportSession {
                     AVVideoYCbCrMatrixKey: colorYCbCrMatrix
                 ]
             }
+            var compressionProperties: [String: Any] = [:]
+            if let quality {
+                compressionProperties[kVTCompressionPropertyKey_Quality as String] = quality
+            }
             if #available(macOS 14.0, iOS 17.0, *),
                formatDescription?.hasLeftAndRightEye ?? false {
-                var compressionProperties: [CFString: Any] = [:]
-                compressionProperties[kVTCompressionPropertyKey_MVHEVCVideoLayerIDs] = [0, 1]
+                compressionProperties[kVTCompressionPropertyKey_MVHEVCVideoLayerIDs as String] = [0, 1]
                 if let extensions = formatDescription?.extensions {
                     for key in [
                         kVTCompressionPropertyKey_HeroEye,
@@ -305,10 +313,12 @@ public class UpscalingExportSession {
                         if let value = extensions.first(
                             where: { $0.key == key }
                         )?.value {
-                            compressionProperties[key] = value
+                            compressionProperties[key as String] = value
                         }
                     }
                 }
+            }
+            if !compressionProperties.isEmpty {
                 outputSettings[AVVideoCompressionPropertiesKey] = compressionProperties
             }
             let assetWriterInput = AVAssetWriterInput(
