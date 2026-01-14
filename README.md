@@ -28,7 +28,7 @@ OPTIONS:
 - Quality controls the VideoToolbox encoder constant quality (1 = lowest, 100 = highest). If not specified, the encoder default is used. Quality is ignored for ProRes codec.
 
 > [!NOTE]
-> When upscaling videos to >4k, `.mp4` files will be converted to `.mov` and `h264` or `hevc` codecs will be re-encoded as `proRes422`.  This is due to the fact that macOS struggles to play back >4k video `h264` and `hevc` files, and `h264` and `hevc` codecs only support up to ~8k.  If you have a use case for creating >4k `h264`/`hevc` `.mp4`'s, please open an issue.
+> When upscaling videos to >14.5K resolution, `.mp4` files will be converted to `.mov` and `h264` or `hevc` codecs will be re-encoded as `proRes422`. This is due to encoder limitations at extreme resolutions. If you have a use case for creating very large `h264`/`hevc` `.mp4`'s, please open an issue.
 
 ## Installation
 ### Homebrew
