@@ -13,6 +13,9 @@ public class UpscalingFilter: CIFilter {
         #if canImport(MetalFX)
         guard let device, let inputImage, let outputSize else { return nil }
 
+        lock.lock()
+        defer { lock.unlock() }
+
         if spatialScaler?.inputSize != inputImage.extent.size || spatialScaler?.outputSize != outputSize {
             let spatialScalerDescriptor = MTLFXSpatialScalerDescriptor()
             spatialScalerDescriptor.inputSize = inputImage.extent.size
@@ -52,6 +55,7 @@ public class UpscalingFilter: CIFilter {
     // MARK: Private
 
     private let device = MTLCreateSystemDefaultDevice()
+    private let lock = NSLock()
 
     #if canImport(MetalFX)
     private var spatialScaler: MTLFXSpatialScaler?

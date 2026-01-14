@@ -41,6 +41,10 @@ import Upscaling
         let naturalSize = try await videoTrack.load(.naturalSize)
         let inputSize = dimensions ?? naturalSize
 
+        guard inputSize.width > 0, inputSize.height > 0 else {
+            throw ValidationError("Invalid input video dimensions: \(Int(inputSize.width))x\(Int(inputSize.height)). The video file may be corrupted.")
+        }
+
         // 1. Use passed in width/height
         // 2. Use proportional width/height if only one is specified
         // 3. Default to 2x upscale
@@ -62,9 +66,10 @@ import Upscaling
 
         let outputSize = CGSize(width: width, height: height)
         let outputCodec: AVVideoCodecType? = switch codec.lowercased() {
+        case "hevc": .hevc
         case "prores": .proRes422
         case "h264": .h264
-        default: .hevc
+        default: throw ValidationError("Invalid codec '\(codec)'. Supported codecs: hevc, prores, h264")
         }
 
         // Through anecdotal tests anything beyond 14.5K fails to encode for anything other than ProRes

@@ -170,12 +170,15 @@ public class UpscalingExportSession {
                             )
                         case let .spatialVideo(output, input, inputSize, adaptor):
                             if #available(macOS 14.0, iOS 17.0, *) {
+                                guard let taggedAdaptor = adaptor as? AVAssetWriterInputTaggedPixelBufferGroupAdaptor else {
+                                    throw Error.invalidTaggedBufferAdaptor
+                                }
                                 let progress = Progress(totalUnitCount: Int64(duration.seconds))
                                 self.progress.addChild(progress, withPendingUnitCount: 10)
                                 try await Self.processSpatialVideoSamples(
                                     from: output,
                                     to: input,
-                                    adaptor: adaptor as! AVAssetWriterInputTaggedPixelBufferGroupAdaptor,
+                                    adaptor: taggedAdaptor,
                                     inputSize: inputSize,
                                     outputSize: outputSize,
                                     progress: progress
@@ -350,11 +353,13 @@ public class UpscalingExportSession {
         progress: Progress
     ) async throws {
         try await withCheckedThrowingContinuation { continuation in
+            var hasResumed = false
             let queue = DispatchQueue(
                 label: "\(String(describing: Self.self)).audio.\(UUID().uuidString)",
                 qos: .userInitiated
             )
             assetWriterInput.requestMediaDataWhenReady(on: queue) {
+                guard !hasResumed else { return }
                 while assetWriterInput.isReadyForMoreMediaData {
                     if let nextSampleBuffer = assetReaderOutput.copyNextSampleBuffer() {
                         if nextSampleBuffer.presentationTimeStamp.isNumeric {
@@ -362,11 +367,13 @@ public class UpscalingExportSession {
                         }
                         guard assetWriterInput.append(nextSampleBuffer) else {
                             assetWriterInput.markAsFinished()
+                            hasResumed = true
                             continuation.resume()
                             return
                         }
                     } else {
                         assetWriterInput.markAsFinished()
+                        hasResumed = true
                         continuation.resume()
                         return
                     }
@@ -387,11 +394,13 @@ public class UpscalingExportSession {
             throw Error.failedToCreateUpscaler
         }
         try await withCheckedThrowingContinuation { continuation in
+            var hasResumed = false
             let queue = DispatchQueue(
                 label: "\(String(describing: Self.self)).video.\(UUID().uuidString)",
                 qos: .userInitiated
             )
             assetWriterInput.requestMediaDataWhenReady(on: queue) {
+                guard !hasResumed else { return }
                 while assetWriterInput.isReadyForMoreMediaData {
                     if let nextSampleBuffer = assetReaderOutput.copyNextSampleBuffer() {
                         if nextSampleBuffer.presentationTimeStamp.isNumeric {
@@ -410,16 +419,19 @@ public class UpscalingExportSession {
                                 withPresentationTime: nextSampleBuffer.presentationTimeStamp
                             ) else {
                                 assetWriterInput.markAsFinished()
+                                hasResumed = true
                                 continuation.resume()
                                 return
                             }
                         } else {
                             assetWriterInput.markAsFinished()
+                            hasResumed = true
                             continuation.resume(throwing: Error.missingImageBuffer)
                             return
                         }
                     } else {
                         assetWriterInput.markAsFinished()
+                        hasResumed = true
                         continuation.resume()
                         return
                     }
@@ -440,11 +452,13 @@ public class UpscalingExportSession {
             throw Error.failedToCreateUpscaler
         }
         try await withCheckedThrowingContinuation { continuation in
+            var hasResumed = false
             let queue = DispatchQueue(
                 label: "\(String(describing: Self.self)).spatialvideo.\(UUID().uuidString)",
                 qos: .userInitiated
             )
             assetWriterInput.requestMediaDataWhenReady(on: queue) {
+                guard !hasResumed else { return }
                 while assetWriterInput.isReadyForMoreMediaData {
                     if let nextSampleBuffer = assetReaderOutput.copyNextSampleBuffer() {
                         if nextSampleBuffer.presentationTimeStamp.isNumeric {
@@ -465,6 +479,7 @@ public class UpscalingExportSession {
                                   case let .pixelBuffer(leftEyePixelBuffer) = leftEyeBuffer,
                                   case let .pixelBuffer(rightEyePixelBuffer) = rightEyeBuffer else {
                                 assetWriterInput.markAsFinished()
+                                hasResumed = true
                                 continuation.resume(throwing: Error.invalidTaggedBuffers)
                                 return
                             }
@@ -489,16 +504,19 @@ public class UpscalingExportSession {
                                 withPresentationTime: nextSampleBuffer.presentationTimeStamp
                             ) else {
                                 assetWriterInput.markAsFinished()
+                                hasResumed = true
                                 continuation.resume()
                                 return
                             }
                         } else {
                             assetWriterInput.markAsFinished()
+                            hasResumed = true
                             continuation.resume(throwing: Error.missingTaggedBuffers)
                             return
                         }
                     } else {
                         assetWriterInput.markAsFinished()
+                        hasResumed = true
                         continuation.resume()
                         return
                     }
@@ -518,6 +536,7 @@ public extension UpscalingExportSession {
         case missingImageBuffer
         case missingTaggedBuffers
         case invalidTaggedBuffers
+        case invalidTaggedBufferAdaptor
         case failedToCreateUpscaler
     }
 }

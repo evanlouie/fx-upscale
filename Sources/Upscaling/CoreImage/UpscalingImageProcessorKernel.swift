@@ -6,6 +6,11 @@ import MetalFX
 
 // MARK: - UpscalingImageProcessorKernel
 
+/// A CoreImage processor kernel that uses MetalFX spatial scaling for upscaling.
+///
+/// - Warning: MetalFX spatial scaling does not support tiled rendering. The entire input image
+///   must fit in GPU memory. For very large images, consider using `Upscaler` directly with
+///   chunked processing at the application level.
 public class UpscalingImageProcessorKernel: CIImageProcessorKernel {
     override public class var synchronizeInputs: Bool { false }
     override public class var outputFormat: CIFormat { .BGRA8 }
@@ -49,6 +54,12 @@ public class UpscalingImageProcessorKernel: CIImageProcessorKernel {
         #endif
     }
 
+    /// Returns the region of interest for the given output rectangle.
+    ///
+    /// - Important: This method intentionally returns the full input size regardless of `outputRect`.
+    ///   MetalFX's `MTLFXSpatialScaler` does not support partial/tiled upscaling—it requires the
+    ///   complete input image to produce the complete output image. This is a fundamental limitation
+    ///   of the MetalFX API, not a bug.
     override public class func roi(
         forInput _: Int32,
         arguments: [String: Any]?,
