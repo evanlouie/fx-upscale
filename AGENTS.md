@@ -26,8 +26,8 @@ swift test
 xcodebuild build -scheme Upscaling -destination "platform=macOS"
 xcodebuild build -scheme Upscaling -destination "generic/platform=iOS"
 
-# Format code (uses .swiftformat config)
-swiftformat .
+# Format code
+xcrun swift-format --in-place --recursive .
 ```
 
 ## Architecture
