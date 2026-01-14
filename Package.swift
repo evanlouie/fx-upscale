@@ -21,12 +21,10 @@ let package = Package(
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
         .product(name: "SwiftTUI", package: "SwiftTUI"),
         "Upscaling",
-      ],
-      swiftSettings: [.swiftLanguageMode(.v5)]
+      ]
     ),
     .target(
-      name: "Upscaling",
-      swiftSettings: [.swiftLanguageMode(.v5)]
+      name: "Upscaling"
     ),
     .testTarget(
       name: "UpscalingTests",

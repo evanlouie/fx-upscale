@@ -3,7 +3,7 @@ import VideoToolbox
 
 // MARK: - UpscalingExportSession
 
-public class UpscalingExportSession {
+public final class UpscalingExportSession: @unchecked Sendable {
   // MARK: Lifecycle
 
   public init(
@@ -236,7 +236,7 @@ public class UpscalingExportSession {
 
   // MARK: Private
 
-  private enum MediaTrack {
+  private enum MediaTrack: @unchecked Sendable {
     case audio(
       _ output: AVAssetReaderOutput,
       _ input: AVAssetWriterInput
@@ -361,8 +361,8 @@ public class UpscalingExportSession {
   ) async throws {
     nonisolated(unsafe) let assetWriterInput = assetWriterInput
     nonisolated(unsafe) let assetReaderOutput = assetReaderOutput
+    nonisolated(unsafe) var hasResumed = false
     try await withCheckedThrowingContinuation { continuation in
-      var hasResumed = false
       let queue = DispatchQueue(
         label: "\(String(describing: Self.self)).audio.\(UUID().uuidString)",
         qos: .userInitiated
@@ -405,8 +405,8 @@ public class UpscalingExportSession {
     nonisolated(unsafe) let assetWriterInput = assetWriterInput
     nonisolated(unsafe) let assetReaderOutput = assetReaderOutput
     nonisolated(unsafe) let adaptor = adaptor
+    nonisolated(unsafe) var hasResumed = false
     try await withCheckedThrowingContinuation { continuation in
-      var hasResumed = false
       let queue = DispatchQueue(
         label: "\(String(describing: Self.self)).video.\(UUID().uuidString)",
         qos: .userInitiated
@@ -465,11 +465,11 @@ public class UpscalingExportSession {
     guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
       throw Error.failedToCreateUpscaler
     }
+    nonisolated(unsafe) let assetWriterInput = assetWriterInput
+    nonisolated(unsafe) let assetReaderOutput = assetReaderOutput
+    nonisolated(unsafe) let adaptor = adaptor
+    nonisolated(unsafe) var hasResumed = false
     try await withCheckedThrowingContinuation { continuation in
-      nonisolated(unsafe) let assetWriterInput = assetWriterInput
-      nonisolated(unsafe) let assetReaderOutput = assetReaderOutput
-      nonisolated(unsafe) let adaptor = adaptor
-      var hasResumed = false
       let queue = DispatchQueue(
         label: "\(String(describing: Self.self)).spatialvideo.\(UUID().uuidString)",
         qos: .userInitiated

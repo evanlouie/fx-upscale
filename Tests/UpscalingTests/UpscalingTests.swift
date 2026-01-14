@@ -324,7 +324,7 @@ struct UpscalerTests {
 
     // Use expectation-style testing for callback API
     let semaphore = DispatchSemaphore(value: 0)
-    var outputBuffer: CVPixelBuffer?
+    nonisolated(unsafe) var outputBuffer: CVPixelBuffer?
 
     upscaler.upscale(inputBuffer) { result in
       outputBuffer = result

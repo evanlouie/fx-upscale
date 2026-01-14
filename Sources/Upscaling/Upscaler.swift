@@ -117,22 +117,24 @@ public final class Upscaler: @unchecked Sendable {
     _ pixelBuffer: CVPixelBuffer,
     pixelBufferPool: CVPixelBufferPool? = nil,
     outputPixelBuffer: CVPixelBuffer? = nil,
-    completionHandler: @escaping (CVPixelBuffer) -> Void
+    completionHandler: @escaping @Sendable (CVPixelBuffer) -> Void
   ) {
     #if canImport(MetalFX)
       do {
-        let (commandBuffer, outputPixelBuffer) = try synchronizationQueue.sync {
+        let (commandBuffer, upscaledPixelBuffer) = try synchronizationQueue.sync {
           try upscaleCommandBuffer(
             pixelBuffer,
             pixelBufferPool: pixelBufferPool,
             outputPixelBuffer: outputPixelBuffer
           )
         }
+        nonisolated(unsafe) let inputPixelBuffer = pixelBuffer
+        nonisolated(unsafe) let outputBuffer = upscaledPixelBuffer
         commandBuffer.addCompletedHandler { commandBuffer in
           if commandBuffer.error != nil {
-            completionHandler(pixelBuffer)
+            completionHandler(inputPixelBuffer)
           } else {
-            completionHandler(outputPixelBuffer)
+            completionHandler(outputBuffer)
           }
         }
         commandBuffer.commit()
