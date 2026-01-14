@@ -17,14 +17,7 @@ public class UpscalingExportSession {
     self.asset = asset
     self.outputCodec = outputCodec
     self.quality = quality
-    if preferredOutputURL.pathExtension.lowercased() != "mov", outputCodec?.isProRes ?? false {
-      outputURL =
-        preferredOutputURL
-        .deletingPathExtension()
-        .appendingPathExtension("mov")
-    } else {
-      outputURL = preferredOutputURL
-    }
+    outputURL = preferredOutputURL
     self.outputSize = outputSize
     self.creator = creator
     progress = Progress(

@@ -52,7 +52,6 @@ This is a Metal-powered video upscaling tool using Apple's MetalFX framework. It
 
 ### Video Format Handling
 
-- Outputs >14.5K resolution force-convert to ProRes422 (encoder limitation)
 - Preserves color properties (primaries, transfer function, YCbCr matrix) from source
 - Audio tracks are passed through without re-encoding
 

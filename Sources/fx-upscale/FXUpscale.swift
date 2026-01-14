@@ -11,7 +11,7 @@ import Upscaling
 
   @Option(name: .shortAndLong, help: "The output file width") var width: Int?
   @Option(name: .shortAndLong, help: "The output file height") var height: Int?
-  @Option(name: .shortAndLong, help: "Output codec: 'hevc', 'prores', or 'h264' (default: h264)")
+  @Option(name: .shortAndLong, help: "Output codec: 'hevc' or 'h264' (default: h264)")
   var codec: String = "h264"
   @Option(name: .shortAndLong, help: "Output quality: 1-100 (default: encoder default)")
   var quality: Int?
@@ -72,36 +72,16 @@ import Upscaling
     let outputCodec: AVVideoCodecType? =
       switch codec.lowercased() {
       case "hevc": .hevc
-      case "prores": .proRes422
       case "h264": .h264
       default:
-        throw ValidationError("Invalid codec '\(codec)'. Supported codecs: hevc, prores, h264")
+        throw ValidationError("Invalid codec '\(codec)'. Supported codecs: hevc, h264")
       }
 
-    // Through anecdotal tests anything beyond 14.5K fails to encode for anything other than ProRes
-    let convertToProRes = (outputSize.width * outputSize.height) > (14500 * 8156)
-
-    if convertToProRes {
-      CommandLine.info(
-        "Forced ProRes conversion due to output size being larger than 14.5K (will fail otherwise)")
-    }
-
-    let effectiveCodec = convertToProRes ? AVVideoCodecType.proRes422 : outputCodec
-    if quality != nil, effectiveCodec?.isProRes ?? false {
-      CommandLine.info(
-        "Quality setting is ignored for ProRes codec (ProRes uses fixed quality profiles)")
-    }
-
-    let normalizedQuality: Double? =
-      if let quality, !(effectiveCodec?.isProRes ?? false) {
-        Double(quality) / 100.0
-      } else {
-        nil
-      }
+    let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
 
     let exportSession = UpscalingExportSession(
       asset: asset,
-      outputCodec: effectiveCodec,
+      outputCodec: outputCodec,
       preferredOutputURL: url.renamed { "\($0) Upscaled" },
       outputSize: outputSize,
       quality: normalizedQuality,
@@ -113,7 +93,7 @@ import Upscaling
       [
         "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) ",
         "to \(Int(outputSize.width))x\(Int(outputSize.height)) ",
-        "using codec: \(effectiveCodec?.rawValue ?? "hevc")\(qualityInfo)",
+        "using codec: \(outputCodec?.rawValue ?? "hevc")\(qualityInfo)",
       ].joined())
     ProgressBar.start(progress: exportSession.progress)
     defer { ProgressBar.stop() }

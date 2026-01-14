@@ -158,30 +158,6 @@ struct TestVideoGenerator {
 
 // MARK: - Extension Tests
 
-@Suite("AVVideoCodecType Extension Tests")
-struct AVVideoCodecTypeTests {
-  @Test("ProRes codecs are identified correctly")
-  func proresCodecsIdentified() {
-    #if !os(visionOS)
-      // All ProRes variants should return true
-      #expect(AVVideoCodecType.proRes422.isProRes == true)
-      #expect(AVVideoCodecType.proRes4444.isProRes == true)
-      #expect(AVVideoCodecType.proRes422HQ.isProRes == true)
-      #expect(AVVideoCodecType.proRes422LT.isProRes == true)
-      #expect(AVVideoCodecType.proRes422Proxy.isProRes == true)
-      #expect(AVVideoCodecType(rawValue: "ap4x").isProRes == true)  // ProRes 4444 XQ
-    #endif
-  }
-
-  @Test("Non-ProRes codecs are identified correctly")
-  func nonProresCodecsIdentified() {
-    // Common non-ProRes codecs should return false
-    #expect(AVVideoCodecType.h264.isProRes == false)
-    #expect(AVVideoCodecType.hevc.isProRes == false)
-    #expect(AVVideoCodecType.jpeg.isProRes == false)
-  }
-}
-
 @Suite("URL Extension Tests")
 struct URLExtensionTests {
   @Test("URL renamed preserves extension")
@@ -417,22 +393,6 @@ struct ExportSessionTests {
     #endif
   }
 
-  @Test("Export session URL handling for ProRes")
-  func proresURLConversion() throws {
-    // Test that ProRes codec changes .mp4 to .mov extension
-    let mp4URL = FileManager.default.temporaryDirectory.appendingPathComponent("test.mp4")
-    let asset = AVAsset(url: mp4URL)
-
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .proRes422,
-      preferredOutputURL: mp4URL,
-      outputSize: CGSize(width: 640, height: 480)
-    )
-
-    #expect(session.outputURL.pathExtension == "mov")
-  }
-
   @Test("Export session preserves .mov extension")
   func movExtensionPreserved() throws {
     let movURL = FileManager.default.temporaryDirectory.appendingPathComponent("test.mov")
@@ -581,44 +541,6 @@ struct ExportSessionTests {
     try await session.export()
 
     #expect(FileManager.default.fileExists(atPath: outputURL.path))
-  }
-
-  /// https://github.com/finnvoor/fx-upscale/commit/44463975e46ee7d418ad41017782c1e267205c82
-  @Test("ProRes codec uses .mov extension (end-to-end)")
-  func transcodeToProRes() async throws {
-    try requireMetal()
-
-    // Create test video
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
-
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 0.5,
-      frameRate: 10,
-      size: inputSize
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
-
-    // Request .mp4 but with ProRes codec - should convert to .mov
-    let preferredURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("prores_test_\(UUID().uuidString).mp4")
-
-    let asset = AVAsset(url: inputURL)
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .proRes422,
-      preferredOutputURL: preferredURL,
-      outputSize: outputSize
-    )
-
-    // The session should have converted .mp4 to .mov for ProRes
-    #expect(session.outputURL.pathExtension.lowercased() == "mov")
-
-    defer { TestVideoGenerator.cleanup(session.outputURL) }
-
-    try await session.export()
-
-    #expect(FileManager.default.fileExists(atPath: session.outputURL.path))
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/7
