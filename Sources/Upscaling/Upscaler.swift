@@ -8,7 +8,7 @@ import MetalFX
 
 // MARK: - Upscaler
 
-public final class Upscaler {
+public final class Upscaler: @unchecked Sendable {
     // MARK: Lifecycle
 
     public init?(inputSize: CGSize, outputSize: CGSize) {

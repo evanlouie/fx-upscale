@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import VideoToolbox
 
 // MARK: - UpscalingExportSession
@@ -352,6 +352,8 @@ public class UpscalingExportSession {
         to assetWriterInput: AVAssetWriterInput,
         progress: Progress
     ) async throws {
+        nonisolated(unsafe) let assetWriterInput = assetWriterInput
+        nonisolated(unsafe) let assetReaderOutput = assetReaderOutput
         try await withCheckedThrowingContinuation { continuation in
             var hasResumed = false
             let queue = DispatchQueue(
@@ -393,6 +395,9 @@ public class UpscalingExportSession {
         guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
             throw Error.failedToCreateUpscaler
         }
+        nonisolated(unsafe) let assetWriterInput = assetWriterInput
+        nonisolated(unsafe) let assetReaderOutput = assetReaderOutput
+        nonisolated(unsafe) let adaptor = adaptor
         try await withCheckedThrowingContinuation { continuation in
             var hasResumed = false
             let queue = DispatchQueue(
@@ -452,6 +457,9 @@ public class UpscalingExportSession {
             throw Error.failedToCreateUpscaler
         }
         try await withCheckedThrowingContinuation { continuation in
+            nonisolated(unsafe) let assetWriterInput = assetWriterInput
+            nonisolated(unsafe) let assetReaderOutput = assetReaderOutput
+            nonisolated(unsafe) let adaptor = adaptor
             var hasResumed = false
             let queue = DispatchQueue(
                 label: "\(String(describing: Self.self)).spatialvideo.\(UUID().uuidString)",
