@@ -1,5 +1,0 @@
-{
-  "name": "copilot-cli",
-  "version": "0.1.0",
-  "description": "Delegate tasks to GitHub Copilot CLI as a subagent"
-}
