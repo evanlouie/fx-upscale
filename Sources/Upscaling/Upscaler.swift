@@ -61,15 +61,19 @@ public final class Upscaler: @unchecked Sendable {
   ) async -> CVPixelBuffer {
     #if canImport(MetalFX)
       do {
-        let (commandBuffer, outputPixelBuffer) = try synchronizationQueue.sync {
-          try upscaleCommandBuffer(
-            pixelBuffer,
-            pixelBufferPool: pixelBufferPool,
-            outputPixelBuffer: outputPixelBuffer
-          )
-        }
+        let (commandBuffer, outputPixelBuffer, cvColorTexture, cvUpscaledTexture) =
+          try synchronizationQueue.sync {
+            try upscaleCommandBuffer(
+              pixelBuffer,
+              pixelBufferPool: pixelBufferPool,
+              outputPixelBuffer: outputPixelBuffer
+            )
+          }
         try await withCheckedThrowingContinuation { continuation in
           commandBuffer.addCompletedHandler { commandBuffer in
+            // Prevent CVMetalTextures from being released before GPU completes
+            _ = cvColorTexture
+            _ = cvUpscaledTexture
             if let error = commandBuffer.error {
               continuation.resume(throwing: error)
             } else {
@@ -95,7 +99,7 @@ public final class Upscaler: @unchecked Sendable {
     #if canImport(MetalFX)
       do {
         return try synchronizationQueue.sync {
-          let (commandBuffer, outputPixelBuffer) = try upscaleCommandBuffer(
+          let (commandBuffer, outputPixelBuffer, _, _) = try upscaleCommandBuffer(
             pixelBuffer,
             pixelBufferPool: pixelBufferPool,
             outputPixelBuffer: outputPixelBuffer
@@ -121,16 +125,20 @@ public final class Upscaler: @unchecked Sendable {
   ) {
     #if canImport(MetalFX)
       do {
-        let (commandBuffer, upscaledPixelBuffer) = try synchronizationQueue.sync {
-          try upscaleCommandBuffer(
-            pixelBuffer,
-            pixelBufferPool: pixelBufferPool,
-            outputPixelBuffer: outputPixelBuffer
-          )
-        }
+        let (commandBuffer, upscaledPixelBuffer, cvColorTexture, cvUpscaledTexture) =
+          try synchronizationQueue.sync {
+            try upscaleCommandBuffer(
+              pixelBuffer,
+              pixelBufferPool: pixelBufferPool,
+              outputPixelBuffer: outputPixelBuffer
+            )
+          }
         nonisolated(unsafe) let inputPixelBuffer = pixelBuffer
         nonisolated(unsafe) let outputBuffer = upscaledPixelBuffer
         commandBuffer.addCompletedHandler { commandBuffer in
+          // Prevent CVMetalTextures from being released before GPU completes
+          _ = cvColorTexture
+          _ = cvUpscaledTexture
           if commandBuffer.error != nil {
             completionHandler(inputPixelBuffer)
           } else {
@@ -160,7 +168,7 @@ public final class Upscaler: @unchecked Sendable {
       _ pixelBuffer: CVPixelBuffer,
       pixelBufferPool: CVPixelBufferPool? = nil,
       outputPixelBuffer: CVPixelBuffer? = nil
-    ) throws -> (MTLCommandBuffer, CVPixelBuffer) {
+    ) throws -> (MTLCommandBuffer, CVPixelBuffer, CVMetalTexture, CVMetalTexture) {
       guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
         throw Error.unsupportedPixelFormat
       }
@@ -175,7 +183,7 @@ public final class Upscaler: @unchecked Sendable {
           }()
       else { throw Error.couldNotCreatePixelBuffer }
 
-      var colorTexture: CVMetalTexture!
+      var cvColorTexture: CVMetalTexture!
       var status = CVMetalTextureCacheCreateTextureFromImage(
         nil,
         textureCache,
@@ -185,15 +193,15 @@ public final class Upscaler: @unchecked Sendable {
         pixelBuffer.width,
         pixelBuffer.height,
         0,
-        &colorTexture
+        &cvColorTexture
       )
       guard status == kCVReturnSuccess,
-        let colorTexture = CVMetalTextureGetTexture(colorTexture)
+        let colorTexture = CVMetalTextureGetTexture(cvColorTexture)
       else {
         throw Error.couldNotCreateMetalTexture
       }
 
-      var upscaledTexture: CVMetalTexture!
+      var cvUpscaledTexture: CVMetalTexture!
       status = CVMetalTextureCacheCreateTextureFromImage(
         nil,
         textureCache,
@@ -203,10 +211,10 @@ public final class Upscaler: @unchecked Sendable {
         outputPixelBuffer.width,
         outputPixelBuffer.height,
         0,
-        &upscaledTexture
+        &cvUpscaledTexture
       )
       guard status == kCVReturnSuccess,
-        let upscaledTexture = CVMetalTextureGetTexture(upscaledTexture)
+        let upscaledTexture = CVMetalTextureGetTexture(cvUpscaledTexture)
       else {
         throw Error.couldNotCreateMetalTexture
       }
@@ -225,7 +233,7 @@ public final class Upscaler: @unchecked Sendable {
       blitCommandEncoder.copy(from: intermediateOutputTexture, to: upscaledTexture)
       blitCommandEncoder.endEncoding()
 
-      return (commandBuffer, outputPixelBuffer)
+      return (commandBuffer, outputPixelBuffer, cvColorTexture, cvUpscaledTexture)
     }
   #endif
 }
