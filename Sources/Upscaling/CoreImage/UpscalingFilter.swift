@@ -12,10 +12,10 @@ public final class UpscalingFilter: CIFilter {
 
   override public var outputImage: CIImage? {
     #if canImport(MetalFX)
-      guard let device, let inputImage, let outputSize else { return nil }
-
       lock.lock()
       defer { lock.unlock() }
+
+      guard let device, let inputImage = _inputImage, let outputSize = _outputSize else { return nil }
 
       if spatialScaler?.inputSize != inputImage.extent.size
         || spatialScaler?.outputSize != outputSize
@@ -52,11 +52,20 @@ public final class UpscalingFilter: CIFilter {
     #endif
   }
 
-  public var inputImage: CIImage?
-  public var outputSize: CGSize?
+  public var inputImage: CIImage? {
+    get { lock.withLock { _inputImage } }
+    set { lock.withLock { _inputImage = newValue } }
+  }
+
+  public var outputSize: CGSize? {
+    get { lock.withLock { _outputSize } }
+    set { lock.withLock { _outputSize = newValue } }
+  }
 
   // MARK: Private
 
+  private var _inputImage: CIImage?
+  private var _outputSize: CGSize?
   private let device = MTLCreateSystemDefaultDevice()
   private let lock = NSLock()
 
