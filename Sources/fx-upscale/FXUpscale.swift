@@ -49,26 +49,21 @@ import Upscaling
       )
     }
 
-    // 1. Use passed in width/height
-    // 2. Use proportional width/height if only one is specified
-    // 3. Default to 2x upscale
+    let outputSize = calculateOutputDimensions(
+      inputSize: inputSize,
+      requestedWidth: width,
+      requestedHeight: height
+    )
 
-    let width =
-      width ?? height.map { Int(inputSize.width * (CGFloat($0) / inputSize.height)) } ?? Int(
-        inputSize.width) * 2
-    let height = height ?? Int(inputSize.height * (CGFloat(width) / inputSize.width))
-
-    guard width > 0, height > 0 else {
+    guard outputSize.width > 0, outputSize.height > 0 else {
       throw ValidationError("Width and height must be positive integers")
     }
 
-    guard width <= UpscalingExportSession.maxOutputSize,
-      height <= UpscalingExportSession.maxOutputSize
+    guard Int(outputSize.width) <= UpscalingExportSession.maxOutputSize,
+      Int(outputSize.height) <= UpscalingExportSession.maxOutputSize
     else {
       throw ValidationError("Maximum supported width/height: 16384")
     }
-
-    let outputSize = CGSize(width: width, height: height)
     let outputCodec: AVVideoCodecType? =
       switch codec.lowercased() {
       case "hevc": .hevc
