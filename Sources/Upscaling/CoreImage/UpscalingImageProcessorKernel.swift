@@ -12,7 +12,7 @@ import Foundation
 /// - Warning: MetalFX spatial scaling does not support tiled rendering. The entire input image
 ///   must fit in GPU memory. For very large images, consider using `Upscaler` directly with
 ///   chunked processing at the application level.
-public class UpscalingImageProcessorKernel: CIImageProcessorKernel {
+public final class UpscalingImageProcessorKernel: CIImageProcessorKernel {
   override public class var synchronizeInputs: Bool { false }
   override public class var outputFormat: CIFormat { .BGRA8 }
 

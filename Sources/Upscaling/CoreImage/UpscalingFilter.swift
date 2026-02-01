@@ -7,7 +7,7 @@ import Foundation
 
 // MARK: - UpscalingFilter
 
-public class UpscalingFilter: CIFilter {
+public final class UpscalingFilter: CIFilter {
   // MARK: Public
 
   override public var outputImage: CIImage? {
