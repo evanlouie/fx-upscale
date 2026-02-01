@@ -233,7 +233,7 @@ public final class Upscaler: @unchecked Sendable {
 // MARK: Upscaler.Error
 
 extension Upscaler {
-  enum Error: Swift.Error {
+  public enum Error: Swift.Error {
     case unsupportedPixelFormat
     case couldNotCreatePixelBuffer
     case couldNotCreateMetalTexture

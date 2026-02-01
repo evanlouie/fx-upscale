@@ -81,7 +81,7 @@ public class UpscalingImageProcessorKernel: CIImageProcessorKernel {
 // MARK: - UpscalingImageProcessorKernel.Error
 
 extension UpscalingImageProcessorKernel {
-  enum Error: Swift.Error {
+  public enum Error: Swift.Error {
     case missingSpatialScaler
     case missingInputTexture
     case missingOutputTexture
