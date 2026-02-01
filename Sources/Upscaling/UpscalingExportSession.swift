@@ -143,7 +143,9 @@ public final class UpscalingExportSession: @unchecked Sendable {
       }
     }
 
-    assert(assetWriter.inputs.count == assetReader.outputs.count)
+    guard assetWriter.inputs.count == assetReader.outputs.count else {
+      throw Error.inputOutputCountMismatch
+    }
 
     assetWriter.startWriting()
     assetReader.startReading()
@@ -553,6 +555,7 @@ extension UpscalingExportSession {
     case outputURLAlreadyExists
     case couldNotAddAssetReaderOutput(AVMediaType)
     case couldNotAddAssetWriterInput(AVMediaType)
+    case inputOutputCountMismatch
     case missingImageBuffer
     case missingTaggedBuffers
     case invalidTaggedBuffers
