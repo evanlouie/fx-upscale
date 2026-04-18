@@ -1,10 +1,10 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 
 import PackageDescription
 
 let package = Package(
   name: "fx-upscale",
-  platforms: [.macOS(.v13), .iOS(.v16)],
+  platforms: [.macOS(.v26)],
   products: [
     .executable(name: "fx-upscale", targets: ["fx-upscale"]),
     .library(name: "Upscaling", targets: ["Upscaling"]),

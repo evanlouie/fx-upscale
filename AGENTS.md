@@ -4,11 +4,11 @@ Guidelines for AI agents working on fx-upscale, a Metal-powered video upscaling 
 
 ## Project Overview
 
-Swift 6.0 package with two targets:
+Swift 6.2 package with two targets:
 - **fx-upscale**: CLI executable using ArgumentParser and SwiftTUI
 - **Upscaling**: Core library for MetalFX-based video upscaling
 
-Platforms: macOS 13+, iOS 16+
+Platforms: macOS 26+ (Tahoe). iOS is not supported.
 
 ## Build Commands
 
@@ -21,7 +21,6 @@ swift build -c release --arch arm64 --arch x86_64 --product fx-upscale
 
 # Build with Xcode (CI-style)
 xcodebuild build -scheme Upscaling -destination "platform=macOS"
-xcodebuild build -scheme Upscaling -destination "generic/platform=iOS"
 
 # Run the CLI
 swift run fx-upscale <video-file> [options]
@@ -199,6 +198,6 @@ Testing uses the `Testing` framework bundled with the Swift 6 toolchain (no exte
 
 ## CI/CD
 
-- CI runs on macOS 15 for both iOS and macOS platforms
+- CI runs on macOS (latest) for the macOS platform only
 - Release builds create universal binaries (arm64 + x86_64)
 - Releases are tagged with semantic versioning and published to GitHub + Homebrew
