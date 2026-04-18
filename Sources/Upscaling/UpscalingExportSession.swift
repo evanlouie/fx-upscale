@@ -122,17 +122,16 @@ public final class UpscalingExportSession: @unchecked Sendable {
         assetWriter.add(assetWriterInput)
 
         progress.totalUnitCount += 10
-        if #available(macOS 14.0, iOS 17.0, *),
-          formatDescription?.hasLeftAndRightEye ?? false
-        {
-          let adaptor = AVAssetWriterInputTaggedPixelBufferGroupAdaptor(
-            assetWriterInput: assetWriterInput,
-            sourcePixelBufferAttributes: PixelBufferAttributes.bgra(size: outputSize)
-          )
+        if formatDescription?.hasLeftAndRightEye ?? false {
+          // macOS 26 replaced AVAssetWriterInputTaggedPixelBufferGroupAdaptor with a
+          // receiver obtained from the asset writer. We manage our own output pool in
+          // `Upscaler`, so no source pixel buffer attributes are needed here.
+          let receiver = assetWriter.inputTaggedPixelBufferGroupReceiver(
+            for: assetWriterInput, pixelBufferAttributes: nil)
           try await mediaTracks.append(
             .spatialVideo(
               output: assetReaderOutput, input: assetWriterInput,
-              inputSize: track.load(.naturalSize), adaptor: adaptor))
+              inputSize: track.load(.naturalSize), receiver: receiver))
         } else {
           let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: assetWriterInput,
@@ -217,15 +216,13 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 from: output, to: input, adaptor: adaptor,
                 inputSize: inputSize, outputSize: self.outputSize,
                 progress: childProgress)
-            case .spatialVideo(let output, let input, let inputSize, let adaptor):
-              if #available(macOS 14.0, iOS 17.0, *) {
-                let childProgress = Progress(totalUnitCount: durationUnits)
-                self.progress.addChild(childProgress, withPendingUnitCount: 10)
-                try await Self.processSpatialVideoSamples(
-                  from: output, to: input, adaptor: adaptor,
-                  inputSize: inputSize, outputSize: self.outputSize,
-                  progress: childProgress)
-              }
+            case .spatialVideo(let output, let input, let inputSize, let receiver):
+              let childProgress = Progress(totalUnitCount: durationUnits)
+              self.progress.addChild(childProgress, withPendingUnitCount: 10)
+              try await Self.processSpatialVideoSamples(
+                from: output, to: input, receiver: receiver,
+                inputSize: inputSize, outputSize: self.outputSize,
+                progress: childProgress)
             }
           }
         }
@@ -323,10 +320,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
       output: AVAssetReaderOutput,
       input: AVAssetWriterInput,
       inputSize: CGSize,
-      // AVAssetWriterInputTaggedPixelBufferGroupAdaptor (macOS 14+). Stored as NSObject so the
-      // enum is available on older OS versions; cast at use site via `preconditionFailure`
-      // since construction is the only place this can be set (see export()).
-      adaptor: NSObject
+      receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver
     )
   }
 
@@ -354,9 +348,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
       kCVPixelBufferMetalCompatibilityKey as String: true,
       kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary,
     ]
-    if #available(macOS 14.0, iOS 17.0, *),
-      formatDescription?.hasLeftAndRightEye ?? false
-    {
+    if formatDescription?.hasLeftAndRightEye ?? false {
       outputSettings[AVVideoDecompressionPropertiesKey] = [
         kVTDecompressionPropertyKey_RequestedMVHEVCVideoLayerIDs: [0, 1]
       ]
@@ -392,9 +384,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     if let quality {
       compressionProperties[kVTCompressionPropertyKey_Quality as String] = quality
     }
-    if #available(macOS 14.0, iOS 17.0, *),
-      formatDescription?.hasLeftAndRightEye ?? false
-    {
+    if formatDescription?.hasLeftAndRightEye ?? false {
       compressionProperties[kVTCompressionPropertyKey_MVHEVCVideoLayerIDs as String] = [0, 1]
       if let extensions = formatDescription?.extensions {
         for key in [
@@ -523,27 +513,20 @@ public final class UpscalingExportSession: @unchecked Sendable {
     } as Void
   }
 
-  @available(macOS 14.0, iOS 17.0, *)
   private static func processSpatialVideoSamples(
     from assetReaderOutput: AVAssetReaderOutput,
     to assetWriterInput: AVAssetWriterInput,
-    adaptor: NSObject,
+    receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver,
     inputSize: CGSize,
     outputSize: CGSize,
     progress: Progress
   ) async throws {
-    // Construction in `export()` is the only place this enum case is instantiated, and it's
-    // always built from an `AVAssetWriterInputTaggedPixelBufferGroupAdaptor`. A failure here
-    // is a programmer error, not a runtime condition.
-    guard let taggedAdaptor = adaptor as? AVAssetWriterInputTaggedPixelBufferGroupAdaptor else {
-      preconditionFailure("MediaTrack.spatialVideo adaptor was not a tagged-buffer adaptor")
-    }
     guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
       throw Error.failedToCreateUpscaler
     }
     nonisolated(unsafe) let input = assetWriterInput
     nonisolated(unsafe) let output = assetReaderOutput
-    nonisolated(unsafe) let adaptor = taggedAdaptor
+    nonisolated(unsafe) let receiver = receiver
     let resume = AsyncResume()
     try await withCheckedThrowingContinuation {
       (continuation: CheckedContinuation<Void, Swift.Error>) in
@@ -595,28 +578,39 @@ public final class UpscalingExportSession: @unchecked Sendable {
             let upscaledLeft: CVPixelBuffer
             let upscaledRight: CVPixelBuffer
             do {
-              upscaledLeft = try upscaler.upscale(
-                leftEyePixelBuffer, pixelBufferPool: adaptor.pixelBufferPool)
-              upscaledRight = try upscaler.upscale(
-                rightEyePixelBuffer, pixelBufferPool: adaptor.pixelBufferPool)
+              // The new TaggedPixelBufferGroupReceiver exposes a CVMutablePixelBuffer.Pool,
+              // which is not interchangeable with the legacy CVPixelBufferPool that
+              // `Upscaler.upscale` accepts. Fall back to the upscaler's internal pool.
+              upscaledLeft = try upscaler.upscale(leftEyePixelBuffer)
+              upscaledRight = try upscaler.upscale(rightEyePixelBuffer)
             } catch {
               input.markAsFinished()
               resume.resume(continuation: continuation, throwing: error)
               return
             }
-            let leftTagged = CMTaggedBuffer(
+            // `CMTaggedDynamicBuffer.init(unsafeBuffer:)` requires a disconnected region;
+            // transfer via `nonisolated(unsafe)` to satisfy region isolation.
+            nonisolated(unsafe) let leftTagged = CMTaggedBuffer(
               tags: [.stereoView(.leftEye), .videoLayerID(0)],
               pixelBuffer: upscaledLeft)
-            let rightTagged = CMTaggedBuffer(
+            nonisolated(unsafe) let rightTagged = CMTaggedBuffer(
               tags: [.stereoView(.rightEye), .videoLayerID(1)],
               pixelBuffer: upscaledRight)
-            if !adaptor.appendTaggedBuffers(
-              [leftTagged, rightTagged], withPresentationTime: pts)
-            {
+            let taggedGroup: [CMTaggedDynamicBuffer] = [
+              CMTaggedDynamicBuffer(unsafeBuffer: leftTagged),
+              CMTaggedDynamicBuffer(unsafeBuffer: rightTagged),
+            ]
+            do {
+              if try !receiver.appendImmediately(taggedGroup, with: pts) {
+                input.markAsFinished()
+                resume.resume(
+                  continuation: continuation,
+                  throwing: Error.appendFailed(pts))
+                return
+              }
+            } catch {
               input.markAsFinished()
-              resume.resume(
-                continuation: continuation,
-                throwing: Error.appendFailed(pts))
+              resume.resume(continuation: continuation, throwing: error)
               return
             }
           }
