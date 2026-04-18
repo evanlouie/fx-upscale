@@ -21,5 +21,21 @@
         outputHeight = Int(newValue.height)
       }
     }
+
+    /// Standard 8-bit BGRA, perceptual-color-space scaler descriptor used throughout the
+    /// upscaling pipeline. Consolidates the five-property boilerplate that otherwise has to be
+    /// kept in sync between call sites.
+    static func bgra8Perceptual(
+      inputSize: CGSize,
+      outputSize: CGSize
+    ) -> MTLFXSpatialScalerDescriptor {
+      let descriptor = MTLFXSpatialScalerDescriptor()
+      descriptor.inputSize = inputSize
+      descriptor.outputSize = outputSize
+      descriptor.colorTextureFormat = .bgra8Unorm
+      descriptor.outputTextureFormat = .bgra8Unorm
+      descriptor.colorProcessingMode = .perceptual
+      return descriptor
+    }
   }
 #endif

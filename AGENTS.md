@@ -37,16 +37,17 @@ swift test
 swift test list
 
 # Run a single test by name
-swift test --filter UpscalingTests.UpscalerTests/upscalerSyncAPI
+swift test --filter "Upscaler Tests/Upscaler sync API produces correct output size"
 
 # Run an entire test suite
-swift test --filter UpscalingTests.ExportSessionTests
+swift test --filter "Export Session Tests"
 
 # Run tests matching a pattern
-swift test --filter "URLExtension"
+swift test --filter "URL Extension"
 ```
 
-Test naming format: `<Module>.<Suite>/<testFunction>`
+Test naming format: `<Suite name>/<test description>` (swift-testing uses the human-readable
+`@Suite` / `@Test` strings, not the Swift symbol names).
 
 ## Code Style Guidelines
 
@@ -193,7 +194,8 @@ Bundle.module.url(forResource: "filename", withExtension: "ext")
 
 - [swift-argument-parser](https://github.com/apple/swift-argument-parser) - CLI parsing
 - [SwiftTUI](https://github.com/Finnvoor/SwiftTUI) - Terminal UI (progress bar)
-- [swift-testing](https://github.com/apple/swift-testing) - Testing framework
+
+Testing uses the `Testing` framework bundled with the Swift 6 toolchain (no external dependency).
 
 ## CI/CD
 

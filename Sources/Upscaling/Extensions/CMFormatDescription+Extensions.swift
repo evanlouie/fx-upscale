@@ -3,11 +3,11 @@ import AVFoundation
 extension CMFormatDescription {
   public var videoCodecType: AVVideoCodecType? {
     switch mediaSubType {
-    case .hevc: return .hevc
-    case .h264: return .h264
-    case .jpeg: return .jpeg
-    case .hevcWithAlpha: return .hevcWithAlpha
-    default: return nil
+    case .hevc: .hevc
+    case .h264: .h264
+    case .jpeg: .jpeg
+    case .hevcWithAlpha: .hevcWithAlpha
+    default: nil
     }
   }
 
@@ -58,12 +58,23 @@ extension CMFormatDescription {
   }
 
   @available(macOS 14.0, iOS 17.0, *) var hasLeftAndRightEye: Bool {
-    let hasLeftEye = (tagCollections ?? []).contains {
-      $0.contains { $0 == .stereoView(.leftEye) }
+    var hasLeftEye = false
+    var hasRightEye = false
+    for collection in tagCollections ?? [] {
+      for tag in collection {
+        if tag == .stereoView(.leftEye) { hasLeftEye = true }
+        if tag == .stereoView(.rightEye) { hasRightEye = true }
+        if hasLeftEye && hasRightEye { return true }
+      }
     }
-    let hasRightEye = (tagCollections ?? []).contains {
-      $0.contains { $0 == .stereoView(.rightEye) }
-    }
-    return hasLeftEye && hasRightEye
+    return false
+  }
+
+  /// True if the transfer function indicates an HDR signal (PQ / HLG). The 8-bit BGRA MetalFX
+  /// path cannot process these without silently clipping, so callers reject such inputs.
+  var isHDR: Bool {
+    guard let transfer = colorTransferFunction else { return false }
+    return transfer == (AVVideoTransferFunction_SMPTE_ST_2084_PQ as String)
+      || transfer == (AVVideoTransferFunction_ITU_R_2100_HLG as String)
   }
 }

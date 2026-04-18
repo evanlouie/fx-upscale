@@ -81,12 +81,23 @@ public final class UpscalingImageProcessorKernel: CIImageProcessorKernel {
 // MARK: - UpscalingImageProcessorKernel.Error
 
 extension UpscalingImageProcessorKernel {
-  public enum Error: Swift.Error {
+  public enum Error: Swift.Error, LocalizedError {
     case missingSpatialScaler
     case missingInputTexture
     case missingOutputTexture
     case missingCommandBuffer
     case missingIntermediateOutputTexture
     case couldNotMakeBlitCommandEncoder
+
+    public var errorDescription: String? {
+      switch self {
+      case .missingSpatialScaler: "Missing MetalFX spatial scaler argument."
+      case .missingInputTexture: "Input CoreImage processor did not provide a Metal texture."
+      case .missingOutputTexture: "Output CoreImage processor did not provide a Metal texture."
+      case .missingCommandBuffer: "Output CoreImage processor did not provide a Metal command buffer."
+      case .missingIntermediateOutputTexture: "Missing intermediate output texture argument."
+      case .couldNotMakeBlitCommandEncoder: "Failed to create Metal blit command encoder."
+      }
+    }
   }
 }

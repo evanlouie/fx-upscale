@@ -72,7 +72,8 @@ struct TestVideoGenerator {
 
     writer.add(videoInput)
 
-    // Audio input (silent) - note: we don't actually write audio samples
+    // Audio input (silent PCM samples)
+    var audioInput: AVAssetWriterInput?
     if includeAudio {
       let audioSettings: [String: Any] = [
         AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -83,6 +84,7 @@ struct TestVideoGenerator {
       let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
       input.expectsMediaDataInRealTime = false
       writer.add(input)
+      audioInput = input
     }
 
     writer.startWriting()
@@ -136,6 +138,13 @@ struct TestVideoGenerator {
 
     videoInput.markAsFinished()
 
+    // Write silent PCM audio samples if requested.
+    if let audioInput {
+      try writeSilentAudio(
+        into: audioInput, duration: duration, sampleRate: 44100, channels: 2)
+      audioInput.markAsFinished()
+    }
+
     // Use semaphore to wait for completion
     let semaphore = DispatchSemaphore(value: 0)
     writer.finishWriting {
@@ -153,6 +162,96 @@ struct TestVideoGenerator {
   /// Cleanup helper
   static func cleanup(_ url: URL) {
     try? FileManager.default.removeItem(at: url)
+  }
+
+  /// Writes a block of silent PCM audio into the given asset writer input.
+  private static func writeSilentAudio(
+    into input: AVAssetWriterInput,
+    duration: TimeInterval,
+    sampleRate: Int,
+    channels: Int
+  ) throws {
+    let totalFrames = Int(Double(sampleRate) * duration)
+    let framesPerChunk = 1024
+
+    var asbd = AudioStreamBasicDescription(
+      mSampleRate: Float64(sampleRate),
+      mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+      mBytesPerPacket: UInt32(channels * 2),
+      mFramesPerPacket: 1,
+      mBytesPerFrame: UInt32(channels * 2),
+      mChannelsPerFrame: UInt32(channels),
+      mBitsPerChannel: 16,
+      mReserved: 0
+    )
+    var formatDescription: CMAudioFormatDescription?
+    CMAudioFormatDescriptionCreate(
+      allocator: kCFAllocatorDefault,
+      asbd: &asbd,
+      layoutSize: 0, layout: nil,
+      magicCookieSize: 0, magicCookie: nil,
+      extensions: nil,
+      formatDescriptionOut: &formatDescription
+    )
+    guard let formatDescription else { return }
+
+    var framesWritten = 0
+    while framesWritten < totalFrames {
+      let frames = min(framesPerChunk, totalFrames - framesWritten)
+      let byteCount = frames * channels * 2
+      let silence = [UInt8](repeating: 0, count: byteCount)
+
+      var blockBuffer: CMBlockBuffer?
+      CMBlockBufferCreateWithMemoryBlock(
+        allocator: kCFAllocatorDefault,
+        memoryBlock: nil,
+        blockLength: byteCount,
+        blockAllocator: nil,
+        customBlockSource: nil,
+        offsetToData: 0,
+        dataLength: byteCount,
+        flags: 0,
+        blockBufferOut: &blockBuffer)
+      guard let blockBuffer else { return }
+      _ = silence.withUnsafeBytes { bytes in
+        CMBlockBufferReplaceDataBytes(
+          with: bytes.baseAddress!,
+          blockBuffer: blockBuffer,
+          offsetIntoDestination: 0,
+          dataLength: byteCount)
+      }
+
+      var sampleBuffer: CMSampleBuffer?
+      var sampleTiming = CMSampleTimingInfo(
+        duration: CMTime(value: 1, timescale: CMTimeScale(sampleRate)),
+        presentationTimeStamp: CMTime(
+          value: Int64(framesWritten), timescale: CMTimeScale(sampleRate)),
+        decodeTimeStamp: .invalid
+      )
+      var sampleSize = channels * 2
+      CMSampleBufferCreate(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: blockBuffer,
+        dataReady: true,
+        makeDataReadyCallback: nil,
+        refcon: nil,
+        formatDescription: formatDescription,
+        sampleCount: CMItemCount(frames),
+        sampleTimingEntryCount: 1,
+        sampleTimingArray: &sampleTiming,
+        sampleSizeEntryCount: 1,
+        sampleSizeArray: &sampleSize,
+        sampleBufferOut: &sampleBuffer
+      )
+      if let sampleBuffer {
+        while !input.isReadyForMoreMediaData {
+          Thread.sleep(forTimeInterval: 0.01)
+        }
+        input.append(sampleBuffer)
+      }
+      framesWritten += frames
+    }
   }
 }
 
@@ -289,7 +388,7 @@ struct UpscalerTests {
     }
 
     let inputBuffer = try createPixelBuffer(size: inputSize)
-    let outputBuffer = upscaler.upscale(inputBuffer)
+    let outputBuffer = try upscaler.upscale(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
     #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
@@ -305,7 +404,7 @@ struct UpscalerTests {
     }
 
     let inputBuffer = try createPixelBuffer(size: inputSize)
-    let outputBuffer = await upscaler.upscale(inputBuffer)
+    let outputBuffer = try await upscaler.upscale(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
     #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
@@ -322,12 +421,13 @@ struct UpscalerTests {
 
     let inputBuffer = try createPixelBuffer(size: inputSize)
 
-    // Use expectation-style testing for callback API
     let semaphore = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var outputBuffer: CVPixelBuffer?
 
     upscaler.upscale(inputBuffer) { result in
-      outputBuffer = result
+      if case .success(let buffer) = result {
+        outputBuffer = buffer
+      }
       semaphore.signal()
     }
 
@@ -341,7 +441,6 @@ struct UpscalerTests {
 
   @Test("Upscaler handles non-square dimensions")
   func upscalerNonSquare() throws {
-    // Wide aspect ratio
     let inputSize = CGSize(width: 1920, height: 800)
     let outputSize = CGSize(width: 3840, height: 1600)
 
@@ -350,10 +449,22 @@ struct UpscalerTests {
     }
 
     let inputBuffer = try createPixelBuffer(size: inputSize)
-    let outputBuffer = upscaler.upscale(inputBuffer)
+    let outputBuffer = try upscaler.upscale(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
     #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
+  }
+
+  @Test("Upscaler rejects mismatched input size")
+  func upscalerRejectsMismatchedInputSize() throws {
+    let upscalerSize = CGSize(width: 640, height: 480)
+    guard let upscaler = Upscaler(inputSize: upscalerSize, outputSize: CGSize(width: 1280, height: 960)) else {
+      throw TestSkipError("Metal device not available")
+    }
+    let wrongBuffer = try createPixelBuffer(size: CGSize(width: 320, height: 240))
+    #expect(throws: Upscaler.Error.self) {
+      _ = try upscaler.upscale(wrongBuffer)
+    }
   }
 
   private func createPixelBuffer(size: CGSize) throws -> CVPixelBuffer {
@@ -396,7 +507,7 @@ struct ExportSessionTests {
   @Test("Export session preserves .mov extension")
   func movExtensionPreserved() throws {
     let movURL = FileManager.default.temporaryDirectory.appendingPathComponent("test.mov")
-    let asset = AVAsset(url: movURL)
+    let asset = AVURLAsset(url: movURL)
 
     let session = UpscalingExportSession(
       asset: asset,
@@ -411,7 +522,7 @@ struct ExportSessionTests {
   @Test("Export session progress is configured")
   func progressConfiguration() throws {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("test.mov")
-    let asset = AVAsset(url: url)
+    let asset = AVURLAsset(url: url)
 
     let session = UpscalingExportSession(
       asset: asset,
@@ -443,7 +554,7 @@ struct ExportSessionTests {
     defer { TestVideoGenerator.cleanup(outputURL) }
 
     // Export
-    let asset = AVAsset(url: inputURL)
+    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
       asset: asset,
       outputCodec: .h264,
@@ -456,7 +567,7 @@ struct ExportSessionTests {
     // Verify output
     #expect(FileManager.default.fileExists(atPath: outputURL.path))
 
-    let outputAsset = AVAsset(url: outputURL)
+    let outputAsset = AVURLAsset(url: outputURL)
     let videoTrack = try await outputAsset.loadTracks(withMediaType: .video).first
     let trackSize = try await videoTrack?.load(.naturalSize)
 
@@ -487,7 +598,7 @@ struct ExportSessionTests {
     defer { TestVideoGenerator.cleanup(outputURL) }
 
     // Export
-    let asset = AVAsset(url: inputURL)
+    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
       asset: asset,
       outputCodec: .h264,
@@ -500,12 +611,18 @@ struct ExportSessionTests {
     // Verify output exists and has video
     #expect(FileManager.default.fileExists(atPath: outputURL.path))
 
-    let outputAsset = AVAsset(url: outputURL)
+    let outputAsset = AVURLAsset(url: outputURL)
     let videoTrack = try await outputAsset.loadTracks(withMediaType: .video).first
-    #expect(videoTrack != nil)
-
-    // Note: Transform preservation depends on implementation details
-    // The test ensures the export completes without crashing
+    let outTrack = try #require(videoTrack)
+    let outTransform = try await outTrack.load(.preferredTransform)
+    // Compare with tolerance to account for floating-point rounding in transform storage
+    let epsilon: CGFloat = 1e-6
+    #expect(abs(outTransform.a - rotationTransform.a) < epsilon)
+    #expect(abs(outTransform.b - rotationTransform.b) < epsilon)
+    #expect(abs(outTransform.c - rotationTransform.c) < epsilon)
+    #expect(abs(outTransform.d - rotationTransform.d) < epsilon)
+    #expect(abs(outTransform.tx - rotationTransform.tx) < epsilon)
+    #expect(abs(outTransform.ty - rotationTransform.ty) < epsilon)
   }
 
   /// https://github.com/finnvoor/fx-upscale/commit/e6666afdb9a5ce1eda38437bec25b0743b740360
@@ -529,7 +646,7 @@ struct ExportSessionTests {
     defer { TestVideoGenerator.cleanup(outputURL) }
 
     // Export - should not crash even if color info is missing
-    let asset = AVAsset(url: inputURL)
+    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
       asset: asset,
       outputCodec: .h264,
@@ -544,7 +661,7 @@ struct ExportSessionTests {
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/7
-  @Test("Audio track is preserved", .disabled("Audio generation not implemented in test helper"))
+  @Test("Audio track is preserved")
   func audioFormatMaintained() async throws {
     try requireMetal()
 
@@ -567,7 +684,7 @@ struct ExportSessionTests {
       .appendingPathComponent("with_audio_\(UUID().uuidString).mov")
     defer { TestVideoGenerator.cleanup(outputURL) }
 
-    let asset = AVAsset(url: inputURL)
+    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
       asset: asset,
       outputCodec: .h264,
@@ -579,7 +696,7 @@ struct ExportSessionTests {
 
     // Check that audio track exists in output if it existed in input
     let inputAudioTracks = try await asset.loadTracks(withMediaType: .audio)
-    let outputAsset = AVAsset(url: outputURL)
+    let outputAsset = AVURLAsset(url: outputURL)
     let outputAudioTracks = try await outputAsset.loadTracks(withMediaType: .audio)
 
     if !inputAudioTracks.isEmpty {
@@ -606,7 +723,7 @@ struct ExportSessionTests {
       .appendingPathComponent("metadata_\(UUID().uuidString).mov")
     defer { TestVideoGenerator.cleanup(outputURL) }
 
-    let asset = AVAsset(url: inputURL)
+    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
       asset: asset,
       outputCodec: .h264,
@@ -642,7 +759,7 @@ struct ExportSessionTests {
       .appendingPathComponent("progress_\(UUID().uuidString).mov")
     defer { TestVideoGenerator.cleanup(outputURL) }
 
-    let asset = AVAsset(url: inputURL)
+    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
       asset: asset,
       outputCodec: .h264,
@@ -681,7 +798,7 @@ struct ExportSessionTests {
     FileManager.default.createFile(atPath: outputURL.path, contents: Data(), attributes: nil)
     defer { TestVideoGenerator.cleanup(outputURL) }
 
-    let asset = AVAsset(url: inputURL)
+    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
       asset: asset,
       outputCodec: .h264,
@@ -701,4 +818,60 @@ struct ExportSessionTests {
 struct TestSkipError: Error, CustomStringConvertible {
   let description: String
   init(_ message: String) { self.description = message }
+}
+
+// MARK: - Dimension Calculation Tests
+
+@Suite("Dimension Calculation")
+struct DimensionCalculationTests {
+  @Test("Defaults to 2x when no dimensions requested")
+  func defaultDoubles() {
+    let out = calculateOutputDimensions(
+      inputSize: CGSize(width: 640, height: 480),
+      requestedWidth: nil, requestedHeight: nil)
+    #expect(out == CGSize(width: 1280, height: 960))
+  }
+
+  @Test("Width-only preserves aspect ratio")
+  func widthOnly() {
+    let out = calculateOutputDimensions(
+      inputSize: CGSize(width: 1920, height: 1080),
+      requestedWidth: 3840, requestedHeight: nil)
+    #expect(out == CGSize(width: 3840, height: 2160))
+  }
+
+  @Test("Height-only preserves aspect ratio")
+  func heightOnly() {
+    let out = calculateOutputDimensions(
+      inputSize: CGSize(width: 1920, height: 1080),
+      requestedWidth: nil, requestedHeight: 2160)
+    #expect(out == CGSize(width: 3840, height: 2160))
+  }
+
+  @Test("Both width and height honored")
+  func bothProvided() {
+    let out = calculateOutputDimensions(
+      inputSize: CGSize(width: 1920, height: 1080),
+      requestedWidth: 1000, requestedHeight: 800)
+    #expect(out == CGSize(width: 1000, height: 800))
+  }
+
+  @Test("Odd widths are rounded up to even")
+  func oddDimensionsAreEvened() {
+    let out = calculateOutputDimensions(
+      inputSize: CGSize(width: 1001, height: 563),
+      requestedWidth: 2001, requestedHeight: nil)
+    #expect(Int(out.width) % 2 == 0)
+    #expect(Int(out.height) % 2 == 0)
+  }
+
+  @Test("Non-integer aspect ratios produce even dimensions")
+  func nonIntegerRatio() {
+    // 720x405 → request width 1000 → height 562.5 → rounded 563 → evened to 564
+    let out = calculateOutputDimensions(
+      inputSize: CGSize(width: 720, height: 405),
+      requestedWidth: 1000, requestedHeight: nil)
+    #expect(Int(out.width) == 1000)
+    #expect(Int(out.height) % 2 == 0)
+  }
 }

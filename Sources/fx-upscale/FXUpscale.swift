@@ -4,17 +4,32 @@ import Foundation
 import SwiftTUI
 import Upscaling
 
-// MARK: - MetalFXUpscale
+// MARK: - FXUpscale
 
 @main struct FXUpscale: AsyncParsableCommand {
+  // MARK: Arguments
+
   @Argument(help: "The video file to upscale", transform: URL.init(fileURLWithPath:)) var url: URL
 
   @Option(name: .shortAndLong, help: "The output file width") var width: Int?
-  @Option(name: .shortAndLong, help: "The output file height") var height: Int?
-  @Option(name: .shortAndLong, help: "Output codec: 'hevc' or 'h264' (default: h264)")
-  var codec: String = "h264"
+
+  // Use a custom short name to avoid colliding with ArgumentParser's built-in `-h` for `--help`.
+  @Option(
+    name: [.customShort("H"), .long],
+    help: "The output file height"
+  )
+  var height: Int?
+
+  @Option(
+    name: .shortAndLong,
+    help: "Output codec"
+  )
+  var codec: Codec = .h264
+
   @Option(name: .shortAndLong, help: "Output quality: 1-100 (default: encoder default)")
   var quality: Int?
+
+  // MARK: Run
 
   mutating func run() async throws {
     guard ["mov", "m4v", "mp4"].contains(url.pathExtension.lowercased()) else {
@@ -25,11 +40,18 @@ import Upscaling
       throw ValidationError("File does not exist at \(url.path(percentEncoded: false))")
     }
 
+    if let width, width <= 0 {
+      throw ValidationError("--width must be a positive integer")
+    }
+    if let height, height <= 0 {
+      throw ValidationError("--height must be a positive integer")
+    }
+
     if let quality, !(1...100).contains(quality) {
       throw ValidationError("Quality must be between 1 and 100")
     }
 
-    let asset = AVAsset(url: url)
+    let asset = AVURLAsset(url: url)
     guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
       throw ValidationError("Failed to get video track from input file")
     }
@@ -56,22 +78,17 @@ import Upscaling
     )
 
     guard outputSize.width > 0, outputSize.height > 0 else {
-      throw ValidationError("Width and height must be positive integers")
+      throw ValidationError("Computed output dimensions are invalid.")
     }
 
     guard Int(outputSize.width) <= UpscalingExportSession.maxOutputSize,
       Int(outputSize.height) <= UpscalingExportSession.maxOutputSize
     else {
-      throw ValidationError("Maximum supported width/height: 16384")
+      throw ValidationError(
+        "Maximum supported width/height: \(UpscalingExportSession.maxOutputSize)")
     }
-    let outputCodec: AVVideoCodecType? =
-      switch codec.lowercased() {
-      case "hevc": .hevc
-      case "h264": .h264
-      default:
-        throw ValidationError("Invalid codec '\(codec)'. Supported codecs: hevc, h264")
-      }
 
+    let outputCodec: AVVideoCodecType = codec.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
 
     let exportSession = UpscalingExportSession(
@@ -80,7 +97,7 @@ import Upscaling
       preferredOutputURL: url.renamed { "\($0) Upscaled" },
       outputSize: outputSize,
       quality: normalizedQuality,
-      creator: ProcessInfo.processInfo.processName
+      creator: "fx-upscale"
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
@@ -88,11 +105,27 @@ import Upscaling
       [
         "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) ",
         "to \(Int(outputSize.width))x\(Int(outputSize.height)) ",
-        "using codec: \(outputCodec?.rawValue ?? "hevc")\(qualityInfo)",
+        "using codec: \(outputCodec.rawValue)\(qualityInfo)",
       ].joined())
     ProgressBar.start(progress: exportSession.progress)
     defer { ProgressBar.stop() }
     try await exportSession.export()
     CommandLine.success("Video successfully upscaled!")
+  }
+}
+
+// MARK: - Codec
+
+extension FXUpscale {
+  enum Codec: String, ExpressibleByArgument, CaseIterable {
+    case h264
+    case hevc
+
+    var avCodec: AVVideoCodecType {
+      switch self {
+      case .h264: .h264
+      case .hevc: .hevc
+      }
+    }
   }
 }
