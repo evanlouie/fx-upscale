@@ -45,6 +45,13 @@ enum Terminal {
     print("\r" + ANSI.clearToEndOfLine, terminator: "")
     fflush(Darwin.stdout)
   }
+
+  /// Emits the sequences needed to restore the cursor. Safe to call from a signal handler:
+  /// uses only `fputs` + `fflush`, no Swift runtime allocation.
+  static func restoreCursorUnsafe() {
+    fputs("\r" + ANSI.clearToEndOfLine + ANSI.showCursor + "\n", Darwin.stdout)
+    fflush(Darwin.stdout)
+  }
 }
 
 // MARK: - ProgressBar
@@ -58,11 +65,12 @@ enum ProgressBar {
     // spam in pipes/CI. A single completion line is emitted by the caller
     // via `Terminal.success`, so we simply no-op here.
     guard Terminal.isTTY else { return }
+    installSignalHandlersIfNeeded()
     print(ANSI.hideCursor, terminator: "")
     task = Task {
       while !Task.isCancelled {
         render(progress: progress)
-        try? await Task.sleep(nanoseconds: frameIntervalNanoseconds)
+        try? await Task.sleep(for: frameInterval)
       }
     }
   }
@@ -78,7 +86,7 @@ enum ProgressBar {
 
   // MARK: Private
 
-  private static let frameIntervalNanoseconds: UInt64 = 80_000_000
+  private static let frameInterval: Duration = .milliseconds(80)
   private static let minBarColumns = 10
   private static let defaultColumns = 80
   private static let percentFieldWidth = 8
@@ -90,7 +98,32 @@ enum ProgressBar {
   private static let openBracket = ANSI.style("[", ANSI.brightCyan, ANSI.bold)
   private static let closeBracket = ANSI.style("]", ANSI.brightCyan, ANSI.bold)
 
+  /// Single-writer invariant: `task` is only ever mutated from `start()`/`stop()`, which the
+  /// CLI invokes from its single `async run()` flow. The marker silences strict-concurrency
+  /// diagnostics without introducing a lock for a value that's only touched in serial.
   private nonisolated(unsafe) static var task: Task<Void, Never>?
+
+  /// Retains the `DispatchSourceSignal` instances for SIGINT/SIGTERM. Installed once on
+  /// first `start()` call.
+  private nonisolated(unsafe) static var signalSources: [DispatchSourceSignal] = []
+
+  /// Installs SIGINT/SIGTERM handlers that restore the terminal cursor before the process
+  /// exits. Without this, Ctrl-C during a render leaves the terminal in a hidden-cursor state
+  /// because the `defer { ProgressBar.stop() }` in the caller never runs.
+  private static func installSignalHandlersIfNeeded() {
+    guard signalSources.isEmpty else { return }
+    signalSources = [SIGINT, SIGTERM].map { sig in
+      signal(sig, SIG_IGN)
+      let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+      source.setEventHandler {
+        Terminal.restoreCursorUnsafe()
+        // 128 + signal number is the conventional shell exit code for signal termination.
+        exit(128 + sig)
+      }
+      source.resume()
+      return source
+    }
+  }
 
   private static func render(progress: Progress) {
     let cols = max(
@@ -113,7 +146,8 @@ enum ProgressBar {
       components.append(String(repeating: " ", count: cols - completed - 1))
     }
     components.append(closeBracket)
-    components.append(ANSI.style(String(format: " %.2f%%", fraction * 100), ANSI.gray))
+    let percent = fraction.formatted(.percent.precision(.fractionLength(2)))
+    components.append(ANSI.style(" " + percent, ANSI.gray))
 
     print("\r" + ANSI.clearToEndOfLine + components.joined(), terminator: "")
     fflush(Darwin.stdout)

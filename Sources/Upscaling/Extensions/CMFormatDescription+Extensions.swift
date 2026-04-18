@@ -11,53 +11,49 @@ extension CMFormatDescription {
     }
   }
 
+  private static let colorPrimariesMap: [String: String] = [
+    kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String: AVVideoColorPrimaries_ITU_R_709_2,
+    kCMFormatDescriptionColorPrimaries_EBU_3213 as String: AVVideoColorPrimaries_EBU_3213,
+    kCMFormatDescriptionColorPrimaries_SMPTE_C as String: AVVideoColorPrimaries_SMPTE_C,
+    kCMFormatDescriptionColorPrimaries_P3_D65 as String: AVVideoColorPrimaries_P3_D65,
+    kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String: AVVideoColorPrimaries_ITU_R_2020,
+  ]
+
+  private static let colorTransferFunctionMap: [String: String] = [
+    kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String: AVVideoTransferFunction_ITU_R_709_2,
+    kCMFormatDescriptionTransferFunction_SMPTE_240M_1995 as String:
+      AVVideoTransferFunction_SMPTE_240M_1995,
+    kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String:
+      AVVideoTransferFunction_SMPTE_ST_2084_PQ,
+    kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String:
+      AVVideoTransferFunction_ITU_R_2100_HLG,
+    kCMFormatDescriptionTransferFunction_Linear as String: AVVideoTransferFunction_Linear,
+  ]
+
+  private static let colorYCbCrMatrixMap: [String: String] = [
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String: AVVideoYCbCrMatrix_ITU_R_709_2,
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4 as String: AVVideoYCbCrMatrix_ITU_R_601_4,
+    kCMFormatDescriptionYCbCrMatrix_SMPTE_240M_1995 as String:
+      AVVideoYCbCrMatrix_SMPTE_240M_1995,
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String: AVVideoYCbCrMatrix_ITU_R_2020,
+  ]
+
   var colorPrimaries: String? {
-    switch extensions[
-      kCMFormatDescriptionExtension_ColorPrimaries
-    ].flatMap({ CFGetTypeID($0) == CFStringGetTypeID() ? ($0 as! CFString) : nil }) {
-    case kCMFormatDescriptionColorPrimaries_ITU_R_709_2: AVVideoColorPrimaries_ITU_R_709_2
-    #if os(macOS)
-      case kCMFormatDescriptionColorPrimaries_EBU_3213: AVVideoColorPrimaries_EBU_3213
-    #endif
-    case kCMFormatDescriptionColorPrimaries_SMPTE_C: AVVideoColorPrimaries_SMPTE_C
-    case kCMFormatDescriptionColorPrimaries_P3_D65: AVVideoColorPrimaries_P3_D65
-    case kCMFormatDescriptionColorPrimaries_ITU_R_2020: AVVideoColorPrimaries_ITU_R_2020
-    default: nil
-    }
+    (extensions[kCMFormatDescriptionExtension_ColorPrimaries] as? String)
+      .flatMap { Self.colorPrimariesMap[$0] }
   }
 
   var colorTransferFunction: String? {
-    switch extensions[
-      kCMFormatDescriptionExtension_TransferFunction
-    ].flatMap({ CFGetTypeID($0) == CFStringGetTypeID() ? ($0 as! CFString) : nil }) {
-    case kCMFormatDescriptionTransferFunction_ITU_R_709_2: AVVideoTransferFunction_ITU_R_709_2
-    #if os(macOS)
-      case kCMFormatDescriptionTransferFunction_SMPTE_240M_1995:
-        AVVideoTransferFunction_SMPTE_240M_1995
-    #endif
-    case kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ:
-      AVVideoTransferFunction_SMPTE_ST_2084_PQ
-    case kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG: AVVideoTransferFunction_ITU_R_2100_HLG
-    case kCMFormatDescriptionTransferFunction_Linear: AVVideoTransferFunction_Linear
-    default: nil
-    }
+    (extensions[kCMFormatDescriptionExtension_TransferFunction] as? String)
+      .flatMap { Self.colorTransferFunctionMap[$0] }
   }
 
   var colorYCbCrMatrix: String? {
-    switch extensions[
-      kCMFormatDescriptionExtension_YCbCrMatrix
-    ].flatMap({ CFGetTypeID($0) == CFStringGetTypeID() ? ($0 as! CFString) : nil }) {
-    case kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2: AVVideoYCbCrMatrix_ITU_R_709_2
-    case kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4: AVVideoYCbCrMatrix_ITU_R_601_4
-    #if os(macOS)
-      case kCMFormatDescriptionYCbCrMatrix_SMPTE_240M_1995: AVVideoYCbCrMatrix_SMPTE_240M_1995
-    #endif
-    case kCMFormatDescriptionYCbCrMatrix_ITU_R_2020: AVVideoYCbCrMatrix_ITU_R_2020
-    default: nil
-    }
+    (extensions[kCMFormatDescriptionExtension_YCbCrMatrix] as? String)
+      .flatMap { Self.colorYCbCrMatrixMap[$0] }
   }
 
-  @available(macOS 14.0, iOS 17.0, *) var hasLeftAndRightEye: Bool {
+  var hasLeftAndRightEye: Bool {
     var hasLeftEye = false
     var hasRightEye = false
     for collection in tagCollections ?? [] {

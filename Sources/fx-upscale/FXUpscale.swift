@@ -6,6 +6,12 @@ import Upscaling
 // MARK: - FXUpscale
 
 @main struct FXUpscale: AsyncParsableCommand {
+  static let configuration = CommandConfiguration(
+    commandName: "fx-upscale",
+    abstract: "Upscale a video file using MetalFX spatial scaling.",
+    version: "1.1.0"
+  )
+
   // MARK: Arguments
 
   @Argument(help: "The video file to upscale", transform: URL.init(fileURLWithPath:)) var url: URL
@@ -28,9 +34,9 @@ import Upscaling
   @Option(name: .shortAndLong, help: "Output quality: 1-100 (default: encoder default)")
   var quality: Int?
 
-  // MARK: Run
+  // MARK: Validation
 
-  mutating func run() async throws {
+  func validate() throws {
     guard ["mov", "m4v", "mp4"].contains(url.pathExtension.lowercased()) else {
       throw ValidationError("Unsupported file type. Supported types: mov, m4v, mp4")
     }
@@ -45,11 +51,14 @@ import Upscaling
     if let height, height <= 0 {
       throw ValidationError("--height must be a positive integer")
     }
-
     if let quality, !(1...100).contains(quality) {
       throw ValidationError("Quality must be between 1 and 100")
     }
+  }
 
+  // MARK: Run
+
+  func run() async throws {
     let asset = AVURLAsset(url: url)
     guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
       throw ValidationError("Failed to get video track from input file")

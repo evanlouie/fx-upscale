@@ -12,13 +12,13 @@ import Foundation
 /// Performs MetalFX spatial upscaling of `CVPixelBuffer`s.
 ///
 /// The upscaler is created with a fixed input/output size and can be reused across many frames.
-/// It is safe to invoke the public `upscale` methods concurrently; each call allocates its own
-/// per-invocation GPU intermediate texture, so in-flight command buffers do not share mutable
-/// state.
+/// Call `upscale(_:)` from any task; the actor serializes access to the shared Metal state
+/// (command queue, texture cache, pixel-buffer pool) while allowing GPU work to run in parallel
+/// via MetalFX command buffers.
 ///
 /// - Important: Input buffers must be `kCVPixelFormatType_32BGRA`. HDR / 10-bit buffers are not
 ///   supported by this 8-bit path and will throw `Error.unsupportedPixelFormat`.
-public final class Upscaler: @unchecked Sendable {
+public actor Upscaler {
   // MARK: Lifecycle
 
   /// Creates an `Upscaler`.
@@ -46,7 +46,10 @@ public final class Upscaler: @unchecked Sendable {
 
       var pixelBufferPool: CVPixelBufferPool?
       let poolAttributes: [String: Any] = [
-        kCVPixelBufferPoolMinimumBufferCountKey as String: Self.minimumPoolBufferCount
+        kCVPixelBufferPoolMinimumBufferCountKey as String: Self.minimumPoolBufferCount,
+        // Release idle buffers after one second so long-running exports don't hold onto
+        // memory proportional to the worst-case in-flight burst.
+        kCVPixelBufferPoolMaximumBufferAgeKey as String: 1.0 as CFNumber,
       ]
       CVPixelBufferPoolCreate(
         nil,
@@ -60,8 +63,8 @@ public final class Upscaler: @unchecked Sendable {
 
   // MARK: Public
 
-  public let inputSize: CGSize
-  public let outputSize: CGSize
+  public nonisolated let inputSize: CGSize
+  public nonisolated let outputSize: CGSize
 
   /// Upscales a pixel buffer asynchronously.
   ///
@@ -74,21 +77,16 @@ public final class Upscaler: @unchecked Sendable {
   /// - Returns: The upscaled pixel buffer.
   /// - Throws: `Upscaler.Error` on failure; the original input buffer is *not* silently returned.
   @discardableResult public func upscale(
-    _ pixelBuffer: CVPixelBuffer,
-    pixelBufferPool: CVPixelBufferPool? = nil,
-    outputPixelBuffer: CVPixelBuffer? = nil
-  ) async throws -> CVPixelBuffer {
+    _ pixelBuffer: sending CVPixelBuffer,
+    pixelBufferPool: sending CVPixelBufferPool? = nil,
+    outputPixelBuffer: sending CVPixelBuffer? = nil
+  ) async throws -> sending CVPixelBuffer {
     #if canImport(MetalFX)
-      let (commandBuffer, output, cvColor, cvUpscaled) =
-        try synchronizationQueue.sync {
-          let prepared = try upscaleCommandBuffer(
-            pixelBuffer,
-            pixelBufferPool: pixelBufferPool,
-            outputPixelBuffer: outputPixelBuffer
-          )
-          advanceFrameCounterLocked()
-          return prepared
-        }
+      let (commandBuffer, output, cvColor, cvUpscaled) = try upscaleCommandBuffer(
+        pixelBuffer,
+        pixelBufferPool: pixelBufferPool,
+        outputPixelBuffer: outputPixelBuffer
+      )
       try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, Swift.Error>) in
         nonisolated(unsafe) let retainedColor = cvColor
@@ -104,77 +102,13 @@ public final class Upscaler: @unchecked Sendable {
         }
         commandBuffer.commit()
       }
-      return output
+      // The output buffer was freshly allocated from the pool and is not referenced by
+      // any other actor-isolated state after the command buffer completes, so transferring
+      // it across the isolation boundary is safe.
+      nonisolated(unsafe) let transferred = output
+      return transferred
     #else
       throw Error.metalFXUnavailable
-    #endif
-  }
-
-  /// Upscales a pixel buffer synchronously, blocking until the GPU completes.
-  @discardableResult public func upscale(
-    _ pixelBuffer: CVPixelBuffer,
-    pixelBufferPool: CVPixelBufferPool? = nil,
-    outputPixelBuffer: CVPixelBuffer? = nil
-  ) throws -> CVPixelBuffer {
-    #if canImport(MetalFX)
-      let (commandBuffer, output, cvColor, cvUpscaled) =
-        try synchronizationQueue.sync {
-          let prepared = try upscaleCommandBuffer(
-            pixelBuffer,
-            pixelBufferPool: pixelBufferPool,
-            outputPixelBuffer: outputPixelBuffer
-          )
-          advanceFrameCounterLocked()
-          return prepared
-        }
-      commandBuffer.commit()
-      commandBuffer.waitUntilCompleted()
-      _ = cvColor
-      _ = cvUpscaled
-      if let error = commandBuffer.error { throw error }
-      return output
-    #else
-      throw Error.metalFXUnavailable
-    #endif
-  }
-
-  /// Upscales a pixel buffer asynchronously and delivers the result (or error) to the callback.
-  public func upscale(
-    _ pixelBuffer: CVPixelBuffer,
-    pixelBufferPool: CVPixelBufferPool? = nil,
-    outputPixelBuffer: CVPixelBuffer? = nil,
-    completionHandler: @escaping @Sendable (Result<CVPixelBuffer, Swift.Error>) -> Void
-  ) {
-    #if canImport(MetalFX)
-      do {
-        let (commandBuffer, upscaled, cvColor, cvUpscaled) =
-          try synchronizationQueue.sync {
-            let prepared = try upscaleCommandBuffer(
-              pixelBuffer,
-              pixelBufferPool: pixelBufferPool,
-              outputPixelBuffer: outputPixelBuffer
-            )
-            advanceFrameCounterLocked()
-            return prepared
-          }
-        nonisolated(unsafe) let output = upscaled
-        nonisolated(unsafe) let retainedColor = cvColor
-        nonisolated(unsafe) let retainedUpscaled = cvUpscaled
-        commandBuffer.addCompletedHandler { commandBuffer in
-          _ = retainedColor
-          _ = retainedUpscaled
-          if let error = commandBuffer.error {
-            completionHandler(.failure(error))
-          } else {
-            completionHandler(.success(output))
-          }
-        }
-        commandBuffer.commit()
-      } catch {
-        completionHandler(.failure(error))
-      }
-    #else
-      completionHandler(.failure(Error.metalFXUnavailable))
     #endif
   }
 
@@ -185,34 +119,16 @@ public final class Upscaler: @unchecked Sendable {
     /// in-flight (reader → GPU → writer) without allocating per frame.
     private static let minimumPoolBufferCount = 3
 
-    /// Flush the Metal texture cache every N frames to release stale cached mappings while
-    /// keeping cache-hit rate high on the hot path.
-    private static let textureCacheFlushInterval = 120
-
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let spatialScaler: MTLFXSpatialScaler
     private let textureCache: CVMetalTextureCache
     private let pixelBufferPool: CVPixelBufferPool
-    private let synchronizationQueue = DispatchQueue(label: "com.upscaling.Upscaler")
-
-    /// Counter used to periodically flush the texture cache. Accessed only on `synchronizationQueue`.
-    private var frameCounter: Int = 0
-
-    /// Called while already holding `synchronizationQueue`. Increments the frame counter and
-    /// flushes the texture cache at the configured cadence. Folding the bookkeeping into the
-    /// existing critical section avoids a per-frame async dispatch hop.
-    private func advanceFrameCounterLocked() {
-      frameCounter &+= 1
-      if frameCounter % Self.textureCacheFlushInterval == 0 {
-        CVMetalTextureCacheFlush(textureCache, 0)
-      }
-    }
 
     private func upscaleCommandBuffer(
-      _ pixelBuffer: CVPixelBuffer,
-      pixelBufferPool: CVPixelBufferPool? = nil,
-      outputPixelBuffer: CVPixelBuffer? = nil
+      _ pixelBuffer: sending CVPixelBuffer,
+      pixelBufferPool: sending CVPixelBufferPool? = nil,
+      outputPixelBuffer: sending CVPixelBuffer? = nil
     ) throws -> (MTLCommandBuffer, CVPixelBuffer, CVMetalTexture, CVMetalTexture) {
       guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
         throw Error.unsupportedPixelFormat

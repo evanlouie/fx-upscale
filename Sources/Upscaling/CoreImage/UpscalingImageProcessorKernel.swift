@@ -50,7 +50,26 @@ public final class UpscalingImageProcessorKernel: CIImageProcessorKernel {
         guard let blitCommandEncoder = commandBuffer.makeBlitCommandEncoder() else {
           throw Error.couldNotMakeBlitCommandEncoder
         }
-        blitCommandEncoder.copy(from: intermediateOutputTexture, to: outputTexture)
+        // The whole-texture `copy(from:to:)` overload traps when the two textures don't have
+        // identical dimensions, which CoreImage may produce when it tiles output. Use the
+        // explicit-region overload and clamp the copy size to the smaller of the two.
+        guard intermediateOutputTexture.pixelFormat == outputTexture.pixelFormat else {
+          blitCommandEncoder.endEncoding()
+          throw Error.textureFormatMismatch
+        }
+        let copyWidth = min(intermediateOutputTexture.width, outputTexture.width)
+        let copyHeight = min(intermediateOutputTexture.height, outputTexture.height)
+        blitCommandEncoder.copy(
+          from: intermediateOutputTexture,
+          sourceSlice: 0,
+          sourceLevel: 0,
+          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+          sourceSize: MTLSize(width: copyWidth, height: copyHeight, depth: 1),
+          to: outputTexture,
+          destinationSlice: 0,
+          destinationLevel: 0,
+          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+        )
         blitCommandEncoder.endEncoding()
       }
     #endif
@@ -88,6 +107,7 @@ extension UpscalingImageProcessorKernel {
     case missingCommandBuffer
     case missingIntermediateOutputTexture
     case couldNotMakeBlitCommandEncoder
+    case textureFormatMismatch
 
     public var errorDescription: String? {
       switch self {
@@ -97,6 +117,7 @@ extension UpscalingImageProcessorKernel {
       case .missingCommandBuffer: "Output CoreImage processor did not provide a Metal command buffer."
       case .missingIntermediateOutputTexture: "Missing intermediate output texture argument."
       case .couldNotMakeBlitCommandEncoder: "Failed to create Metal blit command encoder."
+      case .textureFormatMismatch: "Intermediate and output texture pixel formats must match."
       }
     }
   }

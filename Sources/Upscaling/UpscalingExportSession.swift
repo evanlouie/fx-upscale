@@ -1,5 +1,7 @@
-@preconcurrency import AVFoundation
+import AVFoundation
+import Foundation
 import VideoToolbox
+import os
 
 // MARK: - UpscalingExportSession
 
@@ -258,13 +260,19 @@ public final class UpscalingExportSession: @unchecked Sendable {
         try? FileManager.default.removeItem(at: outputURL)
         throw error
       }
+    case .completed:
+      // Writer already finished (rare race from a concurrent `finishWriting` call) —
+      // nothing to do.
+      break
     case .cancelled:
       try? FileManager.default.removeItem(at: outputURL)
       throw CancellationError()
     case .failed:
       try? FileManager.default.removeItem(at: outputURL)
       throw assetWriter.error ?? Error.failedToStartWriting
-    default:
+    case .unknown:
+      fallthrough
+    @unknown default:
       try? FileManager.default.removeItem(at: outputURL)
       throw Error.failedToStartWriting
     }
@@ -492,8 +500,12 @@ public final class UpscalingExportSession: @unchecked Sendable {
             }
             let upscaled: CVPixelBuffer
             do {
-              upscaled = try upscaler.upscale(
-                imageBuffer, pixelBufferPool: adaptor.pixelBufferPool)
+              nonisolated(unsafe) let capturedBuffer = imageBuffer
+              nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
+              upscaled = try runAsyncBlocking {
+                try await upscaler.upscale(
+                  capturedBuffer, pixelBufferPool: capturedPool)
+              }
             } catch {
               input.markAsFinished()
               resume.resume(continuation: continuation, throwing: error)
@@ -578,11 +590,18 @@ public final class UpscalingExportSession: @unchecked Sendable {
             let upscaledLeft: CVPixelBuffer
             let upscaledRight: CVPixelBuffer
             do {
-              // The new TaggedPixelBufferGroupReceiver exposes a CVMutablePixelBuffer.Pool,
-              // which is not interchangeable with the legacy CVPixelBufferPool that
-              // `Upscaler.upscale` accepts. Fall back to the upscaler's internal pool.
-              upscaledLeft = try upscaler.upscale(leftEyePixelBuffer)
-              upscaledRight = try upscaler.upscale(rightEyePixelBuffer)
+              // The `TaggedPixelBufferGroupReceiver` pool is a `CVMutablePixelBuffer.Pool`
+              // which is not interchangeable with the `CVPixelBufferPool` that
+              // `Upscaler.upscale` accepts, so we let the upscaler use its internal pool.
+              // Left and right are awaited sequentially because the upscaler actor serializes
+              // entry anyway — `async let` would only add scheduler overhead per frame.
+              nonisolated(unsafe) let leftCaptured = leftEyePixelBuffer
+              nonisolated(unsafe) let rightCaptured = rightEyePixelBuffer
+              (upscaledLeft, upscaledRight) = try runAsyncBlocking {
+                let left = try await upscaler.upscale(leftCaptured)
+                let right = try await upscaler.upscale(rightCaptured)
+                return (left, right)
+              }
             } catch {
               input.markAsFinished()
               resume.resume(continuation: continuation, throwing: error)
@@ -623,28 +642,48 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
 // MARK: - AsyncResume
 
+/// Bridges an `async throws` operation to a synchronous caller by blocking the current
+/// thread until the detached task completes. Used only at the AVFoundation
+/// `requestMediaDataWhenReady` GCD-callback boundary where we cannot `await` directly.
+///
+/// - Important: Must not be called from a cooperative-pool thread (it would deadlock if
+///   the pool is saturated). AVFoundation's writer callback runs on a dedicated GCD queue,
+///   so this is safe there.
+private func runAsyncBlocking<T>(
+  _ body: sending @escaping @Sendable () async throws -> sending T
+) throws -> sending T {
+  let semaphore = DispatchSemaphore(value: 0)
+  nonisolated(unsafe) var outcome: Result<T, Swift.Error>?
+  Task.detached {
+    do {
+      outcome = .success(try await body())
+    } catch {
+      outcome = .failure(error)
+    }
+    semaphore.signal()
+  }
+  semaphore.wait()
+  // `outcome` is always written before `signal()` and never touched again after `wait()`
+  // returns, so the force-unwrap is safe and the value is in a disconnected region.
+  nonisolated(unsafe) let result = outcome!
+  return try result.get()
+}
+
 /// Helper that guarantees a `CheckedContinuation` is resumed exactly once.
 private final class AsyncResume: @unchecked Sendable {
-  private let lock = NSLock()
-  private var resumed = false
+  private let state = OSAllocatedUnfairLock<Bool>(initialState: false)
 
-  var isResumed: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return resumed
-  }
+  var isResumed: Bool { state.withLock { $0 } }
 
   func resume(
     continuation: CheckedContinuation<Void, Swift.Error>,
     throwing error: Swift.Error?
   ) {
-    lock.lock()
-    if resumed {
-      lock.unlock()
-      return
+    let firstResume = state.withLock { resumed in
+      defer { resumed = true }
+      return !resumed
     }
-    resumed = true
-    lock.unlock()
+    guard firstResume else { return }
     if let error {
       continuation.resume(throwing: error)
     } else {

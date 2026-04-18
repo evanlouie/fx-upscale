@@ -378,22 +378,6 @@ struct UpscalingFilterTests {
 
 @Suite("Upscaler Tests")
 struct UpscalerTests {
-  @Test("Upscaler sync API produces correct output size")
-  func upscalerSyncAPI() throws {
-    let inputSize = CGSize(width: 640, height: 480)
-    let outputSize = CGSize(width: 1280, height: 960)
-
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      throw TestSkipError("Metal device not available")
-    }
-
-    let inputBuffer = try createPixelBuffer(size: inputSize)
-    let outputBuffer = try upscaler.upscale(inputBuffer)
-
-    #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
-    #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
-  }
-
   @Test("Upscaler async API produces correct output size")
   func upscalerAsyncAPI() async throws {
     let inputSize = CGSize(width: 320, height: 240)
@@ -410,37 +394,8 @@ struct UpscalerTests {
     #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
   }
 
-  @Test("Upscaler callback API produces correct output size")
-  func upscalerCallbackAPI() throws {
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
-
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      throw TestSkipError("Metal device not available")
-    }
-
-    let inputBuffer = try createPixelBuffer(size: inputSize)
-
-    let semaphore = DispatchSemaphore(value: 0)
-    nonisolated(unsafe) var outputBuffer: CVPixelBuffer?
-
-    upscaler.upscale(inputBuffer) { result in
-      if case .success(let buffer) = result {
-        outputBuffer = buffer
-      }
-      semaphore.signal()
-    }
-
-    let timeout = semaphore.wait(timeout: .now() + 5)
-    #expect(timeout == .success)
-
-    let output = try #require(outputBuffer)
-    #expect(CVPixelBufferGetWidth(output) == Int(outputSize.width))
-    #expect(CVPixelBufferGetHeight(output) == Int(outputSize.height))
-  }
-
   @Test("Upscaler handles non-square dimensions")
-  func upscalerNonSquare() throws {
+  func upscalerNonSquare() async throws {
     let inputSize = CGSize(width: 1920, height: 800)
     let outputSize = CGSize(width: 3840, height: 1600)
 
@@ -449,21 +404,22 @@ struct UpscalerTests {
     }
 
     let inputBuffer = try createPixelBuffer(size: inputSize)
-    let outputBuffer = try upscaler.upscale(inputBuffer)
+    let outputBuffer = try await upscaler.upscale(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
     #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
   }
 
   @Test("Upscaler rejects mismatched input size")
-  func upscalerRejectsMismatchedInputSize() throws {
+  func upscalerRejectsMismatchedInputSize() async throws {
     let upscalerSize = CGSize(width: 640, height: 480)
     guard let upscaler = Upscaler(inputSize: upscalerSize, outputSize: CGSize(width: 1280, height: 960)) else {
       throw TestSkipError("Metal device not available")
     }
     let wrongBuffer = try createPixelBuffer(size: CGSize(width: 320, height: 240))
-    #expect(throws: Upscaler.Error.self) {
-      _ = try upscaler.upscale(wrongBuffer)
+    nonisolated(unsafe) let captured = wrongBuffer
+    await #expect(throws: Upscaler.Error.self) {
+      _ = try await upscaler.upscale(captured)
     }
   }
 
