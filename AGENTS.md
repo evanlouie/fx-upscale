@@ -123,6 +123,29 @@ MetalFX pipeline is only exercised on macOS.
 BREAKING CHANGE: iOS is no longer a supported platform.
 ```
 
+## Known Playback Issues
+
+### IINA: arrow-key seeks jump to start on HEVC output
+
+Symptom: in IINA, pressing `→` on an fx-upscale HEVC output jumps to `t=0`
+instead of seeking forward. Plain `mpv`, VLC, and QuickTime all scrub
+correctly on the same file.
+
+Root cause: an FFmpeg bug in `libavformat/mov.c` (`mov_seek_stream`) where
+the keyframe-index lookup returns sample 0 for certain HEVC MOV files.
+Fixed upstream in [FFmpeg `d1b96c3`](https://github.com/FFmpeg/FFmpeg/commit/d1b96c380826c505a8c7e655b5ad4fdb0c2de167),
+but IINA bundles its own FFmpeg inside the `.app` and lags behind.
+Tracked in [iina/iina#4502](https://github.com/iina/iina/issues/4502).
+
+This is not fixable on the encoder side — the 1s keyframe cap from
+`UpscalingExportSession` (`kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration`)
+is still worthwhile for compliant players, but cannot work around a
+downstream index bug.
+
+Workaround for IINA users: Settings → Advanced → Additional mpv options →
+add `hr-seek` = `yes`. This forces precise (decode-forward) seeks, which
+bypass the broken keyframe lookup.
+
 ## CI/CD
 
 - CI runs on macOS (latest) for the macOS platform only
