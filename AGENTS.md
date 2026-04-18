@@ -5,7 +5,7 @@ Guidelines for AI agents working on fx-upscale, a Metal-powered video upscaling 
 ## Project Overview
 
 Swift 6.2 package with two targets:
-- **fx-upscale**: CLI executable using ArgumentParser and SwiftTUI
+- **fx-upscale**: CLI executable using ArgumentParser with a small in-tree terminal UI helper
 - **Upscaling**: Core library for MetalFX-based video upscaling
 
 Platforms: macOS 26+ (Tahoe). iOS is not supported.
@@ -192,7 +192,10 @@ Bundle.module.url(forResource: "filename", withExtension: "ext")
 ## Dependencies
 
 - [swift-argument-parser](https://github.com/apple/swift-argument-parser) - CLI parsing
-- [SwiftTUI](https://github.com/Finnvoor/SwiftTUI) - Terminal UI (progress bar)
+
+Terminal UI (info/success messages and the progress bar) is implemented in-tree
+in `Sources/fx-upscale/TerminalUI.swift` using ANSI escape codes — no external
+dependency required.
 
 Testing uses the `Testing` framework bundled with the Swift 6 toolchain (no external dependency).
 

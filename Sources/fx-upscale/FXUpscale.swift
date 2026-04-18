@@ -1,7 +1,6 @@
 import AVFoundation
 import ArgumentParser
 import Foundation
-import SwiftTUI
 import Upscaling
 
 // MARK: - FXUpscale
@@ -101,7 +100,7 @@ import Upscaling
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
-    CommandLine.info(
+    Terminal.info(
       [
         "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) ",
         "to \(Int(outputSize.width))x\(Int(outputSize.height)) ",
@@ -110,7 +109,7 @@ import Upscaling
     ProgressBar.start(progress: exportSession.progress)
     defer { ProgressBar.stop() }
     try await exportSession.export()
-    CommandLine.success("Video successfully upscaled!")
+    Terminal.success("Video successfully upscaled!")
   }
 }
 
