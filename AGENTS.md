@@ -5,6 +5,7 @@ Guidelines for AI agents working on fx-upscale, a Metal-powered video upscaling 
 ## Project Overview
 
 Swift 6.2 package with two targets:
+
 - **fx-upscale**: CLI executable using ArgumentParser with a small in-tree terminal UI helper
 - **Upscaling**: Core library for MetalFX-based video upscaling
 
@@ -48,106 +49,6 @@ swift test --filter "URL Extension"
 Test naming format: `<Suite name>/<test description>` (swift-testing uses the human-readable
 `@Suite` / `@Test` strings, not the Swift symbol names).
 
-## Code Style Guidelines
-
-### File Organization
-
-1. **Imports**: Alphabetically sorted, framework imports first
-2. **Conditional imports**: Use `#if canImport(...)` for platform-specific frameworks
-3. **MARK comments**: Structure code sections consistently:
-   ```swift
-   // MARK: - TypeName
-   // MARK: Lifecycle
-   // MARK: Public
-   // MARK: Private
-   ```
-
-### Imports Example
-
-```swift
-import AVFoundation
-import CoreImage
-import Foundation
-
-#if canImport(MetalFX)
-  import MetalFX
-#endif
-```
-
-### Naming Conventions
-
-- **Types**: PascalCase (`UpscalingExportSession`, `Upscaler`)
-- **Functions/Properties**: camelCase (`upscale`, `outputSize`)
-- **Constants**: camelCase (`maxOutputSize`)
-- **File names**: Match primary type (`Upscaler.swift`)
-- **Extensions**: `TypeName+Extensions.swift` (e.g., `URL+Extensions.swift`)
-
-### Type Design
-
-- Prefer `final class` for reference types unless inheritance is needed
-- Use `@unchecked Sendable` when manual synchronization is provided
-- Use `public` access for library APIs, internal/private otherwise
-- Define nested `Error` enums as extensions:
-
-```swift
-extension MyType {
-  enum Error: Swift.Error {
-    case someError
-    case anotherError(SomeType)
-  }
-}
-```
-
-### Control Flow
-
-- Use `guard` for early validation and unwrapping
-- Prefer `switch` expressions for mapping values:
-
-```swift
-let outputFileType: AVFileType =
-  switch url.pathExtension.lowercased() {
-  case "mov": .mov
-  case "m4v": .m4v
-  default: .mp4
-  }
-```
-
-### Properties
-
-- Computed properties for simple derivations:
-  ```swift
-  var width: Int { CVPixelBufferGetWidth(self) }
-  ```
-- Stored properties with explicit types when not obvious
-
-### Extensions
-
-- Place extensions in `Sources/<Target>/Extensions/` directory
-- One type extension per file
-- Keep extensions focused and minimal
-
-### Async/Concurrency
-
-- Use `async`/`await` for async APIs
-- Provide sync, async, and callback variants for flexibility
-- Use `nonisolated(unsafe)` when bridging to completion handlers
-- Use `DispatchQueue` for thread synchronization when needed:
-  ```swift
-  private let synchronizationQueue = DispatchQueue(label: "com.upscaling.Upscaler")
-  ```
-
-### Error Handling
-
-- Throw descriptive errors from enums
-- Use `try?` when failures should return nil/fallback
-- Clean up resources in error paths:
-  ```swift
-  } catch {
-    try? FileManager.default.removeItem(at: outputURL)
-    throw error
-  }
-  ```
-
 ## Testing Guidelines
 
 Uses **swift-testing** framework (not XCTest).
@@ -185,6 +86,7 @@ struct MyTests {
 ### Test Resources
 
 Place test resources in `Tests/<TestTarget>/Resources/` and access via:
+
 ```swift
 Bundle.module.url(forResource: "filename", withExtension: "ext")
 ```
@@ -205,7 +107,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/): `<type>(<scope
 
 - Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
 - Summary: imperative, lowercase, no trailing period, ≤ 72 chars
-- Body: required; explain *what* changed and *why* (not *how*), wrap at ~72 chars
+- Body: required; explain _what_ changed and _why_ (not _how_), wrap at ~72 chars
 - Use `!` + `BREAKING CHANGE:` footer for breaking changes
 - One logical change per commit
 
