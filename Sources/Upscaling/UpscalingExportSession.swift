@@ -16,6 +16,9 @@ public final class UpscalingExportSession: @unchecked Sendable {
   ///   - preferredOutputURL: Output URL. If a file already exists here, `export()` throws.
   ///   - outputSize: Target dimensions. Must be ≤ `maxOutputSize` on each axis.
   ///   - quality: Optional encoder quality in the range 0...1.
+  ///   - keyFrameInterval: Maximum interval between keyframes, in seconds. If `nil`, the
+  ///     encoder chooses (VideoToolbox HEVC can emit very sparse IDRs in that case, which
+  ///     breaks keyframe-snap seeking in players like IINA).
   ///   - creator: Optional creator string applied as a Spotlight xattr on macOS.
   public init(
     asset: AVAsset,
@@ -23,11 +26,13 @@ public final class UpscalingExportSession: @unchecked Sendable {
     preferredOutputURL: URL,
     outputSize: CGSize,
     quality: Double? = nil,
+    keyFrameInterval: TimeInterval? = nil,
     creator: String? = nil
   ) {
     self.asset = asset
     self.outputCodec = outputCodec
     self.quality = quality
+    self.keyFrameInterval = keyFrameInterval
     outputURL = preferredOutputURL
     self.outputSize = outputSize
     self.creator = creator
@@ -48,6 +53,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   public let outputURL: URL
   public let outputSize: CGSize
   public let quality: Double?
+  public let keyFrameInterval: TimeInterval?
   public let creator: String?
 
   public let progress: Progress
@@ -111,7 +117,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
             for: track, formatDescription: formatDescription),
           let assetWriterInput = try await Self.videoAssetWriterInput(
             for: track, formatDescription: formatDescription,
-            outputSize: outputSize, outputCodec: outputCodec, quality: quality)
+            outputSize: outputSize, outputCodec: outputCodec, quality: quality,
+            keyFrameInterval: keyFrameInterval)
         else { continue }
 
         guard assetReader.canAdd(assetReaderOutput) else {
@@ -383,7 +390,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
     formatDescription: CMFormatDescription?,
     outputSize: CGSize,
     outputCodec: AVVideoCodecType?,
-    quality: Double?
+    quality: Double?,
+    keyFrameInterval: TimeInterval?
   ) async throws -> AVAssetWriterInput? {
     var outputSettings: [String: Any] = [
       AVVideoWidthKey: Int(outputSize.width),
@@ -403,6 +411,12 @@ public final class UpscalingExportSession: @unchecked Sendable {
     var compressionProperties: [String: Any] = [:]
     if let quality {
       compressionProperties[kVTCompressionPropertyKey_Quality as String] = quality
+    }
+    if let keyFrameInterval {
+      // Without this, VideoToolbox HEVC can emit a single IDR at t=0 and rely on scene-change
+      // detection. That breaks keyframe-snap seeking (e.g. IINA arrow keys jump to start).
+      compressionProperties[kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration as String] =
+        keyFrameInterval
     }
     if formatDescription?.hasLeftAndRightEye ?? false {
       compressionProperties[kVTCompressionPropertyKey_MVHEVCVideoLayerIDs as String] = [0, 1]

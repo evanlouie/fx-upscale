@@ -45,6 +45,18 @@ import Upscaling
   )
   var quality: Int?
 
+  @Option(
+    name: [.customShort("k"), .customLong("keyframe-interval")],
+    help: ArgumentHelp(
+      "Max seconds between keyframes (0 = let encoder decide).",
+      discussion:
+        "Shorter intervals improve scrubbing responsiveness at a small size cost. "
+        + "Leaving this up to the encoder can cause HEVC output to contain only a "
+        + "single keyframe, which breaks arrow-key seeking in some players (e.g. IINA)."
+    )
+  )
+  var keyframeInterval: Double = 1.0
+
   @Flag(name: .shortAndLong, help: "Overwrite the output file if it already exists")
   var force: Bool = false
 
@@ -67,6 +79,9 @@ import Upscaling
     }
     if let quality, !(1...100).contains(quality) {
       throw ValidationError("Quality must be between 1 and 100")
+    }
+    if keyframeInterval < 0 || !keyframeInterval.isFinite {
+      throw ValidationError("--keyframe-interval must be a non-negative, finite number")
     }
   }
 
@@ -131,6 +146,7 @@ import Upscaling
       preferredOutputURL: outputURL,
       outputSize: outputSize,
       quality: normalizedQuality,
+      keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
       creator: "fx-upscale"
     )
 
