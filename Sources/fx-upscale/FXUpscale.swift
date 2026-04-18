@@ -10,9 +10,11 @@ import Upscaling
     commandName: "fx-upscale",
     abstract: "Upscale a video file using Apple's Metal / VideoToolbox upscalers.",
     discussion: """
-      By default the video is upscaled by 2×. If one of --width or --height is supplied, \
-      the other is computed from the source aspect ratio. Output dimensions are rounded up \
-      to the nearest even integer (required by H.264 / HEVC).
+      By default the video is upscaled by 2×. Pass --scale for a uniform integer factor \
+      (e.g. --scale 4 for 4× on both axes), or --width and/or --height for explicit dimensions \
+      — --scale cannot be combined with --width or --height. When only one of --width / \
+      --height is supplied, the other is computed from the source aspect ratio. Output \
+      dimensions are rounded up to the nearest even integer (required by H.264 / HEVC).
 
       HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected because the 8-bit BGRA \
       path would silently clip or shift those values.
@@ -38,6 +40,15 @@ import Upscaling
     help: "The output file height"
   )
   var height: Int?
+
+  @Option(
+    name: [.customShort("x"), .long],
+    help: ArgumentHelp(
+      "Uniform integer scale factor (e.g. 2 for 2×, 4 for 4×).",
+      discussion: "Mutually exclusive with --width and --height."
+    )
+  )
+  var scale: Int?
 
   @Option(
     name: .shortAndLong,
@@ -96,6 +107,14 @@ import Upscaling
     if let height, height <= 0 {
       throw ValidationError("--height must be a positive integer")
     }
+    if let scale {
+      if scale < 2 {
+        throw ValidationError("--scale must be an integer ≥ 2")
+      }
+      if width != nil || height != nil {
+        throw ValidationError("--scale cannot be combined with --width or --height")
+      }
+    }
     if let quality, !(1...100).contains(quality) {
       throw ValidationError("Quality must be between 1 and 100")
     }
@@ -130,8 +149,8 @@ import Upscaling
 
     let outputSize = calculateOutputDimensions(
       inputSize: inputSize,
-      requestedWidth: width,
-      requestedHeight: height
+      requestedWidth: scale.map { Int(inputSize.width) * $0 } ?? width,
+      requestedHeight: scale.map { Int(inputSize.height) * $0 } ?? height
     )
 
     guard outputSize.width > 0, outputSize.height > 0 else {
