@@ -9,6 +9,14 @@ import Upscaling
   static let configuration = CommandConfiguration(
     commandName: "fx-upscale",
     abstract: "Upscale a video file using MetalFX spatial scaling.",
+    discussion: """
+      By default the video is upscaled by 2×. If one of --width or --height is supplied, \
+      the other is computed from the source aspect ratio. Output dimensions are rounded up \
+      to the nearest even integer (required by H.264 / HEVC).
+
+      HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected because the 8-bit BGRA \
+      MetalFX path would silently clip or shift those values.
+      """,
     version: "1.1.0"
   )
 
@@ -27,12 +35,18 @@ import Upscaling
 
   @Option(
     name: .shortAndLong,
-    help: "Output codec"
+    help: "Output codec (h264 | hevc)"
   )
   var codec: Codec = .h264
 
-  @Option(name: .shortAndLong, help: "Output quality: 1-100 (default: encoder default)")
+  @Option(
+    name: .shortAndLong,
+    help: "Output quality 1-100 (higher = better, larger file; default: encoder default)"
+  )
   var quality: Int?
+
+  @Flag(name: .shortAndLong, help: "Overwrite the output file if it already exists")
+  var force: Bool = false
 
   // MARK: Validation
 
@@ -41,7 +55,7 @@ import Upscaling
       throw ValidationError("Unsupported file type. Supported types: mov, m4v, mp4")
     }
 
-    guard FileManager.default.fileExists(atPath: url.path) else {
+    guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) else {
       throw ValidationError("File does not exist at \(url.path(percentEncoded: false))")
     }
 
@@ -75,7 +89,8 @@ import Upscaling
 
     guard inputSize.width > 0, inputSize.height > 0 else {
       throw ValidationError(
-        "Invalid input video dimensions: \(Int(inputSize.width))x\(Int(inputSize.height)). The video file may be corrupted."
+        "Invalid input video dimensions: \(Int(inputSize.width))x\(Int(inputSize.height)). "
+          + "The video file may be corrupted."
       )
     }
 
@@ -98,11 +113,22 @@ import Upscaling
 
     let outputCodec: AVVideoCodecType = codec.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
+    let outputURL = url.renamed { "\($0) Upscaled" }
+
+    if FileManager.default.fileExists(atPath: outputURL.path(percentEncoded: false)) {
+      if force {
+        try FileManager.default.removeItem(at: outputURL)
+      } else {
+        throw ValidationError(
+          "Output file already exists at \(outputURL.path(percentEncoded: false)). "
+            + "Pass --force to overwrite.")
+      }
+    }
 
     let exportSession = UpscalingExportSession(
       asset: asset,
       outputCodec: outputCodec,
-      preferredOutputURL: url.renamed { "\($0) Upscaled" },
+      preferredOutputURL: outputURL,
       outputSize: outputSize,
       quality: normalizedQuality,
       creator: "fx-upscale"
@@ -110,14 +136,29 @@ import Upscaling
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
     Terminal.info(
-      [
-        "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) ",
-        "to \(Int(outputSize.width))x\(Int(outputSize.height)) ",
-        "using codec: \(outputCodec.rawValue)\(qualityInfo)",
-      ].joined())
+      "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
+        + "to \(Int(outputSize.width))x\(Int(outputSize.height)) "
+        + "using codec: \(outputCodec.rawValue)\(qualityInfo)"
+    )
+
+    // Install SIGINT/SIGTERM handlers unconditionally so Ctrl-C during pipe/CI runs still
+    // removes the partial output. The progress bar's TTY-only redraw loop is orthogonal.
+    SignalHandlers.install { [outputURL] in
+      try? FileManager.default.removeItem(at: outputURL)
+    }
+    defer { SignalHandlers.clearCleanup() }
+
     ProgressBar.start(progress: exportSession.progress)
     defer { ProgressBar.stop() }
-    try await exportSession.export()
+
+    do {
+      try await exportSession.export()
+    } catch {
+      ProgressBar.stop()
+      try? FileManager.default.removeItem(at: outputURL)
+      Terminal.error(error.localizedDescription)
+      throw ExitCode.failure
+    }
     Terminal.success("Video successfully upscaled!")
   }
 }

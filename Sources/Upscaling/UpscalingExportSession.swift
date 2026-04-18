@@ -56,8 +56,6 @@ public final class UpscalingExportSession: @unchecked Sendable {
     #if os(macOS)
       defer { progress.unpublish() }
     #endif
-    // Always clear the cancellation handler on exit so the progress object doesn't outlive the
-    // session while still retaining AVFoundation reader/writer references.
     defer { progress.cancellationHandler = nil }
 
     guard !FileManager.default.fileExists(atPath: outputURL.path(percentEncoded: false)) else {
@@ -77,13 +75,10 @@ public final class UpscalingExportSession: @unchecked Sendable {
     let assetReader = try AVAssetReader(asset: asset)
 
     let duration = try await asset.load(.duration)
-    // Use millisecond precision for smooth progress, guarding against non-numeric durations
-    // (e.g. indefinite / live streams).
     let durationUnits: Int64 =
       duration.isNumeric
       ? max(1, Int64(duration.seconds * Double(Self.progressUnitsPerSecond))) : 1
 
-    // Install a cancellation handler that tears down AVFoundation objects on user cancel.
     nonisolated(unsafe) let cancelReader = assetReader
     nonisolated(unsafe) let cancelWriter = assetWriter
     progress.cancellationHandler = {
@@ -92,16 +87,21 @@ public final class UpscalingExportSession: @unchecked Sendable {
     }
 
     var mediaTracks: [MediaTrack] = []
+    var minStartTime: CMTime = .positiveInfinity
     let tracks = try await asset.load(.tracks)
 
     for track in tracks {
       let mediaType = track.mediaType
       let formatDescription = try await track.load(.formatDescriptions).first
+      let timeRange = try await track.load(.timeRange)
+      if timeRange.start.isNumeric, timeRange.start < minStartTime {
+        minStartTime = timeRange.start
+      }
 
-      if mediaType == .video, formatDescription?.isHDR == true {
-        // Reject HDR inputs: the 8-bit BGRA MetalFX path would silently clip HDR pixels while
-        // propagating HDR metadata, producing an incorrect file. See review finding C3/C4.
-        throw Error.hdrNotSupported
+      if mediaType == .video, formatDescription?.isUnsupportedForSRGBPath == true {
+        // Reject HDR / wide-gamut inputs: the 8-bit BGRA sRGB-perceptual MetalFX path would
+        // silently clip or shift these values while propagating the source's color metadata.
+        throw Error.unsupportedColorSpace
       }
 
       switch mediaType {
@@ -123,11 +123,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
         }
         assetWriter.add(assetWriterInput)
 
-        progress.totalUnitCount += 10
+        progress.totalUnitCount += Self.videoTrackProgressWeight
         if formatDescription?.hasLeftAndRightEye ?? false {
-          // macOS 26 replaced AVAssetWriterInputTaggedPixelBufferGroupAdaptor with a
-          // receiver obtained from the asset writer. We manage our own output pool in
-          // `Upscaler`, so no source pixel buffer attributes are needed here.
           let receiver = assetWriter.inputTaggedPixelBufferGroupReceiver(
             for: assetWriterInput, pixelBufferAttributes: nil)
           try await mediaTracks.append(
@@ -146,9 +143,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
         }
 
       case .audio:
-        // Passthrough audio: do not request format conversion; append sample buffers as-is.
         let assetReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-        // Default (true) is safer across multiple queues; see review M6.
         let assetWriterInput = AVAssetWriterInput(
           mediaType: .audio, outputSettings: nil, sourceFormatHint: formatDescription)
         assetWriterInput.expectsMediaDataInRealTime = false
@@ -190,7 +185,10 @@ public final class UpscalingExportSession: @unchecked Sendable {
       assetWriter.cancelWriting()
       throw assetReader.error ?? Error.failedToStartReading
     }
-    assetWriter.startSession(atSourceTime: .zero)
+    // Start at the earliest track-range start so assets with a leading offset (edited clips,
+    // compositions) don't produce a leading gap or fail the first append.
+    let startTime: CMTime = minStartTime.isNumeric ? minStartTime : .zero
+    assetWriter.startSession(atSourceTime: startTime)
 
     do {
       try await withThrowingTaskGroup(of: Void.self) { [weak self] group in
@@ -200,27 +198,31 @@ public final class UpscalingExportSession: @unchecked Sendable {
             try Task.checkCancellation()
             switch mediaTrack {
             case .passthrough(let output, let input):
-              // Only audio passthrough contributes to the weighted parent progress. Timecode,
-              // subtitle, CC, and metadata tracks are tiny and don't need their own child.
-              let childProgress: Progress
-              if input.mediaType == .audio {
-                childProgress = Progress(totalUnitCount: durationUnits)
+              // Only audio tracks contribute to the parent progress. Subtitle / timecode /
+              // closed-caption / metadata tracks are tiny and don't need reporting.
+              let childProgress: Progress? =
+                if input.mediaType == .audio {
+                  Progress(totalUnitCount: durationUnits)
+                } else {
+                  nil
+                }
+              if let childProgress {
                 self.progress.addChild(childProgress, withPendingUnitCount: 1)
-              } else {
-                childProgress = Progress(totalUnitCount: durationUnits)
               }
               try await Self.processPassthroughSamples(
                 from: output, to: input, progress: childProgress)
             case .video(let output, let input, let inputSize, let adaptor):
               let childProgress = Progress(totalUnitCount: durationUnits)
-              self.progress.addChild(childProgress, withPendingUnitCount: 10)
+              self.progress.addChild(
+                childProgress, withPendingUnitCount: Self.videoTrackProgressWeight)
               try await Self.processVideoSamples(
                 from: output, to: input, adaptor: adaptor,
                 inputSize: inputSize, outputSize: self.outputSize,
                 progress: childProgress)
             case .spatialVideo(let output, let input, let inputSize, let receiver):
               let childProgress = Progress(totalUnitCount: durationUnits)
-              self.progress.addChild(childProgress, withPendingUnitCount: 10)
+              self.progress.addChild(
+                childProgress, withPendingUnitCount: Self.videoTrackProgressWeight)
               try await Self.processSpatialVideoSamples(
                 from: output, to: input, receiver: receiver,
                 inputSize: inputSize, outputSize: self.outputSize,
@@ -231,9 +233,6 @@ public final class UpscalingExportSession: @unchecked Sendable {
         do {
           try await group.waitForAll()
         } catch {
-          // On any task failure, cancel siblings and tear down AVFoundation objects so that
-          // pending `requestMediaDataWhenReady` loops observe the cancelled state and resume
-          // their continuations.
           group.cancelAll()
           assetReader.cancelReading()
           assetWriter.cancelWriting()
@@ -261,8 +260,6 @@ public final class UpscalingExportSession: @unchecked Sendable {
         throw error
       }
     case .completed:
-      // Writer already finished (rare race from a concurrent `finishWriting` call) —
-      // nothing to do.
       break
     case .cancelled:
       try? FileManager.default.removeItem(at: outputURL)
@@ -310,10 +307,28 @@ public final class UpscalingExportSession: @unchecked Sendable {
   /// Throttles the KVO / `Progress.publish()` notification storm on long videos.
   private static let progressUpdateThresholdUnits: Int64 = 100
 
+  /// Pending-unit-count weight assigned to each video/spatial-video track inside the parent
+  /// `Progress`. Audio passthrough is weighted 1; video tracks dominate the export time, so
+  /// they're weighted 10.
+  private static let videoTrackProgressWeight: Int64 = 10
+
   /// Spotlight creator metadata xattr key (macOS).
   private static let creatorXattrName = "com.apple.metadata:kMDItemCreator"
 
+  /// Polling interval used by `waitForInputReady` while the writer input is saturated.
+  /// `isReadyForMoreMediaData` typically flips within microseconds, so 500µs minimizes wasted
+  /// throughput when the writer is briefly saturated without burning CPU.
+  private static let writerReadyPollInterval: Duration = .microseconds(500)
+
+  /// Maximum number of decoded sample buffers in flight between the reader pump and the writer
+  /// consumer. Bounded so slow-writer stalls can't accumulate unbounded decoded `CVPixelBuffer`s
+  /// (a single 4K frame is ~24 MiB). Small enough to cap memory, large enough to smooth jitter.
+  private static let sampleBufferBufferDepth: Int = 4
+
   private enum MediaTrack: @unchecked Sendable {
+    // Exclusive-ownership invariant: each `MediaTrack` is handed to exactly one child
+    // `addTask` and never touched from any other isolation domain. That's what makes
+    // @unchecked Sendable safe here despite AVFoundation's reference types being non-Sendable.
     case passthrough(
       output: AVAssetReaderOutput,
       input: AVAssetWriterInput
@@ -334,11 +349,12 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
   /// Update `progress.completedUnitCount` only if the presentation time has advanced by at least
   /// `progressUpdateThresholdUnits` milliseconds since the last write, or the end has been
-  /// reached. Eliminates ~99% of KVO/publish notifications on typical long videos with no
-  /// user-visible UX change.
+  /// reached. Clamps to `totalUnitCount` so that composition edits or muxer rounding can't push
+  /// the reported percentage above 100.
   private static func updateProgress(_ progress: Progress, pts: CMTime) {
     guard pts.isNumeric else { return }
-    let newUnits = Int64(pts.seconds * Double(progressUnitsPerSecond))
+    let raw = Int64(pts.seconds * Double(progressUnitsPerSecond))
+    let newUnits = min(raw, progress.totalUnitCount)
     let last = progress.completedUnitCount
     if newUnits - last >= progressUpdateThresholdUnits
       || newUnits >= progress.totalUnitCount
@@ -351,11 +367,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     for track: AVAssetTrack,
     formatDescription: CMFormatDescription?
   ) -> AVAssetReaderOutput? {
-    var outputSettings: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-      kCVPixelBufferMetalCompatibilityKey as String: true,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary,
-    ]
+    var outputSettings: [String: Any] = PixelBufferAttributes.bgra
     if formatDescription?.hasLeftAndRightEye ?? false {
       outputSettings[AVVideoDecompressionPropertiesKey] = [
         kVTDecompressionPropertyKey_RequestedMVHEVCVideoLayerIDs: [0, 1]
@@ -421,42 +433,25 @@ public final class UpscalingExportSession: @unchecked Sendable {
   private static func processPassthroughSamples(
     from assetReaderOutput: AVAssetReaderOutput,
     to assetWriterInput: AVAssetWriterInput,
-    progress: Progress
+    progress: Progress?
   ) async throws {
-    nonisolated(unsafe) let input = assetWriterInput
-    nonisolated(unsafe) let output = assetReaderOutput
-    let resume = AsyncResume()
-    try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<Void, Swift.Error>) in
-      let queue = DispatchQueue(label: "com.upscaling.passthrough", qos: .userInitiated)
-      input.requestMediaDataWhenReady(on: queue) {
-        if resume.isResumed { return }
-        while input.isReadyForMoreMediaData {
-          autoreleasepool {
-            if Task.isCancelled {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: CancellationError())
-              return
-            }
-            guard let nextSampleBuffer = output.copyNextSampleBuffer() else {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: nil)
-              return
-            }
-            let pts = nextSampleBuffer.presentationTimeStamp
-            updateProgress(progress, pts: pts)
-            if !input.append(nextSampleBuffer) {
-              input.markAsFinished()
-              resume.resume(
-                continuation: continuation,
-                throwing: Error.appendFailed(pts))
-              return
-            }
-          }
-          if resume.isResumed { break }
-        }
+    let sampleBuffers = makeSampleBufferStream(
+      from: assetReaderOutput, label: "com.upscaling.passthrough.reader")
+
+    defer { assetWriterInput.markAsFinished() }
+
+    for await envelope in sampleBuffers {
+      defer { envelope.release() }
+      try Task.checkCancellation()
+      let sampleBuffer = envelope.buffer
+      if let progress {
+        updateProgress(progress, pts: sampleBuffer.presentationTimeStamp)
       }
-    } as Void
+      try await waitForInputReady(assetWriterInput)
+      if !assetWriterInput.append(sampleBuffer) {
+        throw Error.appendFailed(sampleBuffer.presentationTimeStamp)
+      }
+    }
   }
 
   private static func processVideoSamples(
@@ -470,59 +465,30 @@ public final class UpscalingExportSession: @unchecked Sendable {
     guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
       throw Error.failedToCreateUpscaler
     }
-    nonisolated(unsafe) let input = assetWriterInput
-    nonisolated(unsafe) let output = assetReaderOutput
-    nonisolated(unsafe) let adaptor = adaptor
-    let resume = AsyncResume()
-    try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<Void, Swift.Error>) in
-      let queue = DispatchQueue(label: "com.upscaling.video", qos: .userInitiated)
-      input.requestMediaDataWhenReady(on: queue) {
-        if resume.isResumed { return }
-        while input.isReadyForMoreMediaData {
-          autoreleasepool {
-            if Task.isCancelled {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: CancellationError())
-              return
-            }
-            guard let nextSampleBuffer = output.copyNextSampleBuffer() else {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: nil)
-              return
-            }
-            let pts = nextSampleBuffer.presentationTimeStamp
-            updateProgress(progress, pts: pts)
-            guard let imageBuffer = nextSampleBuffer.imageBuffer else {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: Error.missingImageBuffer)
-              return
-            }
-            let upscaled: CVPixelBuffer
-            do {
-              nonisolated(unsafe) let capturedBuffer = imageBuffer
-              nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
-              upscaled = try runAsyncBlocking {
-                try await upscaler.upscale(
-                  capturedBuffer, pixelBufferPool: capturedPool)
-              }
-            } catch {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: error)
-              return
-            }
-            if !adaptor.append(upscaled, withPresentationTime: pts) {
-              input.markAsFinished()
-              resume.resume(
-                continuation: continuation,
-                throwing: Error.appendFailed(pts))
-              return
-            }
-          }
-          if resume.isResumed { break }
-        }
+
+    let sampleBuffers = makeSampleBufferStream(
+      from: assetReaderOutput, label: "com.upscaling.video.reader")
+
+    defer { assetWriterInput.markAsFinished() }
+
+    for await envelope in sampleBuffers {
+      defer { envelope.release() }
+      try Task.checkCancellation()
+      let sampleBuffer = envelope.buffer
+      let pts = sampleBuffer.presentationTimeStamp
+      updateProgress(progress, pts: pts)
+      guard let imageBuffer = sampleBuffer.imageBuffer else {
+        throw Error.missingImageBuffer
       }
-    } as Void
+      nonisolated(unsafe) let capturedBuffer = imageBuffer
+      nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
+      let upscaled = try await upscaler.upscale(
+        capturedBuffer, pixelBufferPool: capturedPool)
+      try await waitForInputReady(assetWriterInput)
+      if !adaptor.append(upscaled, withPresentationTime: pts) {
+        throw Error.appendFailed(pts)
+      }
+    }
   }
 
   private static func processSpatialVideoSamples(
@@ -536,160 +502,116 @@ public final class UpscalingExportSession: @unchecked Sendable {
     guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
       throw Error.failedToCreateUpscaler
     }
-    nonisolated(unsafe) let input = assetWriterInput
-    nonisolated(unsafe) let output = assetReaderOutput
-    nonisolated(unsafe) let receiver = receiver
-    let resume = AsyncResume()
-    try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<Void, Swift.Error>) in
-      let queue = DispatchQueue(label: "com.upscaling.spatialvideo", qos: .userInitiated)
-      input.requestMediaDataWhenReady(on: queue) {
-        if resume.isResumed { return }
-        while input.isReadyForMoreMediaData {
-          autoreleasepool {
-            if Task.isCancelled {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: CancellationError())
-              return
-            }
-            guard let nextSampleBuffer = output.copyNextSampleBuffer() else {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: nil)
-              return
-            }
-            let pts = nextSampleBuffer.presentationTimeStamp
-            updateProgress(progress, pts: pts)
-            guard let taggedBuffers = nextSampleBuffer.taggedBuffers else {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: Error.missingTaggedBuffers)
-              return
-            }
-            // Single pass over the tagged-buffer array — previously scanned twice per frame.
-            var leftEye: CVPixelBuffer?
-            var rightEye: CVPixelBuffer?
-            for tagged in taggedBuffers {
-              let stereoTag = tagged.tags.first(matchingCategory: .stereoView)
-              if stereoTag == .stereoView(.leftEye),
-                case .pixelBuffer(let buffer) = tagged.buffer
-              {
-                leftEye = buffer
-              } else if stereoTag == .stereoView(.rightEye),
-                case .pixelBuffer(let buffer) = tagged.buffer
-              {
-                rightEye = buffer
-              }
-              if leftEye != nil && rightEye != nil { break }
-            }
-            guard let leftEyePixelBuffer = leftEye,
-              let rightEyePixelBuffer = rightEye
-            else {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: Error.invalidTaggedBuffers)
-              return
-            }
-            let upscaledLeft: CVPixelBuffer
-            let upscaledRight: CVPixelBuffer
-            do {
-              // The `TaggedPixelBufferGroupReceiver` pool is a `CVMutablePixelBuffer.Pool`
-              // which is not interchangeable with the `CVPixelBufferPool` that
-              // `Upscaler.upscale` accepts, so we let the upscaler use its internal pool.
-              // Left and right are awaited sequentially because the upscaler actor serializes
-              // entry anyway — `async let` would only add scheduler overhead per frame.
-              nonisolated(unsafe) let leftCaptured = leftEyePixelBuffer
-              nonisolated(unsafe) let rightCaptured = rightEyePixelBuffer
-              (upscaledLeft, upscaledRight) = try runAsyncBlocking {
-                let left = try await upscaler.upscale(leftCaptured)
-                let right = try await upscaler.upscale(rightCaptured)
-                return (left, right)
-              }
-            } catch {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: error)
-              return
-            }
-            // `CMTaggedDynamicBuffer.init(unsafeBuffer:)` requires a disconnected region;
-            // transfer via `nonisolated(unsafe)` to satisfy region isolation.
-            nonisolated(unsafe) let leftTagged = CMTaggedBuffer(
-              tags: [.stereoView(.leftEye), .videoLayerID(0)],
-              pixelBuffer: upscaledLeft)
-            nonisolated(unsafe) let rightTagged = CMTaggedBuffer(
-              tags: [.stereoView(.rightEye), .videoLayerID(1)],
-              pixelBuffer: upscaledRight)
-            let taggedGroup: [CMTaggedDynamicBuffer] = [
-              CMTaggedDynamicBuffer(unsafeBuffer: leftTagged),
-              CMTaggedDynamicBuffer(unsafeBuffer: rightTagged),
-            ]
-            do {
-              if try !receiver.appendImmediately(taggedGroup, with: pts) {
-                input.markAsFinished()
-                resume.resume(
-                  continuation: continuation,
-                  throwing: Error.appendFailed(pts))
-                return
-              }
-            } catch {
-              input.markAsFinished()
-              resume.resume(continuation: continuation, throwing: error)
-              return
-            }
+
+    let sampleBuffers = makeSampleBufferStream(
+      from: assetReaderOutput, label: "com.upscaling.spatialvideo.reader")
+
+    defer { assetWriterInput.markAsFinished() }
+
+    for await envelope in sampleBuffers {
+      defer { envelope.release() }
+      try Task.checkCancellation()
+      let sampleBuffer = envelope.buffer
+      let pts = sampleBuffer.presentationTimeStamp
+      updateProgress(progress, pts: pts)
+      guard let taggedBuffers = sampleBuffer.taggedBuffers else {
+        throw Error.missingTaggedBuffers
+      }
+
+      // Preserve each source tagged buffer's `videoLayerID` rather than synthesizing 0/1 in a
+      // fixed order — downstream tools may rely on the hero-eye tag staying on its original
+      // layer. Copy the source `CMTag` directly so we don't have to parse its numeric value.
+      var leftEye: (buffer: CVPixelBuffer, layerTag: CMTag?)?
+      var rightEye: (buffer: CVPixelBuffer, layerTag: CMTag?)?
+      for tagged in taggedBuffers {
+        let stereoTag = tagged.tags.first(matchingCategory: .stereoView)
+        let layerTag = tagged.tags.first(matchingCategory: .videoLayerID)
+        guard case .pixelBuffer(let buffer) = tagged.buffer else { continue }
+        if stereoTag == .stereoView(.leftEye) {
+          leftEye = (buffer, layerTag)
+        } else if stereoTag == .stereoView(.rightEye) {
+          rightEye = (buffer, layerTag)
+        }
+        if leftEye != nil, rightEye != nil { break }
+      }
+      guard let left = leftEye, let right = rightEye else {
+        throw Error.invalidTaggedBuffers
+      }
+
+      nonisolated(unsafe) let leftCaptured = left.buffer
+      nonisolated(unsafe) let rightCaptured = right.buffer
+      async let upscaledLeftTask = upscaler.upscale(leftCaptured)
+      async let upscaledRightTask = upscaler.upscale(rightCaptured)
+      let upscaledLeft = try await upscaledLeftTask
+      let upscaledRight = try await upscaledRightTask
+
+      let leftTags: [CMTag] = [.stereoView(.leftEye), left.layerTag ?? .videoLayerID(0)]
+      let rightTags: [CMTag] = [.stereoView(.rightEye), right.layerTag ?? .videoLayerID(1)]
+      nonisolated(unsafe) let leftTagged = CMTaggedBuffer(
+        tags: leftTags, pixelBuffer: upscaledLeft)
+      nonisolated(unsafe) let rightTagged = CMTaggedBuffer(
+        tags: rightTags, pixelBuffer: upscaledRight)
+      let taggedGroup: [CMTaggedDynamicBuffer] = [
+        CMTaggedDynamicBuffer(unsafeBuffer: leftTagged),
+        CMTaggedDynamicBuffer(unsafeBuffer: rightTagged),
+      ]
+
+      try await waitForInputReady(assetWriterInput)
+      if try !receiver.appendImmediately(taggedGroup, with: pts) {
+        throw Error.appendFailed(pts)
+      }
+    }
+  }
+
+  /// Drives an `AVAssetReaderOutput` on a dedicated GCD queue and yields each sample buffer into
+  /// an `AsyncStream` with bounded backpressure. The producer parks on a semaphore until the
+  /// consumer releases a permit (via `envelope.release()`), capping the number of decoded
+  /// buffers held in memory at `sampleBufferBufferDepth`. Running `copyNextSampleBuffer` off the
+  /// cooperative pool avoids priority-inversion deadlocks.
+  private static func makeSampleBufferStream(
+    from output: AVAssetReaderOutput,
+    label: String
+  ) -> AsyncStream<SampleBufferEnvelope> {
+    let queue = DispatchQueue(label: label, qos: .userInitiated)
+    let semaphore = DispatchSemaphore(value: sampleBufferBufferDepth)
+    return AsyncStream { continuation in
+      continuation.onTermination = { _ in
+        // Wake a parked producer so it exits rather than blocking forever on a dead stream.
+        for _ in 0..<sampleBufferBufferDepth { semaphore.signal() }
+      }
+      nonisolated(unsafe) let unsafeOutput = output
+      queue.async {
+        while true {
+          semaphore.wait()
+          guard let buffer = unsafeOutput.copyNextSampleBuffer() else {
+            continuation.finish()
+            return
           }
-          if resume.isResumed { break }
+          let envelope = SampleBufferEnvelope(buffer: buffer) { semaphore.signal() }
+          if case .terminated = continuation.yield(envelope) { return }
         }
       }
-    } as Void
+    }
+  }
+
+  /// Polls `isReadyForMoreMediaData` with short sleeps. Cooperative-pool-friendly — the `await
+  /// Task.sleep` yields instead of blocking a thread, and cancellation is observed between ticks.
+  private static func waitForInputReady(_ input: AVAssetWriterInput) async throws {
+    while !input.isReadyForMoreMediaData {
+      try Task.checkCancellation()
+      try await Task.sleep(for: writerReadyPollInterval)
+    }
   }
 }
 
-// MARK: - AsyncResume
+// MARK: - SampleBufferEnvelope
 
-/// Bridges an `async throws` operation to a synchronous caller by blocking the current
-/// thread until the detached task completes. Used only at the AVFoundation
-/// `requestMediaDataWhenReady` GCD-callback boundary where we cannot `await` directly.
-///
-/// - Important: Must not be called from a cooperative-pool thread (it would deadlock if
-///   the pool is saturated). AVFoundation's writer callback runs on a dedicated GCD queue,
-///   so this is safe there.
-private func runAsyncBlocking<T>(
-  _ body: sending @escaping @Sendable () async throws -> sending T
-) throws -> sending T {
-  let semaphore = DispatchSemaphore(value: 0)
-  nonisolated(unsafe) var outcome: Result<T, Swift.Error>?
-  Task.detached {
-    do {
-      outcome = .success(try await body())
-    } catch {
-      outcome = .failure(error)
-    }
-    semaphore.signal()
-  }
-  semaphore.wait()
-  // `outcome` is always written before `signal()` and never touched again after `wait()`
-  // returns, so the force-unwrap is safe and the value is in a disconnected region.
-  nonisolated(unsafe) let result = outcome!
-  return try result.get()
-}
-
-/// Helper that guarantees a `CheckedContinuation` is resumed exactly once.
-private final class AsyncResume: @unchecked Sendable {
-  private let state = OSAllocatedUnfairLock<Bool>(initialState: false)
-
-  var isResumed: Bool { state.withLock { $0 } }
-
-  func resume(
-    continuation: CheckedContinuation<Void, Swift.Error>,
-    throwing error: Swift.Error?
-  ) {
-    let firstResume = state.withLock { resumed in
-      defer { resumed = true }
-      return !resumed
-    }
-    guard firstResume else { return }
-    if let error {
-      continuation.resume(throwing: error)
-    } else {
-      continuation.resume()
-    }
-  }
+/// Transfers a `CMSampleBuffer` across an `AsyncStream` boundary and carries the producer-side
+/// backpressure permit. Consumers must call `release()` once per envelope (via `defer` at the
+/// top of each loop iteration) so the producer can fetch the next frame.
+private struct SampleBufferEnvelope: @unchecked Sendable {
+  let buffer: CMSampleBuffer
+  let release: @Sendable () -> Void
 }
 
 // MARK: UpscalingExportSession.Error
@@ -706,7 +628,7 @@ extension UpscalingExportSession {
     case failedToStartWriting
     case failedToStartReading
     case appendFailed(CMTime)
-    case hdrNotSupported
+    case unsupportedColorSpace
     case noMediaTracks
 
     public var errorDescription: String? {
@@ -731,8 +653,10 @@ extension UpscalingExportSession {
         "AVAssetReader failed to start reading."
       case .appendFailed(let time):
         "Failed to append sample at time \(time.seconds)s."
-      case .hdrNotSupported:
-        "HDR (PQ / HLG) video is not supported by this 8-bit upscaling path."
+      case .unsupportedColorSpace:
+        "Unsupported color space. This 8-bit sRGB-perceptual MetalFX path only supports "
+          + "Rec. 709 / sRGB SDR sources. HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs "
+          + "are rejected because they would be silently clipped or shifted."
       case .noMediaTracks:
         "Input asset contains no media tracks to export."
       }

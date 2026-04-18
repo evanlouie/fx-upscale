@@ -14,50 +14,43 @@ public final class UpscalingFilter: CIFilter, @unchecked Sendable {
     #if canImport(MetalFX)
       guard let device = Self.sharedDevice else { return nil }
 
-      // Snapshot state, lazily (re)allocate the scaler/intermediate texture, and capture the
-      // matched pair under a single critical section. Splitting this across multiple lock
-      // regions risks pairing a scaler from thread A with an intermediate texture from thread
-      // B when the input size changes mid-flight.
-      let captured: (MTLFXSpatialScaler, MTLTexture, CIImage)? = lock.withLock {
-        guard let inputImage = _inputImage,
-          let outputSize = _outputSize
-        else { return nil }
-
-        // Normalize to integer pixel dimensions to avoid re-creating the scaler on fractional
-        // extent differences.
-        let normalizedInputSize = CGSize(
-          width: Int(inputImage.extent.width.rounded()),
-          height: Int(inputImage.extent.height.rounded())
-        )
-        let normalizedOutputSize = CGSize(
-          width: Int(outputSize.width.rounded()),
-          height: Int(outputSize.height.rounded())
-        )
-
-        if spatialScaler?.inputSize != normalizedInputSize
-          || spatialScaler?.outputSize != normalizedOutputSize
-        {
-          let descriptor = MTLFXSpatialScalerDescriptor.bgra8Perceptual(
-            inputSize: normalizedInputSize, outputSize: normalizedOutputSize)
-          spatialScaler = descriptor.makeSpatialScaler(device: device)
-
-          let textureDescriptor = MTLTextureDescriptor()
-          textureDescriptor.width = Int(normalizedOutputSize.width)
-          textureDescriptor.height = Int(normalizedOutputSize.height)
-          textureDescriptor.pixelFormat = .bgra8Unorm
-          textureDescriptor.storageMode = .private
-          textureDescriptor.usage = [.renderTarget, .shaderRead]
-          intermediateOutputTexture = device.makeTexture(descriptor: textureDescriptor)
-        }
-
-        guard let scaler = spatialScaler,
-          let intermediate = intermediateOutputTexture
-        else { return nil }
-
-        return (scaler, intermediate, inputImage)
+      let (inputImage, outputSize): (CIImage, CGSize)
+      do {
+        let snapshot = lock.withLock { (_inputImage, _outputSize) }
+        guard let image = snapshot.0, let size = snapshot.1 else { return nil }
+        inputImage = image
+        outputSize = size
       }
 
-      guard let (scaler, intermediate, inputImage) = captured else { return nil }
+      // Normalize to integer pixel dimensions so fractional `extent` differences don't create
+      // mismatched scaler/texture pairs.
+      let normalizedInputSize = CGSize(
+        width: Int(inputImage.extent.width.rounded()),
+        height: Int(inputImage.extent.height.rounded())
+      )
+      let normalizedOutputSize = CGSize(
+        width: Int(outputSize.width.rounded()),
+        height: Int(outputSize.height.rounded())
+      )
+
+      // Allocate a fresh scaler and intermediate texture per call. Sharing a single scaler across
+      // concurrent `outputImage` evaluations was a data race: CoreImage invokes the kernel's
+      // `process` lazily (and potentially off the calling thread), and `process` mutates the
+      // scaler's `colorTexture` / `outputTexture` properties before encoding. macOS 26 caches
+      // MetalFX shaders, so per-call construction is cheap after the first use.
+      let descriptor = MTLFXSpatialScalerDescriptor.bgra8Linear(
+        inputSize: normalizedInputSize, outputSize: normalizedOutputSize)
+      guard let scaler = descriptor.makeSpatialScaler(device: device) else { return nil }
+
+      let textureDescriptor = MTLTextureDescriptor()
+      textureDescriptor.width = Int(normalizedOutputSize.width)
+      textureDescriptor.height = Int(normalizedOutputSize.height)
+      textureDescriptor.pixelFormat = .bgra8Unorm
+      textureDescriptor.storageMode = .private
+      textureDescriptor.usage = [.renderTarget, .shaderRead]
+      guard let intermediate = device.makeTexture(descriptor: textureDescriptor) else {
+        return nil
+      }
 
       return try? UpscalingImageProcessorKernel.apply(
         withExtent: CGRect(origin: .zero, size: scaler.outputSize),
@@ -91,9 +84,4 @@ public final class UpscalingFilter: CIFilter, @unchecked Sendable {
   private var _inputImage: CIImage?
   private var _outputSize: CGSize?
   private let lock = NSLock()
-
-  #if canImport(MetalFX)
-    private var spatialScaler: MTLFXSpatialScaler?
-    private var intermediateOutputTexture: MTLTexture?
-  #endif
 }

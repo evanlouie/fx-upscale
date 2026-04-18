@@ -5,7 +5,7 @@ Metal-powered video upscaling
 ## Usage
 
 ```txt
-USAGE: fx-upscale <url> [--width <width>] [--height <height>] [--codec <codec>] [--quality <quality>]
+USAGE: fx-upscale <url> [--width <width>] [--height <height>] [--codec <codec>] [--quality <quality>] [--force]
 
 ARGUMENTS:
   <url>                   The video file to upscale
@@ -13,8 +13,9 @@ ARGUMENTS:
 OPTIONS:
   -w, --width <width>     The output file width
   -H, --height <height>   The output file height
-  -c, --codec <codec>     Output codec: 'hevc' or 'h264' (default: h264)
-  -q, --quality <quality> Output quality: 1-100 (default: encoder default)
+  -c, --codec <codec>     Output codec (h264 | hevc) (default: h264)
+  -q, --quality <quality> Output quality 1-100 (default: encoder default)
+  -f, --force             Overwrite the output file if it already exists
   -h, --help              Show help information.
 ```
 
@@ -23,7 +24,7 @@ OPTIONS:
 - If neither width nor height is specified, the video will be upscaled by 2x
 - Output dimensions are rounded up to the nearest even number (required by H.264 / HEVC)
 - Quality controls the VideoToolbox encoder constant quality (1 = lowest, 100 = highest). If not specified, the encoder default is used.
-- HDR video (PQ / HLG transfer functions) is not supported and will be rejected — the 8-bit BGRA MetalFX path would silently clip HDR pixels.
+- HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected — the 8-bit BGRA sRGB-perceptual MetalFX path would silently clip or shift those values.
 
 ## Installation
 

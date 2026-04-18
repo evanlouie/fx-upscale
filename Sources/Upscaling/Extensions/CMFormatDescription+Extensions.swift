@@ -66,11 +66,27 @@ extension CMFormatDescription {
     return false
   }
 
-  /// True if the transfer function indicates an HDR signal (PQ / HLG). The 8-bit BGRA MetalFX
-  /// path cannot process these without silently clipping, so callers reject such inputs.
-  var isHDR: Bool {
-    guard let transfer = colorTransferFunction else { return false }
-    return transfer == (AVVideoTransferFunction_SMPTE_ST_2084_PQ as String)
-      || transfer == (AVVideoTransferFunction_ITU_R_2100_HLG as String)
+  /// True when the source's color characteristics can't be faithfully processed by the 8-bit
+  /// BGRA sRGB-perceptual MetalFX path. Covers:
+  ///
+  /// - HDR transfer functions (PQ / HLG). Decoding to 8-bit BGRA would silently clip.
+  /// - Rec. 2020 primaries. The perceptual-sRGB scaler squeezes the wider gamut through an
+  ///   sRGB-shaped curve; re-tagging the output Rec. 2020 produces shifted colors.
+  ///
+  /// Rec. 2020 content also happens to always be 10-bit in practice, so this single check also
+  /// protects against 10-bit sources silently losing precision on the BGRA path.
+  var isUnsupportedForSRGBPath: Bool {
+    if let transfer = colorTransferFunction,
+      transfer == (AVVideoTransferFunction_SMPTE_ST_2084_PQ as String)
+        || transfer == (AVVideoTransferFunction_ITU_R_2100_HLG as String)
+    {
+      return true
+    }
+    if let primaries = colorPrimaries,
+      primaries == (AVVideoColorPrimaries_ITU_R_2020 as String)
+    {
+      return true
+    }
+    return false
   }
 }
