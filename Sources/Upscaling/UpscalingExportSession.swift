@@ -20,6 +20,9 @@ public final class UpscalingExportSession: @unchecked Sendable {
   ///     encoder chooses (VideoToolbox HEVC can emit very sparse IDRs in that case, which
   ///     breaks keyframe-snap seeking in players like IINA).
   ///   - creator: Optional creator string applied as a Spotlight xattr on macOS.
+  ///   - upscaler: Upscaling algorithm selector. Defaults to `.spatial` (MetalFX). Choose
+  ///     `.superResolution` to route video tracks through `VTFrameProcessor`; that backend
+  ///     has stricter input constraints and may trigger a one-time ML model download.
   public init(
     asset: AVAsset,
     outputCodec: AVVideoCodecType? = nil,
@@ -27,7 +30,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
     outputSize: CGSize,
     quality: Double? = nil,
     keyFrameInterval: TimeInterval? = nil,
-    creator: String? = nil
+    creator: String? = nil,
+    upscaler: UpscalerKind = .spatial
   ) {
     self.asset = asset
     self.outputCodec = outputCodec
@@ -36,6 +40,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     outputURL = preferredOutputURL
     self.outputSize = outputSize
     self.creator = creator
+    self.upscalerKind = upscaler
     progress = Progress(parent: nil, userInfo: [.fileURLKey: outputURL])
     progress.isCancellable = true
     #if os(macOS)
@@ -55,6 +60,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   public let quality: Double?
   public let keyFrameInterval: TimeInterval?
   public let creator: String?
+  public let upscalerKind: UpscalerKind
 
   public let progress: Progress
 
@@ -225,6 +231,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
               try await Self.processVideoSamples(
                 from: output, to: input, adaptor: adaptor,
                 inputSize: inputSize, outputSize: self.outputSize,
+                upscalerKind: self.upscalerKind,
                 progress: childProgress)
             case .spatialVideo(let output, let input, let inputSize, let receiver):
               let childProgress = Progress(totalUnitCount: durationUnits)
@@ -233,6 +240,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
               try await Self.processSpatialVideoSamples(
                 from: output, to: input, receiver: receiver,
                 inputSize: inputSize, outputSize: self.outputSize,
+                upscalerKind: self.upscalerKind,
                 progress: childProgress)
             }
           }
@@ -474,11 +482,11 @@ public final class UpscalingExportSession: @unchecked Sendable {
     adaptor: AVAssetWriterInputPixelBufferAdaptor,
     inputSize: CGSize,
     outputSize: CGSize,
+    upscalerKind: UpscalerKind,
     progress: Progress
   ) async throws {
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      throw Error.failedToCreateUpscaler
-    }
+    let upscaler = try await upscalerKind.makeBackend(
+      inputSize: inputSize, outputSize: outputSize)
 
     let sampleBuffers = makeSampleBufferStream(
       from: assetReaderOutput, label: "com.upscaling.video.reader")
@@ -497,7 +505,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
       nonisolated(unsafe) let capturedBuffer = imageBuffer
       nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
       let upscaled = try await upscaler.upscale(
-        capturedBuffer, pixelBufferPool: capturedPool)
+        capturedBuffer, pixelBufferPool: capturedPool, outputPixelBuffer: nil)
       try await waitForInputReady(assetWriterInput)
       if !adaptor.append(upscaled, withPresentationTime: pts) {
         throw Error.appendFailed(pts)
@@ -511,10 +519,22 @@ public final class UpscalingExportSession: @unchecked Sendable {
     receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver,
     inputSize: CGSize,
     outputSize: CGSize,
+    upscalerKind: UpscalerKind,
     progress: Progress
   ) async throws {
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      throw Error.failedToCreateUpscaler
+    // Temporal backends (currently super resolution) accumulate prior-frame state and would
+    // cross-pollute the two eyes if shared. Stateless backends (spatial) can share one instance
+    // across both eyes, saving a second pool + pipeline allocation.
+    let leftUpscaler: any UpscalerBackend
+    let rightUpscaler: any UpscalerBackend
+    if upscalerKind.requiresInstancePerStream {
+      async let left = upscalerKind.makeBackend(inputSize: inputSize, outputSize: outputSize)
+      async let right = upscalerKind.makeBackend(inputSize: inputSize, outputSize: outputSize)
+      (leftUpscaler, rightUpscaler) = try await (left, right)
+    } else {
+      leftUpscaler = try await upscalerKind.makeBackend(
+        inputSize: inputSize, outputSize: outputSize)
+      rightUpscaler = leftUpscaler
     }
 
     let sampleBuffers = makeSampleBufferStream(
@@ -554,8 +574,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
       nonisolated(unsafe) let leftCaptured = left.buffer
       nonisolated(unsafe) let rightCaptured = right.buffer
-      async let upscaledLeftTask = upscaler.upscale(leftCaptured)
-      async let upscaledRightTask = upscaler.upscale(rightCaptured)
+      async let upscaledLeftTask = leftUpscaler.upscale(leftCaptured)
+      async let upscaledRightTask = rightUpscaler.upscale(rightCaptured)
       let upscaledLeft = try await upscaledLeftTask
       let upscaledRight = try await upscaledRightTask
 
@@ -638,7 +658,6 @@ extension UpscalingExportSession {
     case missingImageBuffer
     case missingTaggedBuffers
     case invalidTaggedBuffers
-    case failedToCreateUpscaler
     case failedToStartWriting
     case failedToStartReading
     case appendFailed(CMTime)
@@ -659,8 +678,6 @@ extension UpscalingExportSession {
         "A spatial video sample buffer did not contain tagged buffers."
       case .invalidTaggedBuffers:
         "Spatial video sample buffer is missing left- or right-eye tagged buffers."
-      case .failedToCreateUpscaler:
-        "Failed to create the MetalFX upscaler. This device may not support MetalFX."
       case .failedToStartWriting:
         "AVAssetWriter failed to start writing."
       case .failedToStartReading:

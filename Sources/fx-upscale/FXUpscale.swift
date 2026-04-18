@@ -8,14 +8,20 @@ import Upscaling
 @main struct FXUpscale: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "fx-upscale",
-    abstract: "Upscale a video file using MetalFX spatial scaling.",
+    abstract: "Upscale a video file using Apple's Metal / VideoToolbox upscalers.",
     discussion: """
       By default the video is upscaled by 2×. If one of --width or --height is supplied, \
       the other is computed from the source aspect ratio. Output dimensions are rounded up \
       to the nearest even integer (required by H.264 / HEVC).
 
       HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected because the 8-bit BGRA \
-      MetalFX path would silently clip or shift those values.
+      path would silently clip or shift those values.
+
+      Two upscaling algorithms are available via --scaler:
+        spatial (default)   MTLFXSpatialScaler — fast, arbitrary ratios.
+        super-resolution    VTFrameProcessor ML-based super resolution — higher quality for \
+                            recorded video, but requires an integer scale factor, caps input \
+                            at 1920×1080 on macOS, and may download an ML model on first use.
       """,
     version: "1.1.0"
   )
@@ -59,6 +65,19 @@ import Upscaling
 
   @Flag(name: .shortAndLong, help: "Overwrite the output file if it already exists")
   var force: Bool = false
+
+  @Option(
+    name: [.customShort("s"), .long],
+    help: ArgumentHelp(
+      "Upscaling algorithm (spatial | super-resolution)",
+      discussion:
+        "'spatial' uses MTLFXSpatialScaler (fast, arbitrary ratios). "
+        + "'super-resolution' uses VTFrameProcessor's ML-based super resolution — "
+        + "higher quality on recorded video, but integer scale factor only, "
+        + "input capped at 1920×1080, and a one-time model download on first use."
+    )
+  )
+  var scaler: UpscalerKind = .spatial
 
   // MARK: Validation
 
@@ -126,6 +145,12 @@ import Upscaling
         "Maximum supported width/height: \(UpscalingExportSession.maxOutputSize)")
     }
 
+    do {
+      try scaler.preflight(inputSize: inputSize, outputSize: outputSize)
+    } catch {
+      throw ValidationError(error.localizedDescription)
+    }
+
     let outputCodec: AVVideoCodecType = codec.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
     let outputURL = url.renamed { "\($0) Upscaled" }
@@ -147,14 +172,15 @@ import Upscaling
       outputSize: outputSize,
       quality: normalizedQuality,
       keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
-      creator: "fx-upscale"
+      creator: "fx-upscale",
+      upscaler: scaler
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
     Terminal.info(
       "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
         + "to \(Int(outputSize.width))x\(Int(outputSize.height)) "
-        + "using codec: \(outputCodec.rawValue)\(qualityInfo)"
+        + "using \(scaler.displayName), codec: \(outputCodec.rawValue)\(qualityInfo)"
     )
 
     // Install SIGINT/SIGTERM handlers unconditionally so Ctrl-C during pipe/CI runs still
@@ -178,6 +204,10 @@ import Upscaling
     Terminal.success("Video successfully upscaled!")
   }
 }
+
+// MARK: - UpscalerKind + ExpressibleByArgument
+
+extension UpscalerKind: ExpressibleByArgument {}
 
 // MARK: - Codec
 

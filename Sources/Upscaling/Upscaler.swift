@@ -18,7 +18,7 @@ import Foundation
 ///
 /// - Important: Input buffers must be `kCVPixelFormatType_32BGRA`. HDR / 10-bit buffers are not
 ///   supported by this 8-bit path and will throw `Error.unsupportedPixelFormat`.
-public actor Upscaler {
+public actor Upscaler: UpscalerBackend {
   // MARK: Lifecycle
 
   /// Creates an `Upscaler`.
@@ -44,19 +44,10 @@ public actor Upscaler {
       guard let textureCache else { return nil }
       self.textureCache = textureCache
 
-      var pixelBufferPool: CVPixelBufferPool?
-      let poolAttributes: [String: Any] = [
-        kCVPixelBufferPoolMinimumBufferCountKey as String: Self.minimumPoolBufferCount,
-        // Release idle buffers after one second so long-running exports don't hold onto
-        // memory proportional to the worst-case in-flight burst.
-        kCVPixelBufferPoolMaximumBufferAgeKey as String: 1.0 as CFNumber,
-      ]
-      CVPixelBufferPoolCreate(
-        nil,
-        poolAttributes as CFDictionary,
-        PixelBufferAttributes.bgra(size: outputSize) as CFDictionary,
-        &pixelBufferPool)
-      guard let pixelBufferPool else { return nil }
+      guard
+        let pixelBufferPool = makeBGRAPixelBufferPool(
+          size: outputSize, minimumBufferCount: Self.minimumPoolBufferCount)
+      else { return nil }
       self.pixelBufferPool = pixelBufferPool
     #endif
   }
@@ -102,9 +93,6 @@ public actor Upscaler {
         }
         commandBuffer.commit()
       }
-      // The output buffer was freshly allocated from the pool and is not referenced by
-      // any other actor-isolated state after the command buffer completes, so transferring
-      // it across the isolation boundary is safe.
       nonisolated(unsafe) let transferred = output
       return transferred
     #else
@@ -130,32 +118,14 @@ public actor Upscaler {
       pixelBufferPool: sending CVPixelBufferPool? = nil,
       outputPixelBuffer: sending CVPixelBuffer? = nil
     ) throws -> (MTLCommandBuffer, CVPixelBuffer, CVMetalTexture, CVMetalTexture) {
-      guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
-        throw Error.unsupportedPixelFormat
-      }
-      guard pixelBuffer.width == Int(inputSize.width),
-        pixelBuffer.height == Int(inputSize.height)
-      else {
-        throw Error.inputSizeMismatch
-      }
-
-      let output: CVPixelBuffer
-      if let outputPixelBuffer {
-        guard outputPixelBuffer.width == Int(outputSize.width),
-          outputPixelBuffer.height == Int(outputSize.height)
-        else {
-          throw Error.outputSizeMismatch
-        }
-        output = outputPixelBuffer
-      } else {
-        var buffer: CVPixelBuffer?
-        let status = CVPixelBufferPoolCreatePixelBuffer(
-          nil, pixelBufferPool ?? self.pixelBufferPool, &buffer)
-        guard status == kCVReturnSuccess, let buffer else {
-          throw Error.couldNotCreatePixelBuffer
-        }
-        output = buffer
-      }
+      let output = try resolveUpscalerOutputBuffer(
+        input: pixelBuffer,
+        expectedInputSize: inputSize,
+        expectedOutputSize: outputSize,
+        externalPool: pixelBufferPool,
+        internalPool: self.pixelBufferPool,
+        providedOutput: outputPixelBuffer
+      )
 
       // Input texture
       var cvColorTextureOpt: CVMetalTexture?
@@ -232,10 +202,6 @@ public actor Upscaler {
 
 extension Upscaler {
   public enum Error: Swift.Error, LocalizedError {
-    case unsupportedPixelFormat
-    case inputSizeMismatch
-    case outputSizeMismatch
-    case couldNotCreatePixelBuffer
     case couldNotCreateMetalTexture
     case couldNotMakeCommandBuffer
     case couldNotMakeBlitCommandEncoder
@@ -243,11 +209,6 @@ extension Upscaler {
 
     public var errorDescription: String? {
       switch self {
-      case .unsupportedPixelFormat:
-        "Unsupported pixel format. Only kCVPixelFormatType_32BGRA is supported."
-      case .inputSizeMismatch: "Input pixel buffer dimensions do not match upscaler's input size."
-      case .outputSizeMismatch: "Output pixel buffer dimensions do not match upscaler's output size."
-      case .couldNotCreatePixelBuffer: "Failed to create output pixel buffer from pool."
       case .couldNotCreateMetalTexture: "Failed to create Metal texture for upscaling."
       case .couldNotMakeCommandBuffer: "Failed to create Metal command buffer."
       case .couldNotMakeBlitCommandEncoder: "Failed to create Metal blit command encoder."

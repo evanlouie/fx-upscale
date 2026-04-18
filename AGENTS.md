@@ -146,6 +146,31 @@ Workaround for IINA users: Settings → Advanced → Additional mpv options →
 add `hr-seek` = `yes`. This forces precise (decode-forward) seeks, which
 bypass the broken keyframe lookup.
 
+## Future Work
+
+### Expand the `--scaler super-resolution` path to non-sRGB color
+
+Today both backends (`MTLFXSpatialScaler` and `VTFrameProcessor` super resolution) are
+gated by the same 8-bit BGRA sRGB input check (`formatDescription.isUnsupportedForSRGBPath`
+in `Sources/Upscaling/UpscalingExportSession.swift`). This is a real constraint for the
+MetalFX path (we use `bgra8Perceptual`, which clips / shifts wide-gamut or HDR values),
+but it's an *artificial* constraint on the VT path — `VTSuperResolutionScalerConfiguration`
+exposes `frameSupportedPixelFormats`, `sourcePixelBufferAttributes`, and
+`destinationPixelBufferAttributes` that cover a wider set of formats (including 10-bit
+and some YUV layouts).
+
+To lift it, the whole pipeline needs to become format-aware end-to-end:
+
+1. Reader output settings (`videoAssetReaderOutput`) — today hard-coded to BGRA.
+2. `CVPixelBufferPool` attributes — today use `PixelBufferAttributes.bgra(size:)`.
+3. Asset writer input + compression properties — color primaries / transfer function /
+   YCbCr matrix must round-trip correctly (HDR10, HLG, Rec. 2020).
+4. `VTFrameProcessorFrame` wrap — any buffer change must remain IOSurface-backed.
+
+Suggested split: do this in its own commit / PR, gated by `--scaler super-resolution`
+so the MetalFX path keeps its current strict behavior. Verify HDR metadata round-trips
+with real PQ / HLG sources before relaxing the reject in `UpscalingExportSession.swift`.
+
 ## CI/CD
 
 - CI runs on macOS (latest) for the macOS platform only

@@ -4,6 +4,7 @@ import CoreMedia
 import Foundation
 import Metal
 import Testing
+import VideoToolbox
 
 @testable import Upscaling
 
@@ -382,7 +383,7 @@ struct UpscalerTests {
     // parameter. Rebinding via `nonisolated(unsafe)` releases the value from the test's
     // isolation domain so the compiler accepts the send.
     nonisolated(unsafe) let captured = wrongBuffer
-    await #expect(throws: Upscaler.Error.self) {
+    await #expect(throws: PixelBufferIOError.inputSizeMismatch) {
       _ = try await upscaler.upscale(captured)
     }
   }
@@ -751,6 +752,78 @@ struct ExportSessionTests {
     // partial output file was removed.
     _ = try? await task.value
     #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+  }
+}
+
+// MARK: - UpscalerKind Preflight Tests
+
+@Suite("UpscalerKind Preflight")
+struct UpscalerKindPreflightTests {
+  /// Skips the enclosing test if `VTSuperResolutionScaler` isn't available on this device.
+  private func requireVTSuperResolution() throws {
+    guard VTSuperResolutionScalerConfiguration.isSupported else {
+      throw TestSkipError("VTSuperResolutionScaler not supported on this device")
+    }
+  }
+
+  @Test("Spatial preflight always succeeds for valid sizes")
+  func spatialPreflightSucceeds() throws {
+    try UpscalerKind.spatial.preflight(
+      inputSize: CGSize(width: 1920, height: 1080),
+      outputSize: CGSize(width: 3840, height: 2160))
+
+    try UpscalerKind.spatial.preflight(
+      inputSize: CGSize(width: 1001, height: 563),
+      outputSize: CGSize(width: 2002, height: 1126))
+  }
+
+  @Test("Super-resolution preflight rejects non-integer scale factor")
+  func superResolutionRejectsNonIntegerRatio() throws {
+    try requireVTSuperResolution()
+    #expect(throws: VTSuperResolutionUpscaler.Error.self) {
+      // 1.5× is fractional — not in supportedScaleFactors.
+      try UpscalerKind.superResolution.preflight(
+        inputSize: CGSize(width: 1280, height: 720),
+        outputSize: CGSize(width: 1920, height: 1080))
+    }
+  }
+
+  @Test("Super-resolution preflight rejects anisotropic scaling")
+  func superResolutionRejectsAnisotropic() throws {
+    try requireVTSuperResolution()
+    #expect(throws: VTSuperResolutionUpscaler.Error.self) {
+      // 2× width, 3× height.
+      try UpscalerKind.superResolution.preflight(
+        inputSize: CGSize(width: 640, height: 240),
+        outputSize: CGSize(width: 1280, height: 720))
+    }
+  }
+
+  @Test("Super-resolution preflight rejects inputs above 1920x1080 on macOS")
+  func superResolutionRejectsOversizedInput() throws {
+    try requireVTSuperResolution()
+    #expect(throws: VTSuperResolutionUpscaler.Error.self) {
+      try UpscalerKind.superResolution.preflight(
+        inputSize: CGSize(width: 3840, height: 2160),
+        outputSize: CGSize(width: 7680, height: 4320))
+    }
+  }
+
+  @Test("Super-resolution preflight accepts the device's supported scale factors")
+  func superResolutionAcceptsSupportedFactor() throws {
+    try requireVTSuperResolution()
+    // Pick the smallest supported factor so the resulting output fits under the 1920×1080
+    // input cap with room to spare. Devices in the wild currently advertise factors like
+    // [4], so don't hard-code 2×.
+    let supported = VTSuperResolutionScalerConfiguration.supportedScaleFactors.sorted()
+    let factor = try #require(supported.first)
+    // Keep the input small so `factor * 360 ≤ 1080` even for larger factors.
+    let inputSize = CGSize(width: 320, height: 180)
+    let outputSize = CGSize(
+      width: inputSize.width * CGFloat(factor),
+      height: inputSize.height * CGFloat(factor))
+    try UpscalerKind.superResolution.preflight(
+      inputSize: inputSize, outputSize: outputSize)
   }
 }
 
