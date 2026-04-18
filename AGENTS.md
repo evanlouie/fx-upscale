@@ -196,6 +196,28 @@ Bundle.module.url(forResource: "filename", withExtension: "ext")
 
 Testing uses the `Testing` framework bundled with the Swift 6 toolchain (no external dependency).
 
+## Commit Message Conventions
+
+Use [Conventional Commits](https://www.conventionalcommits.org/): `<type>(<scope>)<!>: <summary>`, followed by a blank line and a body.
+
+- Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
+- Summary: imperative, lowercase, no trailing period, ≤ 72 chars
+- Body: required; explain *what* changed and *why* (not *how*), wrap at ~72 chars
+- Use `!` + `BREAKING CHANGE:` footer for breaking changes
+- One logical change per commit
+
+Example:
+
+```
+feat(platform)!: target macOS 26 only, drop iOS support
+
+Bump swift-tools-version to 6.2 and set platforms to .macOS(.v26) so we
+can use APIs only available on Tahoe. iOS support is removed since the
+MetalFX pipeline is only exercised on macOS.
+
+BREAKING CHANGE: iOS is no longer a supported platform.
+```
+
 ## CI/CD
 
 - CI runs on macOS (latest) for the macOS platform only
