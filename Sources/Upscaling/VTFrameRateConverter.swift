@@ -94,7 +94,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
       throw PixelBufferIOError.inputSizeMismatch
     }
 
-    let vtPts = CMTime(value: Int64(frameIndex), timescale: Self.syntheticTimescale)
+    let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
     frameIndex &+= 1
     guard
       let newFrameWrapper = VTFrameProcessorFrame(
@@ -132,9 +132,17 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     // `targetOutputIndex` is monotonic, so `phase` grows through `[0, 1)`. Any `phase <= 0`
     // entries therefore land at the start, before all interpolated PTSs — we can append in
     // order instead of sorting at the end.
+    //
+    // Upper bound on emitted frames from this pair: one target period per slot plus one for
+    // rounding. `nextPTS - prevPTS` is at most one source period at steady rates, so this is
+    // `ceil(target/source) + 1` in the common case.
+    let emittedUpperBound = max(1, Int((intervalSeconds * targetFrameRate).rounded(.up)) + 1)
     var outputs: [FrameProcessorOutput] = []
     var interpolationPhases: [Float] = []
     var interpolatedOutputPTSs: [CMTime] = []
+    outputs.reserveCapacity(emittedUpperBound)
+    interpolationPhases.reserveCapacity(emittedUpperBound)
+    interpolatedOutputPTSs.reserveCapacity(emittedUpperBound)
     while true {
       let candidatePTS = targetPTS(forIndex: targetOutputIndex)
       if candidatePTS >= nextPTS { break }
@@ -159,7 +167,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
       destinationBuffers.reserveCapacity(interpolationPhases.count)
       destinationFrames.reserveCapacity(interpolationPhases.count)
       for _ in interpolationPhases {
-        let dest = try resolveUpscalerOutputBuffer(
+        let dest = try resolveProcessorOutputBuffer(
           input: pixelBuffer,
           expectedInputSize: frameSize,
           expectedOutputSize: frameSize,
@@ -190,16 +198,9 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
         throw Error.vtFrameConstructionFailed
       }
 
-      try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, Swift.Error>) in
-        processor.process(parameters: parameters) { _, error in
-          if let error {
-            continuation.resume(throwing: error)
-          } else {
-            continuation.resume()
-          }
-        }
-      }
+      nonisolated(unsafe) let vtProcessor = processor
+      nonisolated(unsafe) let vtParameters = parameters
+      try await runVT(on: vtProcessor, parameters: vtParameters)
 
       outputs.reserveCapacity(outputs.count + destinationBuffers.count)
       for (buffer, outputPTS) in zip(destinationBuffers, interpolatedOutputPTSs) {
@@ -239,9 +240,6 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   /// downstream. 12 covers every realistic ratio (≤ ~10×) without forcing the pool to
   /// fall back to `CVPixelBufferPoolCreatePixelBuffer`.
   private static let minimumPoolBufferCount = 12
-
-  /// Fixed timescale for synthesized PTS. Any constant works — VT only cares about monotonicity.
-  private static let syntheticTimescale: CMTimeScale = 600
 
   /// Fallback `CMTime` timescale used for the target period when `targetFrameRate` isn't a
   /// clean integer. Chosen large enough that per-period rounding stays well under one frame

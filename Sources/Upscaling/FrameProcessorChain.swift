@@ -40,7 +40,6 @@ public actor FrameProcessorChain: FrameProcessorBackend {
 
   // MARK: Public
 
-  // Force-unwraps are safe: `init` rejects an empty `stages` array.
   public nonisolated var inputSize: CGSize { stages.first!.inputSize }
   public nonisolated var outputSize: CGSize { stages.last!.outputSize }
   public nonisolated var requiresInstancePerStream: Bool {
@@ -57,7 +56,6 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     // match each stage's `outputSize`.
     nonisolated(unsafe) let terminalPool = outputPool
 
-    // Seed the pipeline with the single input frame.
     nonisolated(unsafe) let seedBuffer = pixelBuffer
     var currentFrames: [FrameProcessorOutput] = [
       FrameProcessorOutput(pixelBuffer: seedBuffer, presentationTimeStamp: presentationTimeStamp)

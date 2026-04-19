@@ -513,19 +513,16 @@ private struct TemporalTestBackend: FrameProcessorBackend {
 
 // MARK: - Motion Blur Processor Tests
 
-@Suite("Motion Blur Processor Tests")
+@Suite(
+  "Motion Blur Processor Tests",
+  .enabled(
+    if: VTMotionBlurConfiguration.isSupported,
+    "VTMotionBlurConfiguration not supported on this device")
+)
 struct MotionBlurProcessorTests {
-  /// Skips the enclosing test if `VTMotionBlurConfiguration` isn't available on this device.
-  private func requireMotionBlur() throws {
-    guard VTMotionBlurConfiguration.isSupported else {
-      throw TestSkipError("VTMotionBlurConfiguration not supported on this device")
-    }
-  }
-
   @Test("Preflight rejects strength below 1")
   func rejectsStrengthBelowMinimum() throws {
-    try requireMotionBlur()
-    #expect(throws: VTMotionBlurProcessor.Error.self) {
+#expect(throws: VTMotionBlurProcessor.Error.self) {
       try VTMotionBlurProcessor.preflight(
         frameSize: CGSize(width: 640, height: 480), strength: 0)
     }
@@ -533,8 +530,7 @@ struct MotionBlurProcessorTests {
 
   @Test("Preflight rejects strength above 100")
   func rejectsStrengthAboveMaximum() throws {
-    try requireMotionBlur()
-    #expect(throws: VTMotionBlurProcessor.Error.self) {
+#expect(throws: VTMotionBlurProcessor.Error.self) {
       try VTMotionBlurProcessor.preflight(
         frameSize: CGSize(width: 640, height: 480), strength: 101)
     }
@@ -542,8 +538,7 @@ struct MotionBlurProcessorTests {
 
   @Test("Preflight rejects oversized frames on macOS")
   func rejectsOversizedFrames() throws {
-    try requireMotionBlur()
-    #expect(throws: VTMotionBlurProcessor.Error.self) {
+#expect(throws: VTMotionBlurProcessor.Error.self) {
       // Beyond the macOS 8192×4320 limit.
       try VTMotionBlurProcessor.preflight(
         frameSize: CGSize(width: 16384, height: 8640), strength: 50)
@@ -552,15 +547,13 @@ struct MotionBlurProcessorTests {
 
   @Test("Preflight accepts valid config")
   func preflightAcceptsValidConfig() throws {
-    try requireMotionBlur()
-    try VTMotionBlurProcessor.preflight(
+try VTMotionBlurProcessor.preflight(
       frameSize: CGSize(width: 640, height: 480), strength: 50)
   }
 
   @Test("Processes two frames at output size")
   func processesTwoFrames() async throws {
-    try requireMotionBlur()
-    let size = CGSize(width: 640, height: 480)
+let size = CGSize(width: 640, height: 480)
     let processor = try await VTMotionBlurProcessor(frameSize: size, strength: 50)
 
     #expect(processor.inputSize == size)
@@ -590,8 +583,7 @@ struct MotionBlurProcessorTests {
 
   @Test("Composes after a spatial upscaler in a chain")
   func composesAfterSpatialUpscaler() async throws {
-    try requireMotionBlur()
-    let inputSize = CGSize(width: 320, height: 240)
+let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
 
     guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {

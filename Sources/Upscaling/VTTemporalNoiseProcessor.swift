@@ -69,7 +69,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
     // Synthesize a monotonically increasing PTS for VT's internal ordering check. VT rejects
     // out-of-order timestamps but doesn't care what base they use; the `presentationTimeStamp`
     // we expose on the returned `FrameProcessorOutput` is the real source PTS.
-    let vtPts = CMTime(value: Int64(frameIndex), timescale: Self.syntheticTimescale)
+    let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
     frameIndex &+= 1
 
     guard
@@ -90,7 +90,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
       ]
     }
 
-    let output = try resolveUpscalerOutputBuffer(
+    let output = try resolveProcessorOutputBuffer(
       input: pixelBuffer,
       expectedInputSize: frameSize,
       expectedOutputSize: frameSize,
@@ -114,16 +114,9 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
       throw Error.vtFrameConstructionFailed
     }
 
-    try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<Void, Swift.Error>) in
-      processor.process(parameters: parameters) { _, error in
-        if let error {
-          continuation.resume(throwing: error)
-        } else {
-          continuation.resume()
-        }
-      }
-    }
+    nonisolated(unsafe) let vtProcessor = processor
+    nonisolated(unsafe) let vtParameters = parameters
+    try await runVT(on: vtProcessor, parameters: vtParameters)
 
     self.previousSourceFrame = sourceFrame
 
@@ -136,9 +129,6 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
   /// across calls, so the pool needs at least one more live buffer than a purely stateless
   /// path would.
   private static let minimumPoolBufferCount = 3
-
-  /// Fixed timescale for synthesized PTS. Any constant works — VT only cares about monotonicity.
-  private static let syntheticTimescale: CMTimeScale = 600
 
   /// Public-facing strength bounds. Mapped to the native 0.0–1.0 `filterStrength` range.
   private static let minStrength = 1

@@ -81,7 +81,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    let output = try resolveUpscalerOutputBuffer(
+    let output = try resolveProcessorOutputBuffer(
       input: pixelBuffer,
       expectedInputSize: inputSize,
       expectedOutputSize: outputSize,
@@ -93,7 +93,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     // Synthesize a monotonically increasing PTS for VT's internal ordering check. VT rejects
     // out-of-order timestamps but doesn't care what base they use; the `presentationTimeStamp`
     // we expose to the caller on the returned `FrameProcessorOutput` is the real source PTS.
-    let vtPts = CMTime(value: Int64(frameIndex), timescale: Self.syntheticTimescale)
+    let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
     frameIndex &+= 1
 
     guard
@@ -113,16 +113,9 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       throw Error.vtFrameConstructionFailed
     }
 
-    try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<Void, Swift.Error>) in
-      processor.process(parameters: parameters) { _, error in
-        if let error {
-          continuation.resume(throwing: error)
-        } else {
-          continuation.resume()
-        }
-      }
-    }
+    nonisolated(unsafe) let vtProcessor = processor
+    nonisolated(unsafe) let vtParameters = parameters
+    try await runVT(on: vtProcessor, parameters: vtParameters)
 
     // Stash this call's source/destination wrappers as the "previous" pair for the next
     // submission. `VTFrameProcessorFrame` retains the underlying `CVPixelBuffer`, so caching
@@ -141,9 +134,6 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
   /// `kCVPixelBufferPoolMinimumBufferCountKey` value. We hold the previous output across calls,
   /// so the pool needs at least one more live buffer than the MetalFX path.
   private static let minimumPoolBufferCount = 4
-
-  /// Fixed timescale for synthesized PTS. Any constant works — VT only cares about monotonicity.
-  private static let syntheticTimescale: CMTimeScale = 600
 
   /// Tolerance for "isotropic" check between width/height ratios.
   private static let ratioEpsilon: Double = 1e-3

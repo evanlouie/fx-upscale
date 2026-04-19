@@ -105,9 +105,11 @@ public actor Upscaler: FrameProcessorBackend {
   // MARK: Private
 
   #if canImport(MetalFX)
-    /// Minimum buffers kept in the output `CVPixelBufferPool`. Chosen to allow ~3 frames
-    /// in-flight (reader → GPU → writer) without allocating per frame.
-    private static let minimumPoolBufferCount = 3
+    /// Minimum buffers kept in the output `CVPixelBufferPool`. Metal allows multiple command
+    /// buffers to run concurrently, so the in-flight set can reach reader → GPU × 2 → writer.
+    /// 4 matches the VT super-resolution path and avoids occasional fall-through to
+    /// `CVPixelBufferPoolCreatePixelBuffer` at 4K frame sizes (~24 MiB each).
+    private static let minimumPoolBufferCount = 4
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -120,7 +122,7 @@ public actor Upscaler: FrameProcessorBackend {
       pixelBufferPool: sending CVPixelBufferPool? = nil,
       outputPixelBuffer: sending CVPixelBuffer? = nil
     ) throws -> (MTLCommandBuffer, CVPixelBuffer, CVMetalTexture, CVMetalTexture) {
-      let output = try resolveUpscalerOutputBuffer(
+      let output = try resolveProcessorOutputBuffer(
         input: pixelBuffer,
         expectedInputSize: inputSize,
         expectedOutputSize: outputSize,

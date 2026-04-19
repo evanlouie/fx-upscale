@@ -93,8 +93,6 @@ extension FrameProcessorBackend {
     guard let first = outputs.first else {
       throw FrameProcessorError.noOutputProduced
     }
-    // `FrameProcessorOutput` is `@unchecked Sendable`; unwrapping is a read — see the
-    // struct's doc comment for the safety argument.
     nonisolated(unsafe) let transferred = first.pixelBuffer
     return transferred
   }

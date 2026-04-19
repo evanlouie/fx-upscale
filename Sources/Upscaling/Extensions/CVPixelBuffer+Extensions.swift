@@ -54,7 +54,7 @@ func makeBGRAPixelBufferPool(size: CGSize, minimumBufferCount: Int) -> CVPixelBu
 
 // MARK: - PixelBufferIOError
 
-/// Shared input/output validation errors used by both upscaler backends.
+/// Shared input/output validation errors used by the frame-processor backends.
 enum PixelBufferIOError: Swift.Error, LocalizedError {
   case unsupportedPixelFormat
   case inputSizeMismatch
@@ -66,9 +66,9 @@ enum PixelBufferIOError: Swift.Error, LocalizedError {
     case .unsupportedPixelFormat:
       "Unsupported pixel format. Only kCVPixelFormatType_32BGRA is supported."
     case .inputSizeMismatch:
-      "Input pixel buffer dimensions do not match the upscaler's input size."
+      "Input pixel buffer dimensions do not match the processor's input size."
     case .outputSizeMismatch:
-      "Output pixel buffer dimensions do not match the upscaler's output size."
+      "Output pixel buffer dimensions do not match the processor's output size."
     case .couldNotCreatePixelBuffer:
       "Failed to create output pixel buffer from pool."
     }
@@ -81,7 +81,7 @@ enum PixelBufferIOError: Swift.Error, LocalizedError {
 /// The returned buffer is either caller-provided (already crossed the isolation boundary as
 /// `sending`) or freshly allocated from a pool. Actor-isolated callers that want to return it
 /// as `sending` must use `nonisolated(unsafe)` to escape the compiler's regional check.
-func resolveUpscalerOutputBuffer(
+func resolveProcessorOutputBuffer(
   input pixelBuffer: CVPixelBuffer,
   expectedInputSize inputSize: CGSize,
   expectedOutputSize outputSize: CGSize,

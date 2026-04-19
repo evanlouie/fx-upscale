@@ -209,25 +209,17 @@ import Upscaling
         "Maximum supported width/height: \(UpscalingExportSession.maxOutputSize)")
     }
 
-    do {
-      try scaler.preflight(inputSize: inputSize, outputSize: outputSize)
-    } catch {
-      throw ValidationError(error.localizedDescription)
-    }
+    try preflight { try scaler.preflight(inputSize: inputSize, outputSize: outputSize) }
 
     if let denoise {
-      do {
+      try preflight {
         try VTTemporalNoiseProcessor.preflight(frameSize: inputSize, strength: denoise)
-      } catch {
-        throw ValidationError(error.localizedDescription)
       }
     }
 
     if let motionBlur {
-      do {
+      try preflight {
         try VTMotionBlurProcessor.preflight(frameSize: outputSize, strength: motionBlur)
-      } catch {
-        throw ValidationError(error.localizedDescription)
       }
     }
 
@@ -241,10 +233,8 @@ import Upscaling
             + "(source: \(String(format: "%.3f", sourceFrameRate)))."
         )
       }
-      do {
+      try preflight {
         try VTFrameRateConverter.preflight(frameSize: outputSize, targetFrameRate: fps)
-      } catch {
-        throw ValidationError(error.localizedDescription)
       }
     }
 
@@ -271,9 +261,11 @@ import Upscaling
       keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
       creator: "fx-upscale",
       upscaler: scaler,
-      denoiseStrength: denoise,
-      targetFrameRate: fps,
-      motionBlurStrength: motionBlur
+      pipeline: PipelineOptions(
+        denoiseStrength: denoise,
+        targetFrameRate: fps,
+        motionBlurStrength: motionBlur
+      )
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
@@ -306,6 +298,12 @@ import Upscaling
       throw ExitCode.failure
     }
     Terminal.success("Video successfully upscaled!")
+  }
+
+  /// Runs a preflight check and rewraps any thrown error as a `ValidationError` so
+  /// ArgumentParser surfaces it the same way it surfaces its own argument-level errors.
+  private func preflight(_ check: () throws -> Void) throws {
+    do { try check() } catch { throw ValidationError(error.localizedDescription) }
   }
 }
 
