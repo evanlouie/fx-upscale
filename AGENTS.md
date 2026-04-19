@@ -11,6 +11,43 @@ Swift 6.2 package with two targets:
 
 Platforms: macOS 26+ (Tahoe). iOS is not supported.
 
+## Code Quality: Simple, Not Easy
+
+The top code-quality goal is **simplicity in the Rich Hickey sense** — code
+that is *not complected*. Simple ≠ easy. "Easy" is familiar, close at hand;
+"simple" is one concept, one role, not braided together with others.
+Prioritise the former.
+
+Concretely, when you're about to write or change code:
+
+- **Separate concerns that don't belong together.** If one function/type is
+  juggling two independent axes of variation (e.g. "what transforms the
+  pixels" vs. "what the encoder does"), pull them apart. Mixing them is
+  complecting.
+- **Avoid sentinel values and ceremony that exist only to satisfy a
+  fabricated invariant.** If a constraint (e.g. "this collection must be
+  non-empty") forces callers to synthesise dummy members to route around it,
+  the constraint itself is probably the complecting element — lift it
+  rather than codifying the workaround.
+- **Prefer data over types for ordering / configuration.** Keeping a
+  pipeline's order in an array beats encoding it in the type system, because
+  callers can reorder without touching the types.
+- **Don't add a concept to speed something up unless you've measured the
+  cost.** Optimisations that introduce special cases ("detect the trivial
+  path and bypass it") *add* complecting. If the simple version is fast
+  enough, leave it simple.
+- **Breaking changes are fine.** This is not a public library; favour the
+  simpler design over backward compatibility. Don't keep vestigial
+  parameters, sentinel stages, or compatibility shims.
+- **Decomplect, then optimise** — in that order. A decomplected design
+  usually exposes where the real hot paths are, and optimisations applied
+  to a simple core are themselves simpler.
+
+When evaluating a proposed change, ask: *does this add a concept, or remove
+one?* Changes that collapse two concepts into one are simplifications;
+changes that fork a single concept into two paths (a fast one and a general
+one) are usually complecting in disguise.
+
 ## Build Commands
 
 ```bash

@@ -418,10 +418,30 @@ private func makeTestPixelBuffer(size: CGSize) throws -> CVPixelBuffer {
 
 @Suite("Frame Processor Chain Tests")
 struct FrameProcessorChainTests {
-  @Test("Empty chain rejects construction")
-  func emptyChainRejected() throws {
+  @Test("Empty chain forwards input unchanged as identity")
+  func emptyChainIsIdentity() async throws {
+    let size = CGSize(width: 320, height: 240)
+    let chain = try FrameProcessorChain(inputSize: size, outputSize: size, stages: [])
+    #expect(chain.inputSize == size)
+    #expect(chain.outputSize == size)
+
+    let buffer = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let captured = buffer
+    let pts = CMTime(value: 17, timescale: 30)
+    let outputs = try await chain.process(
+      captured, presentationTimeStamp: pts, outputPool: nil)
+    try #require(outputs.count == 1)
+    #expect(outputs[0].pixelBuffer === buffer)
+    #expect(outputs[0].presentationTimeStamp == pts)
+  }
+
+  @Test("Empty chain rejects non-identity sizes")
+  func emptyChainRejectsNonIdentity() throws {
     #expect(throws: FrameProcessorChain.Error.self) {
-      _ = try FrameProcessorChain(stages: [])
+      _ = try FrameProcessorChain(
+        inputSize: CGSize(width: 320, height: 240),
+        outputSize: CGSize(width: 640, height: 480),
+        stages: [])
     }
   }
 
@@ -438,7 +458,10 @@ struct FrameProcessorChainTests {
       throw TestSkipError("Metal device not available")
     }
     #expect(throws: FrameProcessorChain.Error.self) {
-      _ = try FrameProcessorChain(stages: [a, b])
+      _ = try FrameProcessorChain(
+        inputSize: CGSize(width: 320, height: 240),
+        outputSize: CGSize(width: 1600, height: 1200),
+        stages: [a, b])
     }
   }
 
@@ -449,7 +472,8 @@ struct FrameProcessorChainTests {
     guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
       throw TestSkipError("Metal device not available")
     }
-    let chain = try FrameProcessorChain(stages: [upscaler])
+    let chain = try FrameProcessorChain(
+      inputSize: inputSize, outputSize: outputSize, stages: [upscaler])
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)
 
@@ -545,7 +569,8 @@ let inputSize = CGSize(width: 320, height: 240)
       throw TestSkipError("Metal device not available")
     }
     let blur = try await VTMotionBlurProcessor(frameSize: outputSize, strength: 50)
-    let chain = try FrameProcessorChain(stages: [upscaler, blur])
+    let chain = try FrameProcessorChain(
+      inputSize: inputSize, outputSize: outputSize, stages: [upscaler, blur])
 
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)
@@ -635,7 +660,8 @@ struct TemporalNoiseProcessorTests {
     guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
       throw TestSkipError("Metal device not available")
     }
-    let chain = try FrameProcessorChain(stages: [denoise, upscaler])
+    let chain = try FrameProcessorChain(
+      inputSize: inputSize, outputSize: outputSize, stages: [denoise, upscaler])
 
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)
@@ -763,7 +789,8 @@ struct FrameRateConverterTests {
       throw TestSkipError("Metal device not available")
     }
     let converter = try await VTFrameRateConverter(frameSize: outputSize, targetFrameRate: 60)
-    let chain = try FrameProcessorChain(stages: [upscaler, converter])
+    let chain = try FrameProcessorChain(
+      inputSize: inputSize, outputSize: outputSize, stages: [upscaler, converter])
 
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)

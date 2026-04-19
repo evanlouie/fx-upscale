@@ -10,11 +10,12 @@ import Upscaling
     commandName: "fx-upscale",
     abstract: "Upscale a video file using Apple's Metal / VideoToolbox upscalers.",
     discussion: """
-      By default the video is upscaled by 2×. Pass --scale for a uniform integer factor \
-      (e.g. --scale 4 for 4× on both axes), or --width and/or --height for explicit dimensions \
-      — --scale cannot be combined with --width or --height. When only one of --width / \
-      --height is supplied, the other is computed from the source aspect ratio. Output \
-      dimensions are rounded up to the nearest even integer (required by H.264 / HEVC).
+      Scaling is opt-in: pass --scale for a uniform integer factor (e.g. --scale 4 for 4× on \
+      both axes), or --width and/or --height for explicit dimensions — --scale cannot be \
+      combined with --width or --height. When only one of --width / --height is supplied, the \
+      other is computed from the source aspect ratio. Output dimensions are rounded up to the \
+      nearest even integer (required by H.264 / HEVC). If no scaling flag is passed, the \
+      source resolution is preserved and only the requested effects (and codec) are applied.
 
       HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected because the 8-bit BGRA \
       path would silently clip or shift those values.
@@ -25,7 +26,7 @@ import Upscaling
                             recorded video, but requires an integer scale factor, caps input \
                             at 1920×1080 on macOS, and may download an ML model on first use.
       """,
-    version: "1.1.0"
+    version: "1.2.0"
   )
 
   // MARK: Arguments
@@ -192,11 +193,14 @@ import Upscaling
       )
     }
 
-    let outputSize = calculateOutputDimensions(
-      inputSize: inputSize,
-      requestedWidth: scale.map { Int(inputSize.width) * $0 } ?? width,
-      requestedHeight: scale.map { Int(inputSize.height) * $0 } ?? height
-    )
+    let wantsScaling = scale != nil || width != nil || height != nil
+    let outputSize: CGSize =
+      wantsScaling
+      ? calculateOutputDimensions(
+        inputSize: inputSize,
+        requestedWidth: scale.map { Int(inputSize.width) * $0 } ?? width,
+        requestedHeight: scale.map { Int(inputSize.height) * $0 } ?? height)
+      : inputSize
 
     guard outputSize.width > 0, outputSize.height > 0 else {
       throw ValidationError("Computed output dimensions are invalid.")
@@ -209,7 +213,9 @@ import Upscaling
         "Maximum supported width/height: \(UpscalingExportSession.maxOutputSize)")
     }
 
-    try preflight { try scaler.preflight(inputSize: inputSize, outputSize: outputSize) }
+    if wantsScaling {
+      try preflight { try scaler.preflight(inputSize: inputSize, outputSize: outputSize) }
+    }
 
     if let denoise {
       try preflight {
@@ -253,13 +259,15 @@ import Upscaling
     }
 
     let chainFactory: UpscalingExportSession.ChainFactory = {
-      [scaler, denoise, fps, motionBlur] inputSize in
+      [scaler, denoise, fps, motionBlur, wantsScaling] inputSize in
       var stages: [any FrameProcessorBackend] = []
       if let denoise {
         stages.append(
           try await VTTemporalNoiseProcessor(frameSize: inputSize, strength: denoise))
       }
-      stages.append(try await scaler.makeBackend(inputSize: inputSize, outputSize: outputSize))
+      if wantsScaling {
+        stages.append(try await scaler.makeBackend(inputSize: inputSize, outputSize: outputSize))
+      }
       if let fps {
         stages.append(
           try await VTFrameRateConverter(frameSize: outputSize, targetFrameRate: fps))
@@ -268,7 +276,8 @@ import Upscaling
         stages.append(
           try await VTMotionBlurProcessor(frameSize: outputSize, strength: motionBlur))
       }
-      return try FrameProcessorChain(stages: stages)
+      return try FrameProcessorChain(
+        inputSize: inputSize, outputSize: outputSize, stages: stages)
     }
 
     let exportSession = UpscalingExportSession(
@@ -286,12 +295,14 @@ import Upscaling
     let denoiseInfo = denoise.map { ", denoise: \($0)" } ?? ""
     let fpsInfo = fps.map { ", fps: \(String(format: "%g", $0))" } ?? ""
     let motionBlurInfo = motionBlur.map { ", motion-blur: \($0)" } ?? ""
-    Terminal.info(
-      "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
+    let summary: String =
+      wantsScaling
+      ? "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
         + "to \(Int(outputSize.width))x\(Int(outputSize.height)) "
         + "using \(scaler.displayName), codec: \(outputCodec.rawValue)\(qualityInfo)"
-        + denoiseInfo + fpsInfo + motionBlurInfo
-    )
+      : "Processing at \(Int(inputSize.width))x\(Int(inputSize.height)), "
+        + "codec: \(outputCodec.rawValue)\(qualityInfo)"
+    Terminal.info(summary + denoiseInfo + fpsInfo + motionBlurInfo)
 
     // Install SIGINT/SIGTERM handlers unconditionally so Ctrl-C during pipe/CI runs still
     // removes the partial output. The progress bar's TTY-only redraw loop is orthogonal.

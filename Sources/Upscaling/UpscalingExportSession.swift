@@ -58,7 +58,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
     self.chainFactory = chainFactory ?? { inputSize in
       let backend = try await UpscalerKind.spatial.makeBackend(
         inputSize: inputSize, outputSize: outputSize)
-      return try FrameProcessorChain(stages: [backend])
+      return try FrameProcessorChain(
+        inputSize: inputSize, outputSize: outputSize, stages: [backend])
     }
     progress = Progress(parent: nil, userInfo: [.fileURLKey: outputURL])
     progress.isCancellable = true
