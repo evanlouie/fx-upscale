@@ -485,8 +485,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
     upscalerKind: UpscalerKind,
     progress: Progress
   ) async throws {
-    let upscaler = try await upscalerKind.makeBackend(
-      inputSize: inputSize, outputSize: outputSize)
+    let chain = try await makeChain(
+      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize)
 
     let sampleBuffers = makeSampleBufferStream(
       from: assetReaderOutput, label: "com.upscaling.video.reader")
@@ -504,11 +504,14 @@ public final class UpscalingExportSession: @unchecked Sendable {
       }
       nonisolated(unsafe) let capturedBuffer = imageBuffer
       nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
-      let upscaled = try await upscaler.upscale(
-        capturedBuffer, pixelBufferPool: capturedPool, outputPixelBuffer: nil)
-      try await waitForInputReady(assetWriterInput)
-      if !adaptor.append(upscaled, withPresentationTime: pts) {
-        throw Error.appendFailed(pts)
+      let outputs = try await chain.process(
+        capturedBuffer, presentationTimeStamp: pts, outputPool: capturedPool)
+      for output in outputs {
+        try await waitForInputReady(assetWriterInput)
+        if !adaptor.append(output.pixelBuffer, withPresentationTime: output.presentationTimeStamp)
+        {
+          throw Error.appendFailed(output.presentationTimeStamp)
+        }
       }
     }
   }
@@ -522,19 +525,18 @@ public final class UpscalingExportSession: @unchecked Sendable {
     upscalerKind: UpscalerKind,
     progress: Progress
   ) async throws {
-    // Temporal backends (currently super resolution) accumulate prior-frame state and would
-    // cross-pollute the two eyes if shared. Stateless backends (spatial) can share one instance
-    // across both eyes, saving a second pool + pipeline allocation.
-    let leftUpscaler: any UpscalerBackend
-    let rightUpscaler: any UpscalerBackend
-    if upscalerKind.requiresInstancePerStream {
-      async let left = upscalerKind.makeBackend(inputSize: inputSize, outputSize: outputSize)
-      async let right = upscalerKind.makeBackend(inputSize: inputSize, outputSize: outputSize)
-      (leftUpscaler, rightUpscaler) = try await (left, right)
+    // Temporal stages (currently super resolution) accumulate prior-frame state and would
+    // cross-pollute the two eyes if shared. Stateless chains (spatial) can share one instance
+    // across both eyes, saving a second pool + pipeline allocation. The chain aggregates
+    // `requiresInstancePerStream` across all stages.
+    let leftChain = try await makeChain(
+      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize)
+    let rightChain: FrameProcessorChain
+    if leftChain.requiresInstancePerStream {
+      rightChain = try await makeChain(
+        upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize)
     } else {
-      leftUpscaler = try await upscalerKind.makeBackend(
-        inputSize: inputSize, outputSize: outputSize)
-      rightUpscaler = leftUpscaler
+      rightChain = leftChain
     }
 
     let sampleBuffers = makeSampleBufferStream(
@@ -574,27 +576,50 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
       nonisolated(unsafe) let leftCaptured = left.buffer
       nonisolated(unsafe) let rightCaptured = right.buffer
-      async let upscaledLeftTask = leftUpscaler.upscale(leftCaptured)
-      async let upscaledRightTask = rightUpscaler.upscale(rightCaptured)
-      let upscaledLeft = try await upscaledLeftTask
-      let upscaledRight = try await upscaledRightTask
+      async let leftOutputsTask = leftChain.process(
+        leftCaptured, presentationTimeStamp: pts, outputPool: nil)
+      async let rightOutputsTask = rightChain.process(
+        rightCaptured, presentationTimeStamp: pts, outputPool: nil)
+      let leftOutputs = try await leftOutputsTask
+      let rightOutputs = try await rightOutputsTask
 
-      let leftTags: [CMTag] = [.stereoView(.leftEye), left.layerTag ?? .videoLayerID(0)]
-      let rightTags: [CMTag] = [.stereoView(.rightEye), right.layerTag ?? .videoLayerID(1)]
-      nonisolated(unsafe) let leftTagged = CMTaggedBuffer(
-        tags: leftTags, pixelBuffer: upscaledLeft)
-      nonisolated(unsafe) let rightTagged = CMTaggedBuffer(
-        tags: rightTags, pixelBuffer: upscaledRight)
-      let taggedGroup: [CMTaggedDynamicBuffer] = [
-        CMTaggedDynamicBuffer(unsafeBuffer: leftTagged),
-        CMTaggedDynamicBuffer(unsafeBuffer: rightTagged),
-      ]
+      // Both eyes must emit the same number of frames on the same PTS schedule. 1:1 stages
+      // always produce a single output; FRC stages emit M interpolated frames but — because
+      // both eyes run the same chain with the same input PTS — the emitted counts and
+      // timestamps must agree.
+      guard leftOutputs.count == rightOutputs.count else {
+        throw Error.spatialFrameCountMismatch(left: leftOutputs.count, right: rightOutputs.count)
+      }
 
-      try await waitForInputReady(assetWriterInput)
-      if try !receiver.appendImmediately(taggedGroup, with: pts) {
-        throw Error.appendFailed(pts)
+      for (leftOutput, rightOutput) in zip(leftOutputs, rightOutputs) {
+        let outputPts = leftOutput.presentationTimeStamp
+        let leftTags: [CMTag] = [.stereoView(.leftEye), left.layerTag ?? .videoLayerID(0)]
+        let rightTags: [CMTag] = [.stereoView(.rightEye), right.layerTag ?? .videoLayerID(1)]
+        nonisolated(unsafe) let leftTagged = CMTaggedBuffer(
+          tags: leftTags, pixelBuffer: leftOutput.pixelBuffer)
+        nonisolated(unsafe) let rightTagged = CMTaggedBuffer(
+          tags: rightTags, pixelBuffer: rightOutput.pixelBuffer)
+        let taggedGroup: [CMTaggedDynamicBuffer] = [
+          CMTaggedDynamicBuffer(unsafeBuffer: leftTagged),
+          CMTaggedDynamicBuffer(unsafeBuffer: rightTagged),
+        ]
+
+        try await waitForInputReady(assetWriterInput)
+        if try !receiver.appendImmediately(taggedGroup, with: outputPts) {
+          throw Error.appendFailed(outputPts)
+        }
       }
     }
+  }
+
+  private static func makeChain(
+    upscalerKind: UpscalerKind,
+    inputSize: CGSize,
+    outputSize: CGSize
+  ) async throws -> FrameProcessorChain {
+    let backend = try await upscalerKind.makeBackend(
+      inputSize: inputSize, outputSize: outputSize)
+    return try FrameProcessorChain(stages: [backend])
   }
 
   /// Drives an `AVAssetReaderOutput` on a dedicated GCD queue and yields each sample buffer into
@@ -663,6 +688,7 @@ extension UpscalingExportSession {
     case appendFailed(CMTime)
     case unsupportedColorSpace
     case noMediaTracks
+    case spatialFrameCountMismatch(left: Int, right: Int)
 
     public var errorDescription: String? {
       switch self {
@@ -690,6 +716,10 @@ extension UpscalingExportSession {
           + "are rejected because they would be silently clipped or shifted."
       case .noMediaTracks:
         "Input asset contains no media tracks to export."
+      case .spatialFrameCountMismatch(let left, let right):
+        "Spatial video frame processor emitted mismatched output counts "
+          + "(left eye: \(left), right eye: \(right)). Both eyes must produce the same "
+          + "number of output frames."
       }
     }
   }

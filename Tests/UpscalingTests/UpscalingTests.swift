@@ -346,7 +346,7 @@ struct UpscalerTests {
       throw TestSkipError("Metal device not available")
     }
 
-    let inputBuffer = try createPixelBuffer(size: inputSize)
+    let inputBuffer = try makeTestPixelBuffer(size: inputSize)
     let outputBuffer = try await upscaler.upscale(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
@@ -362,7 +362,7 @@ struct UpscalerTests {
       throw TestSkipError("Metal device not available")
     }
 
-    let inputBuffer = try createPixelBuffer(size: inputSize)
+    let inputBuffer = try makeTestPixelBuffer(size: inputSize)
     let outputBuffer = try await upscaler.upscale(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
@@ -378,7 +378,7 @@ struct UpscalerTests {
     else {
       throw TestSkipError("Metal device not available")
     }
-    let wrongBuffer = try createPixelBuffer(size: CGSize(width: 320, height: 240))
+    let wrongBuffer = try makeTestPixelBuffer(size: CGSize(width: 320, height: 240))
     // `CVPixelBuffer` is a CF type that isn't Sendable, and `upscale` takes a `sending`
     // parameter. Rebinding via `nonisolated(unsafe)` releases the value from the test's
     // isolation domain so the compiler accepts the send.
@@ -388,26 +388,126 @@ struct UpscalerTests {
     }
   }
 
-  private func createPixelBuffer(size: CGSize) throws -> CVPixelBuffer {
-    var pixelBuffer: CVPixelBuffer?
-    let attrs: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-      kCVPixelBufferWidthKey as String: Int(size.width),
-      kCVPixelBufferHeightKey as String: Int(size.height),
-      kCVPixelBufferMetalCompatibilityKey as String: true,
-    ]
-    let status = CVPixelBufferCreate(
-      kCFAllocatorDefault,
-      Int(size.width),
-      Int(size.height),
-      kCVPixelFormatType_32BGRA,
-      attrs as CFDictionary,
-      &pixelBuffer
-    )
-    guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
-      throw TestSkipError("Failed to create pixel buffer")
+}
+
+// Shared test helper: allocates a BGRA, Metal-compatible `CVPixelBuffer` at the given size.
+// Hoisted to file scope so both `UpscalerTests` and `FrameProcessorChainTests` can use it.
+private func makeTestPixelBuffer(size: CGSize) throws -> CVPixelBuffer {
+  var pixelBuffer: CVPixelBuffer?
+  let attrs: [String: Any] = [
+    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+    kCVPixelBufferWidthKey as String: Int(size.width),
+    kCVPixelBufferHeightKey as String: Int(size.height),
+    kCVPixelBufferMetalCompatibilityKey as String: true,
+  ]
+  let status = CVPixelBufferCreate(
+    kCFAllocatorDefault,
+    Int(size.width),
+    Int(size.height),
+    kCVPixelFormatType_32BGRA,
+    attrs as CFDictionary,
+    &pixelBuffer
+  )
+  guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+    throw TestSkipError("Failed to create pixel buffer")
+  }
+  return buffer
+}
+
+// MARK: - Frame Processor Chain Tests
+
+@Suite("Frame Processor Chain Tests")
+struct FrameProcessorChainTests {
+  @Test("Empty chain rejects construction")
+  func emptyChainRejected() throws {
+    #expect(throws: FrameProcessorChain.Error.self) {
+      _ = try FrameProcessorChain(stages: [])
     }
-    return buffer
+  }
+
+  @Test("Chain rejects adjacent size mismatch")
+  func mismatchedStageSizes() async throws {
+    guard
+      let a = Upscaler(
+        inputSize: CGSize(width: 320, height: 240),
+        outputSize: CGSize(width: 640, height: 480)),
+      let b = Upscaler(
+        inputSize: CGSize(width: 800, height: 600),  // deliberately wrong for chain
+        outputSize: CGSize(width: 1600, height: 1200))
+    else {
+      throw TestSkipError("Metal device not available")
+    }
+    #expect(throws: FrameProcessorChain.Error.self) {
+      _ = try FrameProcessorChain(stages: [a, b])
+    }
+  }
+
+  @Test("Single-stage chain behaves like the backend")
+  func singleStagePassthrough() async throws {
+    let inputSize = CGSize(width: 320, height: 240)
+    let outputSize = CGSize(width: 640, height: 480)
+    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
+      throw TestSkipError("Metal device not available")
+    }
+    let chain = try FrameProcessorChain(stages: [upscaler])
+    #expect(chain.inputSize == inputSize)
+    #expect(chain.outputSize == outputSize)
+    #expect(chain.requiresInstancePerStream == false)
+
+    let buffer = try makeTestPixelBuffer(size: inputSize)
+    nonisolated(unsafe) let captured = buffer
+    let pts = CMTime(value: 42, timescale: 30)
+    let outputs = try await chain.process(
+      captured, presentationTimeStamp: pts, outputPool: nil)
+    try #require(outputs.count == 1)
+    #expect(CVPixelBufferGetWidth(outputs[0].pixelBuffer) == Int(outputSize.width))
+    #expect(CVPixelBufferGetHeight(outputs[0].pixelBuffer) == Int(outputSize.height))
+    // 1:1 stages pass the source PTS through verbatim.
+    #expect(outputs[0].presentationTimeStamp == pts)
+  }
+
+  @Test("Chain aggregates requiresInstancePerStream across stages")
+  func aggregatesTemporalFlag() throws {
+    // Without touching hardware: construct a test double that advertises
+    // `requiresInstancePerStream = true` and verify the chain propagates it.
+    let size = CGSize(width: 100, height: 100)
+    let stateless = StatelessTestBackend(inputSize: size, outputSize: size)
+    let temporal = TemporalTestBackend(inputSize: size, outputSize: size)
+
+    let statelessChain = try FrameProcessorChain(stages: [stateless])
+    #expect(statelessChain.requiresInstancePerStream == false)
+
+    let mixedChain = try FrameProcessorChain(stages: [stateless, temporal])
+    #expect(mixedChain.requiresInstancePerStream == true)
+  }
+}
+
+// Test doubles for size-only / flag-propagation checks. These never get their `process`
+// method called, so the body is a precondition failure — if a future test accidentally
+// wires one into a live pipeline, it trips loudly.
+private struct StatelessTestBackend: FrameProcessorBackend {
+  let inputSize: CGSize
+  let outputSize: CGSize
+  var requiresInstancePerStream: Bool { false }
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    preconditionFailure("StatelessTestBackend.process should not be called")
+  }
+}
+
+private struct TemporalTestBackend: FrameProcessorBackend {
+  let inputSize: CGSize
+  let outputSize: CGSize
+  var requiresInstancePerStream: Bool { true }
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    preconditionFailure("TemporalTestBackend.process should not be called")
   }
 }
 

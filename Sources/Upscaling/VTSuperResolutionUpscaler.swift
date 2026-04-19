@@ -19,7 +19,11 @@ import VideoToolbox
 ///     be one of `VTSuperResolutionScalerConfiguration.supportedScaleFactors`.
 ///   - The device must return `true` for `VTSuperResolutionScalerConfiguration.isSupported`.
 ///   - The backing ML model must be present or downloadable.
-public actor VTSuperResolutionUpscaler: UpscalerBackend {
+public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
+  // MARK: FrameProcessorBackend
+
+  public nonisolated let requiresInstancePerStream: Bool = true
+
   // MARK: Lifecycle
 
   /// Creates a super-resolution upscaler for the given sizes.
@@ -72,31 +76,31 @@ public actor VTSuperResolutionUpscaler: UpscalerBackend {
   public nonisolated let inputSize: CGSize
   public nonisolated let outputSize: CGSize
 
-  @discardableResult public func upscale(
+  public func process(
     _ pixelBuffer: sending CVPixelBuffer,
-    pixelBufferPool externalPool: sending CVPixelBufferPool? = nil,
-    outputPixelBuffer: sending CVPixelBuffer? = nil
-  ) async throws -> sending CVPixelBuffer {
+    presentationTimeStamp: CMTime,
+    outputPool externalPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
     let output = try resolveUpscalerOutputBuffer(
       input: pixelBuffer,
       expectedInputSize: inputSize,
       expectedOutputSize: outputSize,
       externalPool: externalPool,
       internalPool: pixelBufferPool,
-      providedOutput: outputPixelBuffer
+      providedOutput: nil
     )
 
-    // Synthesize a monotonically increasing PTS per call. VT rejects out-of-order timestamps but
-    // doesn't care what base they use — the source PTS isn't plumbed into the upscaler contract
-    // and mixing it in would risk invalid ordering if a caller rewinds or restarts.
-    let pts = CMTime(value: Int64(frameIndex), timescale: Self.syntheticTimescale)
+    // Synthesize a monotonically increasing PTS for VT's internal ordering check. VT rejects
+    // out-of-order timestamps but doesn't care what base they use; the `presentationTimeStamp`
+    // we expose to the caller on the returned `FrameProcessorOutput` is the real source PTS.
+    let vtPts = CMTime(value: Int64(frameIndex), timescale: Self.syntheticTimescale)
     frameIndex &+= 1
 
     guard
       let sourceFrame = VTFrameProcessorFrame(
-        buffer: pixelBuffer, presentationTimeStamp: pts),
+        buffer: pixelBuffer, presentationTimeStamp: vtPts),
       let destinationFrame = VTFrameProcessorFrame(
-        buffer: output, presentationTimeStamp: pts),
+        buffer: output, presentationTimeStamp: vtPts),
       let parameters = VTSuperResolutionScalerParameters(
         sourceFrame: sourceFrame,
         previousFrame: previousSourceFrame,
@@ -123,16 +127,13 @@ public actor VTSuperResolutionUpscaler: UpscalerBackend {
     // Stash this call's source/destination wrappers as the "previous" pair for the next
     // submission. `VTFrameProcessorFrame` retains the underlying `CVPixelBuffer`, so caching
     // the wrappers avoids re-allocating two wrappers per frame — and also retains the output
-    // buffer past the return, which is why the compiler can't prove `output` is uniquely-owned
-    // for `sending` without the escape below.
+    // buffer past the return. The caller consumes `output` via the asset writer (pixel reads);
+    // the next call passes it to VT as a temporal reference (also pixel reads). Both are
+    // reads of a finalized buffer — safe despite the compiler not being able to prove it.
     previousSourceFrame = sourceFrame
     previousOutputFrame = destinationFrame
 
-    // The caller consumes `output` via the asset writer (pixel reads); the next call passes it
-    // to VT as a temporal reference (also pixel reads). Both are reads of a finalized buffer —
-    // safe despite the compiler not being able to prove it.
-    nonisolated(unsafe) let transferred = output
-    return transferred
+    return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
   }
 
   // MARK: Private

@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreImage
+import CoreMedia
 import CoreVideo
 import Foundation
 
@@ -12,13 +13,16 @@ import Foundation
 /// Performs MetalFX spatial upscaling of `CVPixelBuffer`s.
 ///
 /// The upscaler is created with a fixed input/output size and can be reused across many frames.
-/// Call `upscale(_:)` from any task; the actor serializes access to the shared Metal state
-/// (command queue, texture cache, pixel-buffer pool) while allowing GPU work to run in parallel
-/// via MetalFX command buffers.
+/// Call `process(_:presentationTimeStamp:outputPool:)` from any task; the actor serializes
+/// access to the shared Metal state (command queue, texture cache, pixel-buffer pool) while
+/// allowing GPU work to run in parallel via MetalFX command buffers.
+///
+/// Stateless across frames: MetalFX spatial scaling treats each frame independently, so one
+/// `Upscaler` instance can safely serve multiple streams (e.g. both eyes of a stereo pair).
 ///
 /// - Important: Input buffers must be `kCVPixelFormatType_32BGRA`. HDR / 10-bit buffers are not
 ///   supported by this 8-bit path and will throw `Error.unsupportedPixelFormat`.
-public actor Upscaler: UpscalerBackend {
+public actor Upscaler: FrameProcessorBackend {
   // MARK: Lifecycle
 
   /// Creates an `Upscaler`.
@@ -59,24 +63,21 @@ public actor Upscaler: UpscalerBackend {
 
   /// Upscales a pixel buffer asynchronously.
   ///
-  /// - Parameters:
-  ///   - pixelBuffer: Input buffer in `kCVPixelFormatType_32BGRA` at `inputSize`.
-  ///   - pixelBufferPool: Pool to allocate the output buffer from. Falls back to the upscaler's
-  ///     internal pool if `nil`.
-  ///   - outputPixelBuffer: Pre-allocated output buffer to write into. If provided it must match
-  ///     `outputSize`.
-  /// - Returns: The upscaled pixel buffer.
-  /// - Throws: `Upscaler.Error` on failure; the original input buffer is *not* silently returned.
-  @discardableResult public func upscale(
+  /// MetalFX spatial scaling is a 1:1 stage: this returns a single-element array carrying the
+  /// source frame's PTS verbatim. The `outputPool` is honoured for the output allocation
+  /// (typically the writer adaptor's pool when this is the terminal chain stage).
+  ///
+  /// - Throws: `Upscaler.Error` on GPU failure; `PixelBufferIOError` on size / format mismatch.
+  public func process(
     _ pixelBuffer: sending CVPixelBuffer,
-    pixelBufferPool: sending CVPixelBufferPool? = nil,
-    outputPixelBuffer: sending CVPixelBuffer? = nil
-  ) async throws -> sending CVPixelBuffer {
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
     #if canImport(MetalFX)
       let (commandBuffer, output, cvColor, cvUpscaled) = try upscaleCommandBuffer(
         pixelBuffer,
-        pixelBufferPool: pixelBufferPool,
-        outputPixelBuffer: outputPixelBuffer
+        pixelBufferPool: outputPool,
+        outputPixelBuffer: nil
       )
       try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, Swift.Error>) in
@@ -93,8 +94,9 @@ public actor Upscaler: UpscalerBackend {
         }
         commandBuffer.commit()
       }
-      nonisolated(unsafe) let transferred = output
-      return transferred
+      return [
+        FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)
+      ]
     #else
       throw Error.metalFXUnavailable
     #endif
