@@ -43,6 +43,12 @@ public actor FrameProcessorChain: FrameProcessorBackend {
   public nonisolated var inputSize: CGSize { stages.first!.inputSize }
   public nonisolated var outputSize: CGSize { stages.last!.outputSize }
 
+  /// A chain needs per-stream instances whenever any of its stages does — sharing a single
+  /// chain across streams would route every stream through that stage's shared state.
+  public nonisolated var requiresInstancePerStream: Bool {
+    stages.contains { $0.requiresInstancePerStream }
+  }
+
   public func process(
     _ pixelBuffer: sending CVPixelBuffer,
     presentationTimeStamp: CMTime,

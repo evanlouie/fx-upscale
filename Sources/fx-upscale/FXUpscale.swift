@@ -252,6 +252,25 @@ import Upscaling
       }
     }
 
+    let chainFactory: UpscalingExportSession.ChainFactory = {
+      [scaler, denoise, fps, motionBlur] inputSize in
+      var stages: [any FrameProcessorBackend] = []
+      if let denoise {
+        stages.append(
+          try await VTTemporalNoiseProcessor(frameSize: inputSize, strength: denoise))
+      }
+      stages.append(try await scaler.makeBackend(inputSize: inputSize, outputSize: outputSize))
+      if let fps {
+        stages.append(
+          try await VTFrameRateConverter(frameSize: outputSize, targetFrameRate: fps))
+      }
+      if let motionBlur {
+        stages.append(
+          try await VTMotionBlurProcessor(frameSize: outputSize, strength: motionBlur))
+      }
+      return try FrameProcessorChain(stages: stages)
+    }
+
     let exportSession = UpscalingExportSession(
       asset: asset,
       outputCodec: outputCodec,
@@ -260,12 +279,7 @@ import Upscaling
       quality: normalizedQuality,
       keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
       creator: "fx-upscale",
-      upscaler: scaler,
-      pipeline: PipelineOptions(
-        denoiseStrength: denoise,
-        targetFrameRate: fps,
-        motionBlurStrength: motionBlur
-      )
+      chainFactory: chainFactory
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""

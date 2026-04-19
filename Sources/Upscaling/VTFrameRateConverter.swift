@@ -76,6 +76,8 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   public nonisolated var inputSize: CGSize { frameSize }
   public nonisolated var outputSize: CGSize { frameSize }
 
+  public nonisolated var requiresInstancePerStream: Bool { true }
+
   public func process(
     _ pixelBuffer: sending CVPixelBuffer,
     presentationTimeStamp: CMTime,

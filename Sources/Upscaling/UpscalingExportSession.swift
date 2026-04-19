@@ -3,41 +3,23 @@ import Foundation
 import VideoToolbox
 import os
 
-// MARK: - PipelineOptions
-
-/// Per-effect options applied to the video track. Each field is independent; nil means the
-/// corresponding stage is omitted from the chain. Stored order in the chain is fixed
-/// (denoise → scaler → frame-rate conversion → motion blur) per the physical-camera rationale
-/// in the package README.
-public struct PipelineOptions: Sendable {
-  /// Temporal-noise filter strength in the 1–100 range, mapped internally to the native
-  /// 0.0–1.0 `filterStrength`. Denoise runs before the scaler so SR sees clean inputs.
-  public var denoiseStrength: Int?
-
-  /// Target output frame rate. Must be greater than the source's frame rate; callers
-  /// validate that since this struct doesn't know the source. Output frame count scales
-  /// with the target/source ratio.
-  public var targetFrameRate: Double?
-
-  /// Motion-blur strength in the 1–100 range documented by `VTMotionBlurParameters`
-  /// (50 matches a 180° film shutter). Runs last — motion blur smears optical flow, so
-  /// nothing temporal should come after it.
-  public var motionBlurStrength: Int?
-
-  public init(
-    denoiseStrength: Int? = nil,
-    targetFrameRate: Double? = nil,
-    motionBlurStrength: Int? = nil
-  ) {
-    self.denoiseStrength = denoiseStrength
-    self.targetFrameRate = targetFrameRate
-    self.motionBlurStrength = motionBlurStrength
-  }
-}
-
 // MARK: - UpscalingExportSession
 
 public final class UpscalingExportSession: @unchecked Sendable {
+  // MARK: ChainFactory
+
+  /// Builds a `FrameProcessorChain` for a video track of the given `inputSize`. The factory
+  /// closure encodes which effects to include and in what order — the session is intentionally
+  /// agnostic to pipeline ordering so callers (CLIs, GUIs, future config files) can define
+  /// their own policy without touching library code.
+  ///
+  /// The factory is invoked once per video track, and a second time per track when a stereo
+  /// export's chain reports `requiresInstancePerStream == true`. The returned chain's
+  /// `outputSize` must match the session's configured `outputSize`.
+  public typealias ChainFactory = @Sendable (
+    _ inputSize: CGSize
+  ) async throws -> FrameProcessorChain
+
   // MARK: Lifecycle
 
   /// Creates a new upscaling export session.
@@ -52,12 +34,10 @@ public final class UpscalingExportSession: @unchecked Sendable {
   ///     encoder chooses (VideoToolbox HEVC can emit very sparse IDRs in that case, which
   ///     breaks keyframe-snap seeking in players like IINA).
   ///   - creator: Optional creator string applied as a Spotlight xattr on macOS.
-  ///   - upscaler: Upscaling algorithm selector. Defaults to `.spatial` (MetalFX). Choose
-  ///     `.superResolution` to route video tracks through `VTFrameProcessor`; that backend
-  ///     has stricter input constraints and may trigger a one-time ML model download.
-  ///   - pipeline: Per-effect options applied to the video track. Omitted effects are
-  ///     skipped; present effects compose in the fixed order denoise → scaler → FRC →
-  ///     motion blur.
+  ///   - chainFactory: Builds the frame-processing chain applied to video tracks. When
+  ///     `nil` (default), a single-stage `MTLFXSpatialScaler` chain sized to `outputSize`
+  ///     is used — callers that need other effects (super resolution, denoise, motion blur,
+  ///     frame-rate conversion) provide their own factory and encode ordering there.
   public init(
     asset: AVAsset,
     outputCodec: AVVideoCodecType? = nil,
@@ -66,8 +46,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     quality: Double? = nil,
     keyFrameInterval: TimeInterval? = nil,
     creator: String? = nil,
-    upscaler: UpscalerKind = .spatial,
-    pipeline: PipelineOptions = PipelineOptions()
+    chainFactory: ChainFactory? = nil
   ) {
     self.asset = asset
     self.outputCodec = outputCodec
@@ -76,8 +55,11 @@ public final class UpscalingExportSession: @unchecked Sendable {
     outputURL = preferredOutputURL
     self.outputSize = outputSize
     self.creator = creator
-    self.upscalerKind = upscaler
-    self.pipeline = pipeline
+    self.chainFactory = chainFactory ?? { inputSize in
+      let backend = try await UpscalerKind.spatial.makeBackend(
+        inputSize: inputSize, outputSize: outputSize)
+      return try FrameProcessorChain(stages: [backend])
+    }
     progress = Progress(parent: nil, userInfo: [.fileURLKey: outputURL])
     progress.isCancellable = true
     #if os(macOS)
@@ -97,8 +79,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   public let quality: Double?
   public let keyFrameInterval: TimeInterval?
   public let creator: String?
-  public let upscalerKind: UpscalerKind
-  public let pipeline: PipelineOptions
+  private let chainFactory: ChainFactory
 
   public let progress: Progress
 
@@ -268,9 +249,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 childProgress, withPendingUnitCount: Self.videoTrackProgressWeight)
               try await Self.processVideoSamples(
                 from: output, to: input, adaptor: adaptor,
-                inputSize: inputSize, outputSize: self.outputSize,
-                upscalerKind: self.upscalerKind,
-                pipeline: self.pipeline,
+                inputSize: inputSize,
+                chainFactory: self.chainFactory,
                 progress: childProgress)
             case .spatialVideo(let output, let input, let inputSize, let receiver):
               let childProgress = Progress(totalUnitCount: durationUnits)
@@ -278,9 +258,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 childProgress, withPendingUnitCount: Self.videoTrackProgressWeight)
               try await Self.processSpatialVideoSamples(
                 from: output, to: input, receiver: receiver,
-                inputSize: inputSize, outputSize: self.outputSize,
-                upscalerKind: self.upscalerKind,
-                pipeline: self.pipeline,
+                inputSize: inputSize,
+                chainFactory: self.chainFactory,
                 progress: childProgress)
             }
           }
@@ -521,14 +500,10 @@ public final class UpscalingExportSession: @unchecked Sendable {
     to assetWriterInput: AVAssetWriterInput,
     adaptor: AVAssetWriterInputPixelBufferAdaptor,
     inputSize: CGSize,
-    outputSize: CGSize,
-    upscalerKind: UpscalerKind,
-    pipeline: PipelineOptions,
+    chainFactory: ChainFactory,
     progress: Progress
   ) async throws {
-    let chain = try await makeChain(
-      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
-      pipeline: pipeline)
+    let chain = try await chainFactory(inputSize)
 
     let sampleBuffers = makeSampleBufferStream(
       from: assetReaderOutput, label: "com.upscaling.video.reader")
@@ -573,21 +548,17 @@ public final class UpscalingExportSession: @unchecked Sendable {
     to assetWriterInput: AVAssetWriterInput,
     receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver,
     inputSize: CGSize,
-    outputSize: CGSize,
-    upscalerKind: UpscalerKind,
-    pipeline: PipelineOptions,
+    chainFactory: ChainFactory,
     progress: Progress
   ) async throws {
-    // Each eye gets its own chain: temporal stages accumulate prior-frame state and would
-    // cross-pollute the two eyes if shared. For a pure-spatial chain the second chain's pool
-    // can reach ~30 MiB at 4K output (4 buffers × 8 MiB), but stereo exports are one-shot and
-    // the buffers are lazily committed — not worth a second code path to reuse a single chain.
-    let leftChain = try await makeChain(
-      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
-      pipeline: pipeline)
-    let rightChain = try await makeChain(
-      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
-      pipeline: pipeline)
+    // If any stage is stateful, each eye must get its own chain so prior-frame references
+    // don't cross-pollute between eyes. A fully stateless chain (e.g. MetalFX spatial only)
+    // can safely be shared, saving the ~30 MiB second pool at 4K output.
+    let leftChain = try await chainFactory(inputSize)
+    let rightChain =
+      leftChain.requiresInstancePerStream
+      ? try await chainFactory(inputSize)
+      : leftChain
 
     let sampleBuffers = makeSampleBufferStream(
       from: assetReaderOutput, label: "com.upscaling.spatialvideo.reader")
@@ -689,38 +660,6 @@ public final class UpscalingExportSession: @unchecked Sendable {
         throw Error.appendFailed(outputPts)
       }
     }
-  }
-
-  private static func makeChain(
-    upscalerKind: UpscalerKind,
-    inputSize: CGSize,
-    outputSize: CGSize,
-    pipeline: PipelineOptions
-  ) async throws -> FrameProcessorChain {
-    var stages: [any FrameProcessorBackend] = []
-    // Denoise runs first so the scaler sees clean frames; SR models are trained on clean
-    // inputs and inter-frame flow is easier to estimate without sensor noise.
-    if let denoiseStrength = pipeline.denoiseStrength {
-      stages.append(
-        try await VTTemporalNoiseProcessor(frameSize: inputSize, strength: denoiseStrength))
-    }
-    stages.append(
-      try await upscalerKind.makeBackend(inputSize: inputSize, outputSize: outputSize))
-    // FRC runs on the scaled stream: SR benefits from real source frames rather than FRC
-    // interpolations, and FRC's own flow estimation is more accurate on sharp upscaled
-    // frames. Motion blur must see the interpolated stream so the simulated shutter matches
-    // the target frame rate.
-    if let targetFrameRate = pipeline.targetFrameRate {
-      stages.append(
-        try await VTFrameRateConverter(frameSize: outputSize, targetFrameRate: targetFrameRate))
-    }
-    // Motion blur runs last so downstream temporal stages don't have to reason about
-    // blurred frames (motion blur smears optical flow).
-    if let motionBlurStrength = pipeline.motionBlurStrength {
-      stages.append(
-        try await VTMotionBlurProcessor(frameSize: outputSize, strength: motionBlurStrength))
-    }
-    return try FrameProcessorChain(stages: stages)
   }
 
   /// Drives an `AVAssetReaderOutput` on a dedicated GCD queue and yields each sample buffer into

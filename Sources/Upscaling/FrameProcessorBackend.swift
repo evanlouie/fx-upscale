@@ -39,6 +39,14 @@ public protocol FrameProcessorBackend: Sendable {
   var inputSize: CGSize { get }
   var outputSize: CGSize { get }
 
+  /// Whether each independent stream (e.g. each eye of a stereo pair) needs its own
+  /// instance of this backend. Stateful backends that accumulate prior-frame references
+  /// must return `true` — sharing one instance across streams would let one stream's
+  /// frames contaminate the other's temporal state. Purely stateless backends (MetalFX
+  /// spatial) can safely share a single instance and should return `false` so stereo
+  /// exports don't pay double the pool memory.
+  var requiresInstancePerStream: Bool { get }
+
   /// Processes a single input frame, returning one or more output frames.
   ///
   /// - Parameters:
@@ -71,6 +79,8 @@ public protocol FrameProcessorBackend: Sendable {
 }
 
 extension FrameProcessorBackend {
+  public var requiresInstancePerStream: Bool { false }
+
   public func finish(
     outputPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] { [] }

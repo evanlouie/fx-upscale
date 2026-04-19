@@ -74,6 +74,8 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
   public nonisolated let inputSize: CGSize
   public nonisolated let outputSize: CGSize
 
+  public nonisolated var requiresInstancePerStream: Bool { true }
+
   public func process(
     _ pixelBuffer: sending CVPixelBuffer,
     presentationTimeStamp: CMTime,
