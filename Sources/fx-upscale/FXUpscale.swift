@@ -114,6 +114,19 @@ import Upscaling
   )
   var motionBlur: Int?
 
+  @Option(
+    name: .long,
+    help: ArgumentHelp(
+      "Target output frame rate (omit to preserve source rate).",
+      discussion:
+        "Runs VTFrameProcessor's ML-based frame-rate conversion on the scaled output. "
+        + "Must be greater than the source's frame rate — this flag only upsamples; "
+        + "downsampling is not supported. Output duration stays the same; only the "
+        + "cadence changes. Input must be ≤ 8192×4320 after scaling."
+    )
+  )
+  var fps: Double?
+
   // MARK: Validation
 
   func validate() throws {
@@ -151,6 +164,8 @@ import Upscaling
     if let motionBlur, !(1...100).contains(motionBlur) {
       throw ValidationError("--motion-blur must be between 1 and 100")
     }
+    // `--fps` finiteness / range is validated by `VTFrameRateConverter.preflight` in
+    // `run()`, alongside the source-vs-target check once the source track is loaded.
   }
 
   // MARK: Run
@@ -216,6 +231,23 @@ import Upscaling
       }
     }
 
+    if let fps {
+      // `nominalFrameRate` is a Float; promote for the comparison so rounding doesn't pass
+      // a marginally-higher target like 29.9999 as "greater than" a 30.0 source.
+      let sourceFrameRate = try await Double(videoTrack.load(.nominalFrameRate))
+      if sourceFrameRate > 0, fps <= sourceFrameRate {
+        throw ValidationError(
+          "--fps must be greater than the source frame rate "
+            + "(source: \(String(format: "%.3f", sourceFrameRate)))."
+        )
+      }
+      do {
+        try VTFrameRateConverter.preflight(frameSize: outputSize, targetFrameRate: fps)
+      } catch {
+        throw ValidationError(error.localizedDescription)
+      }
+    }
+
     let outputCodec: AVVideoCodecType = codec.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
     let outputURL = url.renamed { "\($0) Upscaled" }
@@ -240,17 +272,19 @@ import Upscaling
       creator: "fx-upscale",
       upscaler: scaler,
       denoiseStrength: denoise,
+      targetFrameRate: fps,
       motionBlurStrength: motionBlur
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
     let denoiseInfo = denoise.map { ", denoise: \($0)" } ?? ""
+    let fpsInfo = fps.map { ", fps: \(String(format: "%g", $0))" } ?? ""
     let motionBlurInfo = motionBlur.map { ", motion-blur: \($0)" } ?? ""
     Terminal.info(
       "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
         + "to \(Int(outputSize.width))x\(Int(outputSize.height)) "
         + "using \(scaler.displayName), codec: \(outputCodec.rawValue)\(qualityInfo)"
-        + denoiseInfo + motionBlurInfo
+        + denoiseInfo + fpsInfo + motionBlurInfo
     )
 
     // Install SIGINT/SIGTERM handlers unconditionally so Ctrl-C during pipe/CI runs still

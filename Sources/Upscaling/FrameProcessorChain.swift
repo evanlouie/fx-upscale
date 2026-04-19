@@ -84,6 +84,40 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     return currentFrames
   }
 
+  public func finish(
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    // Walk stages in order: for each, first feed any upstream-flushed frames through its
+    // `process(...)` (so they pick up this stage's effect), then ask this stage to flush
+    // its own buffered state. Downstream stages see those flushed frames on the next
+    // iteration and, again, run them through `process(...)` before flushing themselves.
+    //
+    // Only the last stage receives the terminal pool — earlier stages allocate from their
+    // internal pools because the buffers are intermediate.
+    nonisolated(unsafe) let terminalPool = outputPool
+    var running: [FrameProcessorOutput] = []
+    let lastIndex = stages.count - 1
+    for (stageIndex, stage) in stages.enumerated() {
+      let poolForStage: CVPixelBufferPool? = (stageIndex == lastIndex) ? terminalPool : nil
+      var nextFrames: [FrameProcessorOutput] = []
+      for frame in running {
+        nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
+        nonisolated(unsafe) let stagePool = poolForStage
+        let outputs = try await stage.process(
+          inputBuffer,
+          presentationTimeStamp: frame.presentationTimeStamp,
+          outputPool: stagePool
+        )
+        nextFrames.append(contentsOf: outputs)
+      }
+      nonisolated(unsafe) let stageFlushPool = poolForStage
+      let flushed = try await stage.finish(outputPool: stageFlushPool)
+      nextFrames.append(contentsOf: flushed)
+      running = nextFrames
+    }
+    return running
+  }
+
   // MARK: Private
 
   private nonisolated let stages: [any FrameProcessorBackend]

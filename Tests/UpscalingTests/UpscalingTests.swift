@@ -713,6 +713,172 @@ struct TemporalNoiseProcessorTests {
   }
 }
 
+// MARK: - Frame Rate Converter Tests
+
+@Suite(
+  "Frame Rate Converter Tests",
+  .enabled(
+    if: VTFrameRateConversionConfiguration.isSupported,
+    "VTFrameRateConversionConfiguration not supported on this device")
+)
+struct FrameRateConverterTests {
+  @Test("Preflight rejects non-positive frame rate")
+  func rejectsNonPositiveRate() throws {
+    #expect(throws: VTFrameRateConverter.Error.self) {
+      try VTFrameRateConverter.preflight(
+        frameSize: CGSize(width: 640, height: 480), targetFrameRate: 0)
+    }
+    #expect(throws: VTFrameRateConverter.Error.self) {
+      try VTFrameRateConverter.preflight(
+        frameSize: CGSize(width: 640, height: 480), targetFrameRate: -30)
+    }
+  }
+
+  @Test("Preflight rejects non-finite frame rate")
+  func rejectsNonFiniteRate() throws {
+    #expect(throws: VTFrameRateConverter.Error.self) {
+      try VTFrameRateConverter.preflight(
+        frameSize: CGSize(width: 640, height: 480), targetFrameRate: .infinity)
+    }
+    #expect(throws: VTFrameRateConverter.Error.self) {
+      try VTFrameRateConverter.preflight(
+        frameSize: CGSize(width: 640, height: 480), targetFrameRate: .nan)
+    }
+  }
+
+  @Test("Preflight accepts valid config")
+  func preflightAcceptsValidConfig() throws {
+    try VTFrameRateConverter.preflight(
+      frameSize: CGSize(width: 640, height: 480), targetFrameRate: 60)
+  }
+
+  @Test("First frame buffers, next emits source + interpolated at 2x")
+  func firstFrameBuffers() async throws {
+    let size = CGSize(width: 640, height: 480)
+    let converter = try await VTFrameRateConverter(frameSize: size, targetFrameRate: 60)
+
+    #expect(converter.inputSize == size)
+    #expect(converter.outputSize == size)
+
+    // Source at 30 fps (period = 1/30s). First call buffers; no output.
+    let first = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let firstCaptured = first
+    let firstPts = CMTime(value: 0, timescale: 30)
+    let firstOutputs = try await converter.process(
+      firstCaptured, presentationTimeStamp: firstPts, outputPool: nil)
+    #expect(firstOutputs.isEmpty)
+
+    // Second call at 1/30s provides the (prev, next) pair. Target period = 1/60s so the
+    // output schedule inside [0, 1/30) has PTS 0 (phase 0, pass-through) and 1/60 (phase 0.5,
+    // interpolated). Expect 2 outputs.
+    let second = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let secondCaptured = second
+    let secondPts = CMTime(value: 1, timescale: 30)
+    let secondOutputs = try await converter.process(
+      secondCaptured, presentationTimeStamp: secondPts, outputPool: nil)
+    try #require(secondOutputs.count == 2)
+    #expect(secondOutputs[0].presentationTimeStamp == firstPts)
+    #expect(secondOutputs[0].presentationTimeStamp < secondOutputs[1].presentationTimeStamp)
+    #expect(secondOutputs[1].presentationTimeStamp < secondPts)
+    for output in secondOutputs {
+      #expect(CVPixelBufferGetWidth(output.pixelBuffer) == Int(size.width))
+      #expect(CVPixelBufferGetHeight(output.pixelBuffer) == Int(size.height))
+    }
+  }
+
+  @Test("Finish flushes the final buffered source frame")
+  func finishFlushesFinalFrame() async throws {
+    let size = CGSize(width: 640, height: 480)
+    let converter = try await VTFrameRateConverter(frameSize: size, targetFrameRate: 60)
+
+    // Two process() calls — the second's buffered frame still needs flushing.
+    let first = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let firstCaptured = first
+    _ = try await converter.process(
+      firstCaptured, presentationTimeStamp: CMTime(value: 0, timescale: 30), outputPool: nil)
+
+    let second = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let secondCaptured = second
+    _ = try await converter.process(
+      secondCaptured, presentationTimeStamp: CMTime(value: 1, timescale: 30), outputPool: nil)
+
+    let flushed = try await converter.finish(outputPool: nil)
+    try #require(flushed.count == 1)
+    #expect(flushed[0].presentationTimeStamp == CMTime(value: 1, timescale: 30))
+
+    // Calling finish again after flushing produces nothing.
+    let secondFlush = try await converter.finish(outputPool: nil)
+    #expect(secondFlush.isEmpty)
+  }
+
+  @Test("Chain composes after a spatial upscaler")
+  func composesAfterSpatialUpscaler() async throws {
+    let inputSize = CGSize(width: 320, height: 240)
+    let outputSize = CGSize(width: 640, height: 480)
+
+    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
+      throw TestSkipError("Metal device not available")
+    }
+    let converter = try await VTFrameRateConverter(frameSize: outputSize, targetFrameRate: 60)
+    let chain = try FrameProcessorChain(stages: [upscaler, converter])
+
+    #expect(chain.inputSize == inputSize)
+    #expect(chain.outputSize == outputSize)
+    // FRC is stateful — chain must inherit the per-stream-instance requirement.
+    #expect(chain.requiresInstancePerStream == true)
+
+    // Drive two source frames at 30fps, then flush. Expect the first call to buffer (no
+    // output), the second to emit 2 outputs spanning [0, 1/30), and finish() to emit the
+    // last buffered frame at 1/30.
+    let pts0 = CMTime(value: 0, timescale: 30)
+    let pts1 = CMTime(value: 1, timescale: 30)
+
+    let buffer0 = try makeTestPixelBuffer(size: inputSize)
+    nonisolated(unsafe) let captured0 = buffer0
+    let firstOutputs = try await chain.process(
+      captured0, presentationTimeStamp: pts0, outputPool: nil)
+    #expect(firstOutputs.isEmpty)
+
+    let buffer1 = try makeTestPixelBuffer(size: inputSize)
+    nonisolated(unsafe) let captured1 = buffer1
+    let secondOutputs = try await chain.process(
+      captured1, presentationTimeStamp: pts1, outputPool: nil)
+    try #require(secondOutputs.count == 2)
+    for output in secondOutputs {
+      #expect(CVPixelBufferGetWidth(output.pixelBuffer) == Int(outputSize.width))
+      #expect(CVPixelBufferGetHeight(output.pixelBuffer) == Int(outputSize.height))
+    }
+
+    let flushed = try await chain.finish(outputPool: nil)
+    try #require(flushed.count == 1)
+    #expect(CVPixelBufferGetWidth(flushed[0].pixelBuffer) == Int(outputSize.width))
+    #expect(flushed[0].presentationTimeStamp == pts1)
+  }
+
+  @Test("Output count scales with target/source fps ratio")
+  func outputCountMatchesRatio() async throws {
+    let size = CGSize(width: 320, height: 240)
+    // 30 fps source → 90 fps target: 3× ratio.
+    let converter = try await VTFrameRateConverter(frameSize: size, targetFrameRate: 90)
+
+    let sourceFrameCount = 10
+    var totalOutputs = 0
+    for frameIdx in 0..<sourceFrameCount {
+      let buffer = try makeTestPixelBuffer(size: size)
+      nonisolated(unsafe) let captured = buffer
+      let pts = CMTime(value: Int64(frameIdx), timescale: 30)
+      let outputs = try await converter.process(
+        captured, presentationTimeStamp: pts, outputPool: nil)
+      totalOutputs += outputs.count
+    }
+    totalOutputs += try await converter.finish(outputPool: nil).count
+
+    // Exact count: 3 target frames per source interval × (N - 1) source intervals + 1 flushed.
+    // For 10 source frames: 3 × 9 + 1 = 28.
+    #expect(totalOutputs == 28)
+  }
+}
+
 // MARK: - Export Session Tests
 
 @Suite("Export Session Tests", .serialized)

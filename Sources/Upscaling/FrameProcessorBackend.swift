@@ -60,10 +60,27 @@ public protocol FrameProcessorBackend: Sendable {
     presentationTimeStamp: CMTime,
     outputPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput]
+
+  /// Emits any frames the backend was holding back waiting for more input.
+  ///
+  /// Call this exactly once after the input stream ends. Most backends (1:1, no look-ahead)
+  /// buffer nothing and return `[]`. Frame-rate conversion, which needs `(prev, next)` pairs,
+  /// buffers the last source frame and flushes it here so the output covers the full source
+  /// duration.
+  ///
+  /// `outputPool` has the same meaning as on `process(...)`: in a `FrameProcessorChain` only
+  /// the last stage receives the terminal pool.
+  func finish(
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput]
 }
 
 extension FrameProcessorBackend {
   public var requiresInstancePerStream: Bool { false }
+
+  public func finish(
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] { [] }
 
   /// 1:1 convenience wrapper for single-frame callers. Returns the first (and only, for
   /// 1:1 backends) output buffer. Throws if the backend produced zero outputs — that would

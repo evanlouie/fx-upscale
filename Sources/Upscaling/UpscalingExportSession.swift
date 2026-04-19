@@ -26,6 +26,10 @@ public final class UpscalingExportSession: @unchecked Sendable {
   ///   - denoiseStrength: If non-nil, prepends a `VTTemporalNoiseProcessor` stage before the
   ///     scaler so the upscaler operates on clean frames. Integer in the 1–100 range, mapped
   ///     to the native 0.0–1.0 `filterStrength`.
+  ///   - targetFrameRate: If non-nil, inserts a `VTFrameRateConverter` stage between the
+  ///     scaler and motion-blur stages. Must be greater than the source's frame rate; the
+  ///     caller is responsible for validating that. Output frame count scales with the
+  ///     target/source ratio.
   ///   - motionBlurStrength: If non-nil, appends a `VTMotionBlurProcessor` stage after the
   ///     scaler. The strength must be in the 1–100 range documented by
   ///     `VTMotionBlurParameters` (50 matches a 180° film shutter).
@@ -39,6 +43,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     creator: String? = nil,
     upscaler: UpscalerKind = .spatial,
     denoiseStrength: Int? = nil,
+    targetFrameRate: Double? = nil,
     motionBlurStrength: Int? = nil
   ) {
     self.asset = asset
@@ -50,6 +55,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     self.creator = creator
     self.upscalerKind = upscaler
     self.denoiseStrength = denoiseStrength
+    self.targetFrameRate = targetFrameRate
     self.motionBlurStrength = motionBlurStrength
     progress = Progress(parent: nil, userInfo: [.fileURLKey: outputURL])
     progress.isCancellable = true
@@ -72,6 +78,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   public let creator: String?
   public let upscalerKind: UpscalerKind
   public let denoiseStrength: Int?
+  public let targetFrameRate: Double?
   public let motionBlurStrength: Int?
 
   public let progress: Progress
@@ -245,6 +252,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 inputSize: inputSize, outputSize: self.outputSize,
                 upscalerKind: self.upscalerKind,
                 denoiseStrength: self.denoiseStrength,
+                targetFrameRate: self.targetFrameRate,
                 motionBlurStrength: self.motionBlurStrength,
                 progress: childProgress)
             case .spatialVideo(let output, let input, let inputSize, let receiver):
@@ -256,6 +264,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 inputSize: inputSize, outputSize: self.outputSize,
                 upscalerKind: self.upscalerKind,
                 denoiseStrength: self.denoiseStrength,
+                targetFrameRate: self.targetFrameRate,
                 motionBlurStrength: self.motionBlurStrength,
                 progress: childProgress)
             }
@@ -500,12 +509,14 @@ public final class UpscalingExportSession: @unchecked Sendable {
     outputSize: CGSize,
     upscalerKind: UpscalerKind,
     denoiseStrength: Int?,
+    targetFrameRate: Double?,
     motionBlurStrength: Int?,
     progress: Progress
   ) async throws {
     let chain = try await makeChain(
       upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
       denoiseStrength: denoiseStrength,
+      targetFrameRate: targetFrameRate,
       motionBlurStrength: motionBlurStrength)
 
     let sampleBuffers = makeSampleBufferStream(
@@ -534,6 +545,16 @@ public final class UpscalingExportSession: @unchecked Sendable {
         }
       }
     }
+
+    // Emit any frames the chain was holding back waiting for more input.
+    nonisolated(unsafe) let finalPool = adaptor.pixelBufferPool
+    let finalOutputs = try await chain.finish(outputPool: finalPool)
+    for output in finalOutputs {
+      try await waitForInputReady(assetWriterInput)
+      if !adaptor.append(output.pixelBuffer, withPresentationTime: output.presentationTimeStamp) {
+        throw Error.appendFailed(output.presentationTimeStamp)
+      }
+    }
   }
 
   private static func processSpatialVideoSamples(
@@ -544,6 +565,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     outputSize: CGSize,
     upscalerKind: UpscalerKind,
     denoiseStrength: Int?,
+    targetFrameRate: Double?,
     motionBlurStrength: Int?,
     progress: Progress
   ) async throws {
@@ -554,12 +576,14 @@ public final class UpscalingExportSession: @unchecked Sendable {
     let leftChain = try await makeChain(
       upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
       denoiseStrength: denoiseStrength,
+      targetFrameRate: targetFrameRate,
       motionBlurStrength: motionBlurStrength)
     let rightChain: FrameProcessorChain
     if leftChain.requiresInstancePerStream {
       rightChain = try await makeChain(
         upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
         denoiseStrength: denoiseStrength,
+        targetFrameRate: targetFrameRate,
         motionBlurStrength: motionBlurStrength)
     } else {
       rightChain = leftChain
@@ -617,23 +641,52 @@ public final class UpscalingExportSession: @unchecked Sendable {
         throw Error.spatialFrameCountMismatch(left: leftOutputs.count, right: rightOutputs.count)
       }
 
-      for (leftOutput, rightOutput) in zip(leftOutputs, rightOutputs) {
-        let outputPts = leftOutput.presentationTimeStamp
-        let leftTags: [CMTag] = [.stereoView(.leftEye), left.layerTag ?? .videoLayerID(0)]
-        let rightTags: [CMTag] = [.stereoView(.rightEye), right.layerTag ?? .videoLayerID(1)]
-        nonisolated(unsafe) let leftTagged = CMTaggedBuffer(
-          tags: leftTags, pixelBuffer: leftOutput.pixelBuffer)
-        nonisolated(unsafe) let rightTagged = CMTaggedBuffer(
-          tags: rightTags, pixelBuffer: rightOutput.pixelBuffer)
-        let taggedGroup: [CMTaggedDynamicBuffer] = [
-          CMTaggedDynamicBuffer(unsafeBuffer: leftTagged),
-          CMTaggedDynamicBuffer(unsafeBuffer: rightTagged),
-        ]
+      try await appendStereo(
+        leftOutputs: leftOutputs, rightOutputs: rightOutputs,
+        leftLayerTag: left.layerTag, rightLayerTag: right.layerTag,
+        receiver: receiver, input: assetWriterInput)
+    }
 
-        try await waitForInputReady(assetWriterInput)
-        if try !receiver.appendImmediately(taggedGroup, with: outputPts) {
-          throw Error.appendFailed(outputPts)
-        }
+    // Emit any frames the chains were holding back waiting for more input.
+    async let leftFinalTask = leftChain.finish(outputPool: nil)
+    async let rightFinalTask = rightChain.finish(outputPool: nil)
+    let leftFinal = try await leftFinalTask
+    let rightFinal = try await rightFinalTask
+    guard leftFinal.count == rightFinal.count else {
+      throw Error.spatialFrameCountMismatch(left: leftFinal.count, right: rightFinal.count)
+    }
+    // We no longer have the source tagged-buffer for these flushed frames, so fall back to
+    // the `.videoLayerID(0/1)` defaults that `appendStereo` supplies.
+    try await appendStereo(
+      leftOutputs: leftFinal, rightOutputs: rightFinal,
+      leftLayerTag: nil, rightLayerTag: nil,
+      receiver: receiver, input: assetWriterInput)
+  }
+
+  private static func appendStereo(
+    leftOutputs: [FrameProcessorOutput],
+    rightOutputs: [FrameProcessorOutput],
+    leftLayerTag: CMTag?,
+    rightLayerTag: CMTag?,
+    receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver,
+    input: AVAssetWriterInput
+  ) async throws {
+    for (leftOutput, rightOutput) in zip(leftOutputs, rightOutputs) {
+      let outputPts = leftOutput.presentationTimeStamp
+      let leftTags: [CMTag] = [.stereoView(.leftEye), leftLayerTag ?? .videoLayerID(0)]
+      let rightTags: [CMTag] = [.stereoView(.rightEye), rightLayerTag ?? .videoLayerID(1)]
+      nonisolated(unsafe) let leftTagged = CMTaggedBuffer(
+        tags: leftTags, pixelBuffer: leftOutput.pixelBuffer)
+      nonisolated(unsafe) let rightTagged = CMTaggedBuffer(
+        tags: rightTags, pixelBuffer: rightOutput.pixelBuffer)
+      let taggedGroup: [CMTaggedDynamicBuffer] = [
+        CMTaggedDynamicBuffer(unsafeBuffer: leftTagged),
+        CMTaggedDynamicBuffer(unsafeBuffer: rightTagged),
+      ]
+
+      try await waitForInputReady(input)
+      if try !receiver.appendImmediately(taggedGroup, with: outputPts) {
+        throw Error.appendFailed(outputPts)
       }
     }
   }
@@ -643,6 +696,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     inputSize: CGSize,
     outputSize: CGSize,
     denoiseStrength: Int?,
+    targetFrameRate: Double?,
     motionBlurStrength: Int?
   ) async throws -> FrameProcessorChain {
     var stages: [any FrameProcessorBackend] = []
@@ -654,6 +708,14 @@ public final class UpscalingExportSession: @unchecked Sendable {
     }
     stages.append(
       try await upscalerKind.makeBackend(inputSize: inputSize, outputSize: outputSize))
+    // FRC runs on the scaled stream: SR benefits from real source frames rather than FRC
+    // interpolations, and FRC's own flow estimation is more accurate on sharp upscaled
+    // frames. Motion blur must see the interpolated stream so the simulated shutter matches
+    // the target frame rate.
+    if let targetFrameRate {
+      stages.append(
+        try await VTFrameRateConverter(frameSize: outputSize, targetFrameRate: targetFrameRate))
+    }
     // Motion blur runs last so downstream temporal stages don't have to reason about
     // blurred frames (motion blur smears optical flow).
     if let motionBlurStrength {
