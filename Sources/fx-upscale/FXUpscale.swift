@@ -90,6 +90,18 @@ import Upscaling
   )
   var scaler: UpscalerKind = .spatial
 
+  @Option(
+    name: [.customShort("m"), .long],
+    help: ArgumentHelp(
+      "Motion-blur strength, 1-100 (omit for no motion blur).",
+      discussion:
+        "Runs VTFrameProcessor's ML-based motion-blur synthesis on the scaled output. "
+        + "50 matches a standard 180° film shutter; 1 is subtle, 100 is pronounced. "
+        + "Input must be ≤ 8192×4320 after scaling."
+    )
+  )
+  var motionBlur: Int?
+
   // MARK: Validation
 
   func validate() throws {
@@ -120,6 +132,9 @@ import Upscaling
     }
     if keyframeInterval < 0 || !keyframeInterval.isFinite {
       throw ValidationError("--keyframe-interval must be a non-negative, finite number")
+    }
+    if let motionBlur, !(1...100).contains(motionBlur) {
+      throw ValidationError("--motion-blur must be between 1 and 100")
     }
   }
 
@@ -170,6 +185,14 @@ import Upscaling
       throw ValidationError(error.localizedDescription)
     }
 
+    if let motionBlur {
+      do {
+        try VTMotionBlurProcessor.preflight(frameSize: outputSize, strength: motionBlur)
+      } catch {
+        throw ValidationError(error.localizedDescription)
+      }
+    }
+
     let outputCodec: AVVideoCodecType = codec.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
     let outputURL = url.renamed { "\($0) Upscaled" }
@@ -192,14 +215,17 @@ import Upscaling
       quality: normalizedQuality,
       keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
       creator: "fx-upscale",
-      upscaler: scaler
+      upscaler: scaler,
+      motionBlurStrength: motionBlur
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
+    let motionBlurInfo = motionBlur.map { ", motion-blur: \($0)" } ?? ""
     Terminal.info(
       "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
         + "to \(Int(outputSize.width))x\(Int(outputSize.height)) "
         + "using \(scaler.displayName), codec: \(outputCodec.rawValue)\(qualityInfo)"
+        + motionBlurInfo
     )
 
     // Install SIGINT/SIGTERM handlers unconditionally so Ctrl-C during pipe/CI runs still

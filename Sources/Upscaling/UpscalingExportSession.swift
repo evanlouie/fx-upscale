@@ -23,6 +23,9 @@ public final class UpscalingExportSession: @unchecked Sendable {
   ///   - upscaler: Upscaling algorithm selector. Defaults to `.spatial` (MetalFX). Choose
   ///     `.superResolution` to route video tracks through `VTFrameProcessor`; that backend
   ///     has stricter input constraints and may trigger a one-time ML model download.
+  ///   - motionBlurStrength: If non-nil, appends a `VTMotionBlurProcessor` stage after the
+  ///     scaler. The strength must be in the 1–100 range documented by
+  ///     `VTMotionBlurParameters` (50 matches a 180° film shutter).
   public init(
     asset: AVAsset,
     outputCodec: AVVideoCodecType? = nil,
@@ -31,7 +34,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
     quality: Double? = nil,
     keyFrameInterval: TimeInterval? = nil,
     creator: String? = nil,
-    upscaler: UpscalerKind = .spatial
+    upscaler: UpscalerKind = .spatial,
+    motionBlurStrength: Int? = nil
   ) {
     self.asset = asset
     self.outputCodec = outputCodec
@@ -41,6 +45,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     self.outputSize = outputSize
     self.creator = creator
     self.upscalerKind = upscaler
+    self.motionBlurStrength = motionBlurStrength
     progress = Progress(parent: nil, userInfo: [.fileURLKey: outputURL])
     progress.isCancellable = true
     #if os(macOS)
@@ -61,6 +66,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   public let keyFrameInterval: TimeInterval?
   public let creator: String?
   public let upscalerKind: UpscalerKind
+  public let motionBlurStrength: Int?
 
   public let progress: Progress
 
@@ -232,6 +238,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 from: output, to: input, adaptor: adaptor,
                 inputSize: inputSize, outputSize: self.outputSize,
                 upscalerKind: self.upscalerKind,
+                motionBlurStrength: self.motionBlurStrength,
                 progress: childProgress)
             case .spatialVideo(let output, let input, let inputSize, let receiver):
               let childProgress = Progress(totalUnitCount: durationUnits)
@@ -241,6 +248,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 from: output, to: input, receiver: receiver,
                 inputSize: inputSize, outputSize: self.outputSize,
                 upscalerKind: self.upscalerKind,
+                motionBlurStrength: self.motionBlurStrength,
                 progress: childProgress)
             }
           }
@@ -483,10 +491,12 @@ public final class UpscalingExportSession: @unchecked Sendable {
     inputSize: CGSize,
     outputSize: CGSize,
     upscalerKind: UpscalerKind,
+    motionBlurStrength: Int?,
     progress: Progress
   ) async throws {
     let chain = try await makeChain(
-      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize)
+      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
+      motionBlurStrength: motionBlurStrength)
 
     let sampleBuffers = makeSampleBufferStream(
       from: assetReaderOutput, label: "com.upscaling.video.reader")
@@ -523,18 +533,21 @@ public final class UpscalingExportSession: @unchecked Sendable {
     inputSize: CGSize,
     outputSize: CGSize,
     upscalerKind: UpscalerKind,
+    motionBlurStrength: Int?,
     progress: Progress
   ) async throws {
-    // Temporal stages (currently super resolution) accumulate prior-frame state and would
-    // cross-pollute the two eyes if shared. Stateless chains (spatial) can share one instance
-    // across both eyes, saving a second pool + pipeline allocation. The chain aggregates
-    // `requiresInstancePerStream` across all stages.
+    // Temporal stages (currently super resolution and motion blur) accumulate prior-frame
+    // state and would cross-pollute the two eyes if shared. Stateless chains (spatial only)
+    // can share one instance across both eyes, saving a second pool + pipeline allocation.
+    // The chain aggregates `requiresInstancePerStream` across all stages.
     let leftChain = try await makeChain(
-      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize)
+      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
+      motionBlurStrength: motionBlurStrength)
     let rightChain: FrameProcessorChain
     if leftChain.requiresInstancePerStream {
       rightChain = try await makeChain(
-        upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize)
+        upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
+        motionBlurStrength: motionBlurStrength)
     } else {
       rightChain = leftChain
     }
@@ -615,11 +628,19 @@ public final class UpscalingExportSession: @unchecked Sendable {
   private static func makeChain(
     upscalerKind: UpscalerKind,
     inputSize: CGSize,
-    outputSize: CGSize
+    outputSize: CGSize,
+    motionBlurStrength: Int?
   ) async throws -> FrameProcessorChain {
-    let backend = try await upscalerKind.makeBackend(
-      inputSize: inputSize, outputSize: outputSize)
-    return try FrameProcessorChain(stages: [backend])
+    var stages: [any FrameProcessorBackend] = []
+    stages.append(
+      try await upscalerKind.makeBackend(inputSize: inputSize, outputSize: outputSize))
+    // Motion blur runs last so downstream temporal stages don't have to reason about
+    // blurred frames (motion blur smears optical flow).
+    if let motionBlurStrength {
+      stages.append(
+        try await VTMotionBlurProcessor(frameSize: outputSize, strength: motionBlurStrength))
+    }
+    return try FrameProcessorChain(stages: stages)
   }
 
   /// Drives an `AVAssetReaderOutput` on a dedicated GCD queue and yields each sample buffer into

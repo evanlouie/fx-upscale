@@ -511,6 +511,116 @@ private struct TemporalTestBackend: FrameProcessorBackend {
   }
 }
 
+// MARK: - Motion Blur Processor Tests
+
+@Suite("Motion Blur Processor Tests")
+struct MotionBlurProcessorTests {
+  /// Skips the enclosing test if `VTMotionBlurConfiguration` isn't available on this device.
+  private func requireMotionBlur() throws {
+    guard VTMotionBlurConfiguration.isSupported else {
+      throw TestSkipError("VTMotionBlurConfiguration not supported on this device")
+    }
+  }
+
+  @Test("Preflight rejects strength below 1")
+  func rejectsStrengthBelowMinimum() throws {
+    try requireMotionBlur()
+    #expect(throws: VTMotionBlurProcessor.Error.self) {
+      try VTMotionBlurProcessor.preflight(
+        frameSize: CGSize(width: 640, height: 480), strength: 0)
+    }
+  }
+
+  @Test("Preflight rejects strength above 100")
+  func rejectsStrengthAboveMaximum() throws {
+    try requireMotionBlur()
+    #expect(throws: VTMotionBlurProcessor.Error.self) {
+      try VTMotionBlurProcessor.preflight(
+        frameSize: CGSize(width: 640, height: 480), strength: 101)
+    }
+  }
+
+  @Test("Preflight rejects oversized frames on macOS")
+  func rejectsOversizedFrames() throws {
+    try requireMotionBlur()
+    #expect(throws: VTMotionBlurProcessor.Error.self) {
+      // Beyond the macOS 8192×4320 limit.
+      try VTMotionBlurProcessor.preflight(
+        frameSize: CGSize(width: 16384, height: 8640), strength: 50)
+    }
+  }
+
+  @Test("Preflight accepts valid config")
+  func preflightAcceptsValidConfig() throws {
+    try requireMotionBlur()
+    try VTMotionBlurProcessor.preflight(
+      frameSize: CGSize(width: 640, height: 480), strength: 50)
+  }
+
+  @Test("Processes two frames at output size")
+  func processesTwoFrames() async throws {
+    try requireMotionBlur()
+    let size = CGSize(width: 640, height: 480)
+    let processor = try await VTMotionBlurProcessor(frameSize: size, strength: 50)
+
+    #expect(processor.inputSize == size)
+    #expect(processor.outputSize == size)
+    #expect(processor.requiresInstancePerStream == true)
+
+    // First call: no previous frame yet, so the input passes through.
+    let first = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let firstCaptured = first
+    let firstPts = CMTime(value: 0, timescale: 30)
+    let firstOutputs = try await processor.process(
+      firstCaptured, presentationTimeStamp: firstPts, outputPool: nil)
+    try #require(firstOutputs.count == 1)
+    #expect(firstOutputs[0].presentationTimeStamp == firstPts)
+
+    // Second call: previousSourceFrame is populated, so VT runs and produces a blurred frame.
+    let second = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let secondCaptured = second
+    let secondPts = CMTime(value: 1, timescale: 30)
+    let secondOutputs = try await processor.process(
+      secondCaptured, presentationTimeStamp: secondPts, outputPool: nil)
+    try #require(secondOutputs.count == 1)
+    #expect(CVPixelBufferGetWidth(secondOutputs[0].pixelBuffer) == Int(size.width))
+    #expect(CVPixelBufferGetHeight(secondOutputs[0].pixelBuffer) == Int(size.height))
+    #expect(secondOutputs[0].presentationTimeStamp == secondPts)
+  }
+
+  @Test("Composes after a spatial upscaler in a chain")
+  func composesAfterSpatialUpscaler() async throws {
+    try requireMotionBlur()
+    let inputSize = CGSize(width: 320, height: 240)
+    let outputSize = CGSize(width: 640, height: 480)
+
+    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
+      throw TestSkipError("Metal device not available")
+    }
+    let blur = try await VTMotionBlurProcessor(frameSize: outputSize, strength: 50)
+    let chain = try FrameProcessorChain(stages: [upscaler, blur])
+
+    #expect(chain.inputSize == inputSize)
+    #expect(chain.outputSize == outputSize)
+    // Motion blur is temporal — chain must inherit the per-stream-instance requirement.
+    #expect(chain.requiresInstancePerStream == true)
+
+    // Drive two frames through the chain so the motion-blur stage exercises its VT path on
+    // the second call (first is a passthrough — see VTMotionBlurProcessor.process).
+    for frameIdx in 0..<2 {
+      let buffer = try makeTestPixelBuffer(size: inputSize)
+      nonisolated(unsafe) let captured = buffer
+      let pts = CMTime(value: Int64(frameIdx), timescale: 30)
+      let outputs = try await chain.process(
+        captured, presentationTimeStamp: pts, outputPool: nil)
+      try #require(outputs.count == 1)
+      #expect(CVPixelBufferGetWidth(outputs[0].pixelBuffer) == Int(outputSize.width))
+      #expect(CVPixelBufferGetHeight(outputs[0].pixelBuffer) == Int(outputSize.height))
+      #expect(outputs[0].presentationTimeStamp == pts)
+    }
+  }
+}
+
 // MARK: - Export Session Tests
 
 @Suite("Export Session Tests", .serialized)
