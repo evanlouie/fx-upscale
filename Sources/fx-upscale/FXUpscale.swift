@@ -322,7 +322,7 @@ import Upscaling
       Terminal.error(error.localizedDescription)
       throw ExitCode.failure
     }
-    Terminal.success("Video successfully upscaled!")
+    Terminal.success("Wrote \(outputURL.path(percentEncoded: false))")
   }
 
   /// Runs a preflight check and rewraps any thrown error as a `ValidationError` so
