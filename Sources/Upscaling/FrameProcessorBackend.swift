@@ -85,7 +85,7 @@ extension FrameProcessorBackend {
   /// 1:1 convenience wrapper for single-frame callers. Returns the first (and only, for
   /// 1:1 backends) output buffer. Throws if the backend produced zero outputs — that would
   /// be a backend bug.
-  @discardableResult public func upscale(
+  @discardableResult public func processSingle(
     _ pixelBuffer: sending CVPixelBuffer
   ) async throws -> sending CVPixelBuffer {
     let outputs = try await process(

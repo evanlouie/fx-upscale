@@ -95,7 +95,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     }
 
     let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
-    frameIndex &+= 1
+    frameIndex += 1
     guard
       let newFrameWrapper = VTFrameProcessorFrame(
         buffer: pixelBuffer, presentationTimeStamp: vtPts)
@@ -135,14 +135,14 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     //
     // Upper bound on emitted frames from this pair: one target period per slot plus one for
     // rounding. `nextPTS - prevPTS` is at most one source period at steady rates, so this is
-    // `ceil(target/source) + 1` in the common case.
+    // `ceil(target/source) + 1` in the common case. Planning scratch (`interpolationPhases`,
+    // `interpolatedOutputPTSs`, `destinationBuffers`, `destinationFrames`) lives on the actor
+    // and is reused with `keepingCapacity: true` so the steady-state case hits no heap growth.
     let emittedUpperBound = max(1, Int((intervalSeconds * targetFrameRate).rounded(.up)) + 1)
     var outputs: [FrameProcessorOutput] = []
-    var interpolationPhases: [Float] = []
-    var interpolatedOutputPTSs: [CMTime] = []
     outputs.reserveCapacity(emittedUpperBound)
-    interpolationPhases.reserveCapacity(emittedUpperBound)
-    interpolatedOutputPTSs.reserveCapacity(emittedUpperBound)
+    interpolationPhases.removeAll(keepingCapacity: true)
+    interpolatedOutputPTSs.removeAll(keepingCapacity: true)
     while true {
       let candidatePTS = targetPTS(forIndex: targetOutputIndex)
       if candidatePTS >= nextPTS { break }
@@ -156,16 +156,14 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
         interpolationPhases.append(Float(phase))
         interpolatedOutputPTSs.append(candidatePTS)
       }
-      targetOutputIndex &+= 1
+      targetOutputIndex += 1
     }
 
     if !interpolationPhases.isEmpty {
       // Allocate one destination buffer per interpolated frame and wrap each. VT needs the
       // same count in `interpolationPhase` and `destinationFrames`.
-      var destinationBuffers: [CVPixelBuffer] = []
-      var destinationFrames: [VTFrameProcessorFrame] = []
-      destinationBuffers.reserveCapacity(interpolationPhases.count)
-      destinationFrames.reserveCapacity(interpolationPhases.count)
+      destinationBuffers.removeAll(keepingCapacity: true)
+      destinationFrames.removeAll(keepingCapacity: true)
       for _ in interpolationPhases {
         let dest = try resolveProcessorOutputBuffer(
           input: pixelBuffer,
@@ -227,6 +225,10 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     // interpolate against, and synthesising pixels past the input would distort duration.
     guard let buffered = bufferedFrame else { return [] }
     bufferedFrame = nil
+    // Release retained planning scratch so the last emitted frame doesn't keep destination
+    // buffers alive past the end of the stream.
+    destinationBuffers.removeAll(keepingCapacity: false)
+    destinationFrames.removeAll(keepingCapacity: false)
     nonisolated(unsafe) let passthroughBuffer = buffered.buffer
     return [
       FrameProcessorOutput(pixelBuffer: passthroughBuffer, presentationTimeStamp: buffered.pts)
@@ -273,6 +275,13 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   private var bufferedFrame: BufferedFrame?
   private var anchorPTS: CMTime = .zero
   private var targetOutputIndex: Int64 = 0
+
+  // Per-call planning scratch. Stored on the actor and reused with `removeAll(keepingCapacity:)`
+  // so steady-state processing allocates nothing beyond the per-call output array.
+  private var interpolationPhases: [Float] = []
+  private var interpolatedOutputPTSs: [CMTime] = []
+  private var destinationBuffers: [CVPixelBuffer] = []
+  private var destinationFrames: [VTFrameProcessorFrame] = []
 
   /// PTS of the target output at index `k`, computed exactly (for integer rates) or with
   /// sub-nanosecond drift (for non-integer rates).

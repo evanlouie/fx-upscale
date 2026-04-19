@@ -347,7 +347,7 @@ struct UpscalerTests {
     }
 
     let inputBuffer = try makeTestPixelBuffer(size: inputSize)
-    let outputBuffer = try await upscaler.upscale(inputBuffer)
+    let outputBuffer = try await upscaler.processSingle(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
     #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
@@ -363,7 +363,7 @@ struct UpscalerTests {
     }
 
     let inputBuffer = try makeTestPixelBuffer(size: inputSize)
-    let outputBuffer = try await upscaler.upscale(inputBuffer)
+    let outputBuffer = try await upscaler.processSingle(inputBuffer)
 
     #expect(CVPixelBufferGetWidth(outputBuffer) == Int(outputSize.width))
     #expect(CVPixelBufferGetHeight(outputBuffer) == Int(outputSize.height))
@@ -379,12 +379,12 @@ struct UpscalerTests {
       throw TestSkipError("Metal device not available")
     }
     let wrongBuffer = try makeTestPixelBuffer(size: CGSize(width: 320, height: 240))
-    // `CVPixelBuffer` is a CF type that isn't Sendable, and `upscale` takes a `sending`
+    // `CVPixelBuffer` is a CF type that isn't Sendable, and `processSingle` takes a `sending`
     // parameter. Rebinding via `nonisolated(unsafe)` releases the value from the test's
     // isolation domain so the compiler accepts the send.
     nonisolated(unsafe) let captured = wrongBuffer
     await #expect(throws: PixelBufferIOError.inputSizeMismatch) {
-      _ = try await upscaler.upscale(captured)
+      _ = try await upscaler.processSingle(captured)
     }
   }
 

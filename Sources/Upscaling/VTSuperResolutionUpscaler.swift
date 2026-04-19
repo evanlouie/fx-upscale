@@ -90,11 +90,8 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       providedOutput: nil
     )
 
-    // Synthesize a monotonically increasing PTS for VT's internal ordering check. VT rejects
-    // out-of-order timestamps but doesn't care what base they use; the `presentationTimeStamp`
-    // we expose to the caller on the returned `FrameProcessorOutput` is the real source PTS.
     let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
-    frameIndex &+= 1
+    frameIndex += 1
 
     guard
       let sourceFrame = VTFrameProcessorFrame(
