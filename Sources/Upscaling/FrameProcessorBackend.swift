@@ -39,11 +39,6 @@ public protocol FrameProcessorBackend: Sendable {
   var inputSize: CGSize { get }
   var outputSize: CGSize { get }
 
-  /// `true` if the backend accumulates temporal state across calls and therefore needs a
-  /// dedicated instance per independent frame stream (e.g. per eye in a stereo pair).
-  /// `false` if one backend can safely be shared across streams.
-  var requiresInstancePerStream: Bool { get }
-
   /// Processes a single input frame, returning one or more output frames.
   ///
   /// - Parameters:
@@ -76,8 +71,6 @@ public protocol FrameProcessorBackend: Sendable {
 }
 
 extension FrameProcessorBackend {
-  public var requiresInstancePerStream: Bool { false }
-
   public func finish(
     outputPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] { [] }

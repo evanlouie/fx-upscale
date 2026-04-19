@@ -19,10 +19,6 @@ import VideoToolbox
 ///   - `strength` must be in the 1–100 range. The integer is mapped to the native Float
 ///     0.0–1.0 `filterStrength` range documented by `VTTemporalNoiseFilterParameters`.
 public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
-  // MARK: FrameProcessorBackend
-
-  public nonisolated let requiresInstancePerStream: Bool = true
-
   // MARK: Lifecycle
 
   /// Creates a temporal-noise processor for frames at the given size.
@@ -41,7 +37,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
     guard
       let pixelBufferPool = makeBGRAPixelBufferPool(
         size: frameSize, minimumBufferCount: Self.minimumPoolBufferCount)
-    else { throw Error.pixelBufferPoolCreationFailed }
+    else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: .temporalNoise) }
     self.pixelBufferPool = pixelBufferPool
   }
 
@@ -73,7 +69,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
       let sourceFrame = VTFrameProcessorFrame(
         buffer: pixelBuffer, presentationTimeStamp: vtPts)
     else {
-      throw Error.vtFrameConstructionFailed
+      throw VTBackendError.vtFrameConstructionFailed(backend: .temporalNoise)
     }
 
     // The API requires at least one reference frame (previous or next). This backend doesn't
@@ -108,12 +104,10 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
         hasDiscontinuity: false
       )
     else {
-      throw Error.vtFrameConstructionFailed
+      throw VTBackendError.vtFrameConstructionFailed(backend: .temporalNoise)
     }
 
-    nonisolated(unsafe) let vtProcessor = processor
-    nonisolated(unsafe) let vtParameters = parameters
-    try await runVT(on: vtProcessor, parameters: vtParameters)
+    try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
 
     self.previousSourceFrame = sourceFrame
 
@@ -160,7 +154,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
     frameSize: CGSize
   ) throws -> VTTemporalNoiseFilterConfiguration {
     guard VTTemporalNoiseFilterConfiguration.isSupported else {
-      throw Error.notSupportedOnDevice
+      throw VTBackendError.notSupportedOnDevice(backend: .temporalNoise)
     }
 
     let frameWidth = Int(frameSize.width.rounded())
@@ -184,16 +178,11 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
 
 extension VTTemporalNoiseProcessor {
   public enum Error: Swift.Error, LocalizedError {
-    case notSupportedOnDevice
     case strengthOutOfRange(requested: Int, minimum: Int, maximum: Int)
     case configurationInitFailed(frameWidth: Int, frameHeight: Int)
-    case pixelBufferPoolCreationFailed
-    case vtFrameConstructionFailed
 
     public var errorDescription: String? {
       switch self {
-      case .notSupportedOnDevice:
-        "The VideoToolbox temporal noise filter is not supported on this device."
       case .strengthOutOfRange(let requested, let minimum, let maximum):
         "Denoise strength \(requested) is out of range. "
           + "Valid range is \(minimum)–\(maximum)."
@@ -201,11 +190,6 @@ extension VTTemporalNoiseProcessor {
         "Temporal noise filter rejected the input configuration "
           + "(\(frameWidth)×\(frameHeight)). The dimensions may exceed the processor's "
           + "supported range, or the source pixel format may be unsupported."
-      case .pixelBufferPoolCreationFailed:
-        "Failed to create the temporal noise filter output pixel buffer pool."
-      case .vtFrameConstructionFailed:
-        "Failed to construct temporal noise filter frame parameters "
-          + "(pixel buffers must be IOSurface-backed)."
       }
     }
   }

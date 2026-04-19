@@ -18,10 +18,6 @@ import VideoToolbox
 ///   - The device must return `true` for `VTMotionBlurConfiguration.isSupported`.
 ///   - `strength` must be in the 1–100 range documented by the configuration.
 public actor VTMotionBlurProcessor: FrameProcessorBackend {
-  // MARK: FrameProcessorBackend
-
-  public nonisolated let requiresInstancePerStream: Bool = true
-
   // MARK: Lifecycle
 
   /// Creates a motion-blur processor for frames at the given size.
@@ -40,7 +36,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     guard
       let pixelBufferPool = makeBGRAPixelBufferPool(
         size: frameSize, minimumBufferCount: Self.minimumPoolBufferCount)
-    else { throw Error.pixelBufferPoolCreationFailed }
+    else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: .motionBlur) }
     self.pixelBufferPool = pixelBufferPool
   }
 
@@ -72,7 +68,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
       let sourceFrame = VTFrameProcessorFrame(
         buffer: pixelBuffer, presentationTimeStamp: vtPts)
     else {
-      throw Error.vtFrameConstructionFailed
+      throw VTBackendError.vtFrameConstructionFailed(backend: .motionBlur)
     }
 
     // VT returns -19730 if both previous and next reference frames are missing. This backend
@@ -109,12 +105,10 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
         destinationFrame: destinationFrame
       )
     else {
-      throw Error.vtFrameConstructionFailed
+      throw VTBackendError.vtFrameConstructionFailed(backend: .motionBlur)
     }
 
-    nonisolated(unsafe) let vtProcessor = processor
-    nonisolated(unsafe) let vtParameters = parameters
-    try await runVT(on: vtProcessor, parameters: vtParameters)
+    try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
 
     self.previousSourceFrame = sourceFrame
 
@@ -157,7 +151,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     frameSize: CGSize
   ) throws -> VTMotionBlurConfiguration {
     guard VTMotionBlurConfiguration.isSupported else {
-      throw Error.notSupportedOnDevice
+      throw VTBackendError.notSupportedOnDevice(backend: .motionBlur)
     }
 
     let frameWidth = Int(frameSize.width.rounded())
@@ -183,27 +177,17 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
 
 extension VTMotionBlurProcessor {
   public enum Error: Swift.Error, LocalizedError {
-    case notSupportedOnDevice
     case strengthOutOfRange(requested: Int, minimum: Int, maximum: Int)
     case configurationInitFailed(frameWidth: Int, frameHeight: Int)
-    case pixelBufferPoolCreationFailed
-    case vtFrameConstructionFailed
 
     public var errorDescription: String? {
       switch self {
-      case .notSupportedOnDevice:
-        "The VideoToolbox motion-blur processor is not supported on this device."
       case .strengthOutOfRange(let requested, let minimum, let maximum):
         "Motion-blur strength \(requested) is out of range. "
           + "Valid range is \(minimum)–\(maximum) (50 matches a 180° film shutter)."
       case .configurationInitFailed(let frameWidth, let frameHeight):
         "Motion blur rejected the input configuration (\(frameWidth)×\(frameHeight)). "
           + "On macOS, inputs must be ≤ 8192×4320."
-      case .pixelBufferPoolCreationFailed:
-        "Failed to create the motion-blur output pixel buffer pool."
-      case .vtFrameConstructionFailed:
-        "Failed to construct motion-blur frame parameters "
-          + "(pixel buffers must be IOSurface-backed)."
       }
     }
   }

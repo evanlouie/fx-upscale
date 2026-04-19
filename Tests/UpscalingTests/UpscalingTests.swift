@@ -452,7 +452,6 @@ struct FrameProcessorChainTests {
     let chain = try FrameProcessorChain(stages: [upscaler])
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)
-    #expect(chain.requiresInstancePerStream == false)
 
     let buffer = try makeTestPixelBuffer(size: inputSize)
     nonisolated(unsafe) let captured = buffer
@@ -466,49 +465,6 @@ struct FrameProcessorChainTests {
     #expect(outputs[0].presentationTimeStamp == pts)
   }
 
-  @Test("Chain aggregates requiresInstancePerStream across stages")
-  func aggregatesTemporalFlag() throws {
-    // Without touching hardware: construct a test double that advertises
-    // `requiresInstancePerStream = true` and verify the chain propagates it.
-    let size = CGSize(width: 100, height: 100)
-    let stateless = StatelessTestBackend(inputSize: size, outputSize: size)
-    let temporal = TemporalTestBackend(inputSize: size, outputSize: size)
-
-    let statelessChain = try FrameProcessorChain(stages: [stateless])
-    #expect(statelessChain.requiresInstancePerStream == false)
-
-    let mixedChain = try FrameProcessorChain(stages: [stateless, temporal])
-    #expect(mixedChain.requiresInstancePerStream == true)
-  }
-}
-
-// Test doubles for size-only / flag-propagation checks. These never get their `process`
-// method called, so the body is a precondition failure — if a future test accidentally
-// wires one into a live pipeline, it trips loudly.
-private struct StatelessTestBackend: FrameProcessorBackend {
-  let inputSize: CGSize
-  let outputSize: CGSize
-  var requiresInstancePerStream: Bool { false }
-  func process(
-    _ pixelBuffer: sending CVPixelBuffer,
-    presentationTimeStamp: CMTime,
-    outputPool: sending CVPixelBufferPool?
-  ) async throws -> [FrameProcessorOutput] {
-    preconditionFailure("StatelessTestBackend.process should not be called")
-  }
-}
-
-private struct TemporalTestBackend: FrameProcessorBackend {
-  let inputSize: CGSize
-  let outputSize: CGSize
-  var requiresInstancePerStream: Bool { true }
-  func process(
-    _ pixelBuffer: sending CVPixelBuffer,
-    presentationTimeStamp: CMTime,
-    outputPool: sending CVPixelBufferPool?
-  ) async throws -> [FrameProcessorOutput] {
-    preconditionFailure("TemporalTestBackend.process should not be called")
-  }
 }
 
 // MARK: - Motion Blur Processor Tests
@@ -558,7 +514,6 @@ let size = CGSize(width: 640, height: 480)
 
     #expect(processor.inputSize == size)
     #expect(processor.outputSize == size)
-    #expect(processor.requiresInstancePerStream == true)
 
     // First call: no previous frame yet, so the input passes through.
     let first = try makeTestPixelBuffer(size: size)
@@ -594,8 +549,6 @@ let inputSize = CGSize(width: 320, height: 240)
 
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)
-    // Motion blur is temporal — chain must inherit the per-stream-instance requirement.
-    #expect(chain.requiresInstancePerStream == true)
 
     // Drive two frames through the chain so the motion-blur stage exercises its VT path on
     // the second call (first is a passthrough — see VTMotionBlurProcessor.process).
@@ -686,8 +639,6 @@ struct TemporalNoiseProcessorTests {
 
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)
-    // Denoise is temporal — chain must inherit the per-stream-instance requirement.
-    #expect(chain.requiresInstancePerStream == true)
 
     // Drive two frames so the denoise stage exercises its VT path on the second call (first
     // is a passthrough — see VTTemporalNoiseProcessor.process).
@@ -816,8 +767,6 @@ struct FrameRateConverterTests {
 
     #expect(chain.inputSize == inputSize)
     #expect(chain.outputSize == outputSize)
-    // FRC is stateful — chain must inherit the per-stream-instance requirement.
-    #expect(chain.requiresInstancePerStream == true)
 
     // Drive two source frames at 30fps, then flush. Expect the first call to buffer (no
     // output), the second to emit 2 outputs spanning [0, 1/30), and finish() to emit the

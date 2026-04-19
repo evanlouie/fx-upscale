@@ -578,21 +578,16 @@ public final class UpscalingExportSession: @unchecked Sendable {
     pipeline: PipelineOptions,
     progress: Progress
   ) async throws {
-    // Temporal stages accumulate prior-frame state and would cross-pollute the two eyes if
-    // shared. Stateless chains (spatial only) can share one instance across both eyes, saving
-    // a second pool + pipeline allocation. The chain aggregates `requiresInstancePerStream`
-    // across all stages.
+    // Each eye gets its own chain: temporal stages accumulate prior-frame state and would
+    // cross-pollute the two eyes if shared. For a pure-spatial chain the second chain's pool
+    // can reach ~30 MiB at 4K output (4 buffers × 8 MiB), but stereo exports are one-shot and
+    // the buffers are lazily committed — not worth a second code path to reuse a single chain.
     let leftChain = try await makeChain(
       upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
       pipeline: pipeline)
-    let rightChain: FrameProcessorChain
-    if leftChain.requiresInstancePerStream {
-      rightChain = try await makeChain(
-        upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
-        pipeline: pipeline)
-    } else {
-      rightChain = leftChain
-    }
+    let rightChain = try await makeChain(
+      upscalerKind: upscalerKind, inputSize: inputSize, outputSize: outputSize,
+      pipeline: pipeline)
 
     let sampleBuffers = makeSampleBufferStream(
       from: assetReaderOutput, label: "com.upscaling.spatialvideo.reader")

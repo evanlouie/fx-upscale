@@ -20,10 +20,6 @@ import VideoToolbox
 ///   - The device must return `true` for `VTSuperResolutionScalerConfiguration.isSupported`.
 ///   - The backing ML model must be present or downloadable.
 public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
-  // MARK: FrameProcessorBackend
-
-  public nonisolated let requiresInstancePerStream: Bool = true
-
   // MARK: Lifecycle
 
   /// Creates a super-resolution upscaler for the given sizes.
@@ -56,7 +52,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     guard
       let pixelBufferPool = makeBGRAPixelBufferPool(
         size: outputSize, minimumBufferCount: Self.minimumPoolBufferCount)
-    else { throw Error.pixelBufferPoolCreationFailed }
+    else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: .superResolution) }
     self.pixelBufferPool = pixelBufferPool
   }
 
@@ -107,12 +103,10 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
         destinationFrame: destinationFrame
       )
     else {
-      throw Error.vtFrameConstructionFailed
+      throw VTBackendError.vtFrameConstructionFailed(backend: .superResolution)
     }
 
-    nonisolated(unsafe) let vtProcessor = processor
-    nonisolated(unsafe) let vtParameters = parameters
-    try await runVT(on: vtProcessor, parameters: vtParameters)
+    try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
 
     // Stash this call's source/destination wrappers as the "previous" pair for the next
     // submission. `VTFrameProcessorFrame` retains the underlying `CVPixelBuffer`, so caching
@@ -164,7 +158,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     inputSize: CGSize, outputSize: CGSize
   ) throws -> VTSuperResolutionScalerConfiguration {
     guard VTSuperResolutionScalerConfiguration.isSupported else {
-      throw Error.notSupportedOnDevice
+      throw VTBackendError.notSupportedOnDevice(backend: .superResolution)
     }
 
     let (scaleFactor, widthRatio, heightRatio) = resolveScaleFactor(
@@ -224,19 +218,14 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
 
 extension VTSuperResolutionUpscaler {
   public enum Error: Swift.Error, LocalizedError {
-    case notSupportedOnDevice
     case anisotropicScalingNotSupported(widthRatio: Double, heightRatio: Double)
     case nonIntegerScaleFactor(ratio: Double)
     case unsupportedScaleFactor(requested: Int, supported: [Int])
     case configurationInitFailed(inputWidth: Int, inputHeight: Int, scaleFactor: Int)
     case modelDownloadFailed(Swift.Error)
-    case pixelBufferPoolCreationFailed
-    case vtFrameConstructionFailed
 
     public var errorDescription: String? {
       switch self {
-      case .notSupportedOnDevice:
-        "The VideoToolbox super-resolution processor is not supported on this device."
       case .anisotropicScalingNotSupported(let widthRatio, let heightRatio):
         "Super resolution requires uniform scaling on both axes "
           + "(got \(String(format: "%.3f", widthRatio))× wide, "
@@ -258,11 +247,6 @@ extension VTSuperResolutionUpscaler {
           + "On macOS, video inputs must be ≤ 1920×1080. Use --scaler spatial for larger sources."
       case .modelDownloadFailed(let underlying):
         "Failed to download the super-resolution ML model: \(underlying.localizedDescription)"
-      case .pixelBufferPoolCreationFailed:
-        "Failed to create the super-resolution output pixel buffer pool."
-      case .vtFrameConstructionFailed:
-        "Failed to construct super-resolution frame parameters "
-          + "(pixel buffers must be IOSurface-backed)."
       }
     }
   }

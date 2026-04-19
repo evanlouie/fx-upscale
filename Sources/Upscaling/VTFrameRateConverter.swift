@@ -24,10 +24,6 @@ import VideoToolbox
 ///   - `targetFrameRate` must be finite and positive. Callers should additionally validate
 ///     `target > source` upstream (this backend doesn't know the source rate).
 public actor VTFrameRateConverter: FrameProcessorBackend {
-  // MARK: FrameProcessorBackend
-
-  public nonisolated let requiresInstancePerStream: Bool = true
-
   // MARK: Lifecycle
 
   /// Creates a frame-rate converter for frames at the given size and target rate.
@@ -58,7 +54,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     guard
       let pixelBufferPool = makeBGRAPixelBufferPool(
         size: frameSize, minimumBufferCount: Self.minimumPoolBufferCount)
-    else { throw Error.pixelBufferPoolCreationFailed }
+    else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: .frameRateConversion) }
     self.pixelBufferPool = pixelBufferPool
   }
 
@@ -100,13 +96,14 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
       let newFrameWrapper = VTFrameProcessorFrame(
         buffer: pixelBuffer, presentationTimeStamp: vtPts)
     else {
-      throw Error.vtFrameConstructionFailed
+      throw VTBackendError.vtFrameConstructionFailed(backend: .frameRateConversion)
     }
+
+    nonisolated(unsafe) let capturedBuffer = pixelBuffer
 
     // First frame: buffer and return empty. Anchor the output schedule on the first source
     // PTS so outputs begin at the same instant as the source.
     guard let buffered = bufferedFrame else {
-      nonisolated(unsafe) let capturedBuffer = pixelBuffer
       bufferedFrame = BufferedFrame(
         wrapper: newFrameWrapper, buffer: capturedBuffer, pts: presentationTimeStamp)
       anchorPTS = presentationTimeStamp
@@ -123,7 +120,6 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     guard intervalSeconds > 0 else {
       // Non-monotonic PTS. Skip planning but still buffer the new frame so forward progress
       // continues on the next call.
-      nonisolated(unsafe) let capturedBuffer = pixelBuffer
       bufferedFrame = BufferedFrame(
         wrapper: newFrameWrapper, buffer: capturedBuffer, pts: nextPTS)
       return []
@@ -177,7 +173,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
           let wrapper = VTFrameProcessorFrame(
             buffer: dest, presentationTimeStamp: vtPts)
         else {
-          throw Error.vtFrameConstructionFailed
+          throw VTBackendError.vtFrameConstructionFailed(backend: .frameRateConversion)
         }
         destinationBuffers.append(dest)
         destinationFrames.append(wrapper)
@@ -193,12 +189,10 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
           destinationFrames: destinationFrames
         )
       else {
-        throw Error.vtFrameConstructionFailed
+        throw VTBackendError.vtFrameConstructionFailed(backend: .frameRateConversion)
       }
 
-      nonisolated(unsafe) let vtProcessor = processor
-      nonisolated(unsafe) let vtParameters = parameters
-      try await runVT(on: vtProcessor, parameters: vtParameters)
+      try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
 
       outputs.reserveCapacity(outputs.count + destinationBuffers.count)
       for (buffer, outputPTS) in zip(destinationBuffers, interpolatedOutputPTSs) {
@@ -210,7 +204,6 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     }
 
     // Slide: the just-received frame becomes the new buffered "prev" for the next call.
-    nonisolated(unsafe) let capturedBuffer = pixelBuffer
     bufferedFrame = BufferedFrame(
       wrapper: newFrameWrapper, buffer: capturedBuffer, pts: nextPTS)
 
@@ -310,7 +303,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     frameSize: CGSize
   ) throws -> VTFrameRateConversionConfiguration {
     guard VTFrameRateConversionConfiguration.isSupported else {
-      throw Error.notSupportedOnDevice
+      throw VTBackendError.notSupportedOnDevice(backend: .frameRateConversion)
     }
 
     let frameWidth = Int(frameSize.width.rounded())
@@ -336,27 +329,17 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
 
 extension VTFrameRateConverter {
   public enum Error: Swift.Error, LocalizedError {
-    case notSupportedOnDevice
     case targetFrameRateOutOfRange(requested: Double, maximum: Double)
     case configurationInitFailed(frameWidth: Int, frameHeight: Int)
-    case pixelBufferPoolCreationFailed
-    case vtFrameConstructionFailed
 
     public var errorDescription: String? {
       switch self {
-      case .notSupportedOnDevice:
-        "The VideoToolbox frame-rate conversion processor is not supported on this device."
       case .targetFrameRateOutOfRange(let requested, let maximum):
         "Target frame rate \(requested) is out of range. "
           + "Must be finite, positive, and ≤ \(Int(maximum)) fps."
       case .configurationInitFailed(let frameWidth, let frameHeight):
         "Frame-rate conversion rejected the input configuration "
           + "(\(frameWidth)×\(frameHeight)). On macOS, inputs must be ≤ 8192×4320."
-      case .pixelBufferPoolCreationFailed:
-        "Failed to create the frame-rate conversion output pixel buffer pool."
-      case .vtFrameConstructionFailed:
-        "Failed to construct frame-rate conversion frame parameters "
-          + "(pixel buffers must be IOSurface-backed)."
       }
     }
   }

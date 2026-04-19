@@ -42,9 +42,6 @@ public actor FrameProcessorChain: FrameProcessorBackend {
 
   public nonisolated var inputSize: CGSize { stages.first!.inputSize }
   public nonisolated var outputSize: CGSize { stages.last!.outputSize }
-  public nonisolated var requiresInstancePerStream: Bool {
-    stages.contains { $0.requiresInstancePerStream }
-  }
 
   public func process(
     _ pixelBuffer: sending CVPixelBuffer,
@@ -63,16 +60,16 @@ public actor FrameProcessorChain: FrameProcessorBackend {
 
     let lastIndex = stages.count - 1
     for (stageIndex, stage) in stages.enumerated() {
-      let poolForStage: CVPixelBufferPool? = (stageIndex == lastIndex) ? terminalPool : nil
+      nonisolated(unsafe) let poolForStage: CVPixelBufferPool? =
+        (stageIndex == lastIndex) ? terminalPool : nil
       var nextFrames: [FrameProcessorOutput] = []
       nextFrames.reserveCapacity(currentFrames.count)
       for frame in currentFrames {
         nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
-        nonisolated(unsafe) let stagePool = poolForStage
         let outputs = try await stage.process(
           inputBuffer,
           presentationTimeStamp: frame.presentationTimeStamp,
-          outputPool: stagePool
+          outputPool: poolForStage
         )
         nextFrames.append(contentsOf: outputs)
       }
@@ -96,20 +93,19 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     var running: [FrameProcessorOutput] = []
     let lastIndex = stages.count - 1
     for (stageIndex, stage) in stages.enumerated() {
-      let poolForStage: CVPixelBufferPool? = (stageIndex == lastIndex) ? terminalPool : nil
+      nonisolated(unsafe) let poolForStage: CVPixelBufferPool? =
+        (stageIndex == lastIndex) ? terminalPool : nil
       var nextFrames: [FrameProcessorOutput] = []
       for frame in running {
         nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
-        nonisolated(unsafe) let stagePool = poolForStage
         let outputs = try await stage.process(
           inputBuffer,
           presentationTimeStamp: frame.presentationTimeStamp,
-          outputPool: stagePool
+          outputPool: poolForStage
         )
         nextFrames.append(contentsOf: outputs)
       }
-      nonisolated(unsafe) let stageFlushPool = poolForStage
-      let flushed = try await stage.finish(outputPool: stageFlushPool)
+      let flushed = try await stage.finish(outputPool: poolForStage)
       nextFrames.append(contentsOf: flushed)
       running = nextFrames
     }
