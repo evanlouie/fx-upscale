@@ -27,6 +27,14 @@ xcodebuild build -scheme Upscaling -destination "platform=macOS"
 swift run fx-upscale <video-file> [options]
 ```
 
+Before declaring any code-change task complete, run `swift build -c release`
+and `swift test`. A debug build is not sufficient: release WMO has surfaced
+Swift compiler bugs (e.g. an `ActorIsolationRequest` cycle on
+`isolated deinit`) that debug builds silently accept. Release is a strict
+superset of debug's checks, so it's the only build required at the
+"declare complete" gate — debug builds remain fine for fast iteration
+during development.
+
 ## Test Commands
 
 ```bash
