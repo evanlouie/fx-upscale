@@ -56,7 +56,9 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     self.pixelBufferPool = pixelBufferPool
   }
 
-  isolated deinit {
+  // Swift 6.3 cycles `ActorIsolationRequest` on `isolated deinit` under release-mode WMO,
+  // so use a plain `deinit` and mark `processor` `nonisolated(unsafe)` to reach it from here.
+  deinit {
     processor.endSession()
   }
 
@@ -129,7 +131,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
   /// Tolerance for "isotropic" check between width/height ratios.
   private static let ratioEpsilon: Double = 1e-3
 
-  private let processor: VTFrameProcessor
+  private nonisolated(unsafe) let processor: VTFrameProcessor
   private let pixelBufferPool: CVPixelBufferPool
 
   private var frameIndex: UInt64 = 0

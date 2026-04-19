@@ -58,7 +58,9 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     self.pixelBufferPool = pixelBufferPool
   }
 
-  isolated deinit {
+  // Swift 6.3 cycles `ActorIsolationRequest` on `isolated deinit` under release-mode WMO,
+  // so use a plain `deinit` and mark `processor` `nonisolated(unsafe)` to reach it from here.
+  deinit {
     processor.endSession()
   }
 
@@ -261,7 +263,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   private let frameSize: CGSize
   private let targetFrameRate: Double
   private let targetPeriod: TargetPeriod
-  private let processor: VTFrameProcessor
+  private nonisolated(unsafe) let processor: VTFrameProcessor
   private let pixelBufferPool: CVPixelBufferPool
 
   private var frameIndex: UInt64 = 0
