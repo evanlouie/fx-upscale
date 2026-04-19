@@ -91,6 +91,18 @@ import Upscaling
   var scaler: UpscalerKind = .spatial
 
   @Option(
+    name: [.customShort("d"), .long],
+    help: ArgumentHelp(
+      "Temporal noise-filter strength, 1-100 (omit for no denoising).",
+      discussion:
+        "Runs VTFrameProcessor's ML-based temporal noise filter before scaling. "
+        + "Denoising before upscaling keeps the scaler from amplifying source noise and "
+        + "gives it cleaner inter-frame flow to work with. 1 is subtle, 100 is aggressive."
+    )
+  )
+  var denoise: Int?
+
+  @Option(
     name: [.customShort("m"), .long],
     help: ArgumentHelp(
       "Motion-blur strength, 1-100 (omit for no motion blur).",
@@ -132,6 +144,9 @@ import Upscaling
     }
     if keyframeInterval < 0 || !keyframeInterval.isFinite {
       throw ValidationError("--keyframe-interval must be a non-negative, finite number")
+    }
+    if let denoise, !(1...100).contains(denoise) {
+      throw ValidationError("--denoise must be between 1 and 100")
     }
     if let motionBlur, !(1...100).contains(motionBlur) {
       throw ValidationError("--motion-blur must be between 1 and 100")
@@ -185,6 +200,14 @@ import Upscaling
       throw ValidationError(error.localizedDescription)
     }
 
+    if let denoise {
+      do {
+        try VTTemporalNoiseProcessor.preflight(frameSize: inputSize, strength: denoise)
+      } catch {
+        throw ValidationError(error.localizedDescription)
+      }
+    }
+
     if let motionBlur {
       do {
         try VTMotionBlurProcessor.preflight(frameSize: outputSize, strength: motionBlur)
@@ -216,16 +239,18 @@ import Upscaling
       keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
       creator: "fx-upscale",
       upscaler: scaler,
+      denoiseStrength: denoise,
       motionBlurStrength: motionBlur
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""
+    let denoiseInfo = denoise.map { ", denoise: \($0)" } ?? ""
     let motionBlurInfo = motionBlur.map { ", motion-blur: \($0)" } ?? ""
     Terminal.info(
       "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
         + "to \(Int(outputSize.width))x\(Int(outputSize.height)) "
         + "using \(scaler.displayName), codec: \(outputCodec.rawValue)\(qualityInfo)"
-        + motionBlurInfo
+        + denoiseInfo + motionBlurInfo
     )
 
     // Install SIGINT/SIGTERM handlers unconditionally so Ctrl-C during pipe/CI runs still
