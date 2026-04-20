@@ -309,13 +309,16 @@ import Upscaling
     SignalHandlers.install { [outputURL] in
       try? FileManager.default.removeItem(at: outputURL)
     }
-    defer { SignalHandlers.clearCleanup() }
 
     ProgressBar.start(progress: exportSession.progress)
     defer { ProgressBar.stop() }
 
     do {
       try await exportSession.export()
+      // Disarm the cleanup closure BEFORE we acknowledge success. A `defer`
+      // here would run after `Terminal.success`, leaving a window in which
+      // a SIGINT would delete the very file we just announced we wrote.
+      SignalHandlers.clearCleanup()
     } catch {
       ProgressBar.stop()
       try? FileManager.default.removeItem(at: outputURL)
