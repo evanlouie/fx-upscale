@@ -3,6 +3,27 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+// MARK: - computeTargetPTS
+
+/// The k-th target-output PTS relative to `anchor`, using `period` as the step.
+///
+/// Uses Int64-native arithmetic on `CMTime.value`, so the result is exact whenever
+/// `period.value * index` does not overflow `Int64`. With the 1 GHz fallback timescale
+/// used by `VTFrameRateConverter` this tolerates centuries of continuous output at any
+/// realistic rate — far past the old `Int32` ceiling that was silently clamping and
+/// freezing output PTSs. A checked multiply crashes loudly if the bound is ever crossed,
+/// instead of corrupting the stream.
+///
+/// Pure function so its regression tests do not need an actor or a live VT session.
+func computeTargetPTS(anchor: CMTime, period: CMTime, index: Int64) -> CMTime {
+  let (scaled, overflow) = period.value.multipliedReportingOverflow(by: index)
+  precondition(
+    !overflow,
+    "computeTargetPTS: Int64 overflow at index \(index); "
+      + "period.value=\(period.value), timescale=\(period.timescale)")
+  return anchor + CMTime(value: scaled, timescale: period.timescale)
+}
+
 // MARK: - VTFrameRateConverter
 
 /// Performs `VTFrameProcessor` frame-rate conversion on `CVPixelBuffer`s.
@@ -38,11 +59,10 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     // is bounded by `0.5 / fallbackTimescale` seconds, well below any meaningful threshold.
     let rounded = targetFrameRate.rounded()
     if abs(rounded - targetFrameRate) < 1e-9, rounded >= 1, rounded <= Double(Int32.max) {
-      self.targetPeriod = .integerRate(Int32(rounded))
+      self.targetPeriod = CMTime(value: 1, timescale: Int32(rounded))
     } else {
-      self.targetPeriod = .fractional(
-        CMTime(
-          seconds: 1.0 / targetFrameRate, preferredTimescale: Self.fallbackPeriodTimescale))
+      self.targetPeriod = CMTime(
+        seconds: 1.0 / targetFrameRate, preferredTimescale: Self.fallbackPeriodTimescale)
     }
 
     let configuration = try Self.makeConfiguration(frameSize: frameSize)
@@ -255,16 +275,13 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     let pts: CMTime
   }
 
-  /// How to compute the k-th target output PTS relative to the anchor. Integer rates use an
-  /// exact CMTime timescale; everything else accumulates the fallback period `k` times.
-  private enum TargetPeriod {
-    case integerRate(Int32)
-    case fractional(CMTime)
-  }
-
   private let frameSize: CGSize
   private let targetFrameRate: Double
-  private let targetPeriod: TargetPeriod
+  /// Period between consecutive target-output PTSs. For integer rates we use
+  /// `timescale == rate, value == 1` so `period.value * k` is exact; for non-integer rates
+  /// we use a 1 GHz fallback timescale, which bounds per-period rounding to under half a
+  /// nanosecond.
+  private let targetPeriod: CMTime
   private nonisolated(unsafe) let processor: VTFrameProcessor
   private let pixelBufferPool: CVPixelBufferPool
 
@@ -283,12 +300,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   /// PTS of the target output at index `k`, computed exactly (for integer rates) or with
   /// sub-nanosecond drift (for non-integer rates).
   private func targetPTS(forIndex index: Int64) -> CMTime {
-    switch targetPeriod {
-    case .integerRate(let timescale):
-      return anchorPTS + CMTime(value: index, timescale: timescale)
-    case .fractional(let period):
-      return anchorPTS + CMTimeMultiply(period, multiplier: Int32(clamping: index))
-    }
+    computeTargetPTS(anchor: anchorPTS, period: targetPeriod, index: index)
   }
 
   @discardableResult

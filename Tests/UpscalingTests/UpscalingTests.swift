@@ -845,6 +845,42 @@ struct FrameRateConverterTests {
     // For 10 source frames: 3 × 9 + 1 = 28.
     #expect(totalOutputs == 28)
   }
+
+  @Test("targetPTS stays monotonic past old Int32 ceiling")
+  func targetPTSMonotonicPastInt32Ceiling() {
+    // 59.94 fps, 1 GHz fallback timescale — matches VTFrameRateConverter's non-integer path.
+    let period = CMTime(seconds: 1.0 / 59.94, preferredTimescale: 1_000_000_000)
+    let anchor = CMTime.zero
+    let atCeiling = computeTargetPTS(anchor: anchor, period: period, index: Int64(Int32.max))
+    let pastCeiling = computeTargetPTS(
+      anchor: anchor, period: period, index: Int64(Int32.max) + 1)
+    // Regression guard: the old Int32(clamping:) path collapsed every index past Int32.max
+    // onto the same PTS. Post-fix the sequence must keep stepping.
+    #expect(pastCeiling > atCeiling)
+    #expect(pastCeiling - atCeiling == period)
+  }
+
+  @Test("targetPTS is exact for integer rates at large index")
+  func targetPTSExactForIntegerRatesAtLargeIndex() {
+    // Integer-rate path uses period = (1, rate), so value * index is exact.
+    let period = CMTime(value: 1, timescale: 60)
+    let index: Int64 = 1_000_000_000
+    let pts = computeTargetPTS(anchor: .zero, period: period, index: index)
+    #expect(pts == CMTime(value: index, timescale: 60))
+  }
+
+  @Test("targetPTS step equals period for representative rates")
+  func targetPTSStepEqualsPeriod() {
+    for (period, anchor) in [
+      (CMTime(value: 1, timescale: 30), CMTime(value: 17, timescale: 30)),
+      (CMTime(seconds: 1.0 / 59.94, preferredTimescale: 1_000_000_000), CMTime.zero),
+      (CMTime(seconds: 1.0 / 23.976, preferredTimescale: 1_000_000_000), CMTime.zero),
+    ] {
+      let a = computeTargetPTS(anchor: anchor, period: period, index: 100)
+      let b = computeTargetPTS(anchor: anchor, period: period, index: 101)
+      #expect(b - a == period)
+    }
+  }
 }
 
 // MARK: - Export Session Tests
