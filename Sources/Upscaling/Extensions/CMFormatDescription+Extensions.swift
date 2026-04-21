@@ -1,5 +1,11 @@
 import AVFoundation
 
+extension CMVideoDimensions {
+  public var cgSize: CGSize {
+    CGSize(width: Int(width), height: Int(height))
+  }
+}
+
 extension CMFormatDescription {
   public var videoCodecType: AVVideoCodecType? {
     switch mediaSubType {

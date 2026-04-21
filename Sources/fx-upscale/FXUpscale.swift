@@ -179,9 +179,7 @@ import Upscaling
 
     let formatDescription = try await videoTrack.load(.formatDescriptions).first
     let dimensions = formatDescription.map {
-      CMVideoFormatDescriptionGetDimensions($0)
-    }.map {
-      CGSize(width: Int($0.width), height: Int($0.height))
+      CMVideoFormatDescriptionGetDimensions($0).cgSize
     }
     let naturalSize = try await videoTrack.load(.naturalSize)
     let inputSize = dimensions ?? naturalSize

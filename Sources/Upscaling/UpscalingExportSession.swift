@@ -156,23 +156,28 @@ public final class UpscalingExportSession: @unchecked Sendable {
         }
         assetWriter.add(assetWriterInput)
 
+        // Use encoded pixel dimensions, not naturalSize. AVAssetReaderTrackOutput delivers
+        // decoded frames at encoded dimensions; naturalSize can differ due to PAR or transforms.
+        guard let formatDescription else { continue }
+        let encodedInputSize = CMVideoFormatDescriptionGetDimensions(formatDescription).cgSize
+
         progress.totalUnitCount += Self.videoTrackProgressWeight
-        if formatDescription?.hasLeftAndRightEye ?? false {
+        if formatDescription.hasLeftAndRightEye {
           let receiver = assetWriter.inputTaggedPixelBufferGroupReceiver(
             for: assetWriterInput, pixelBufferAttributes: nil)
-          try await mediaTracks.append(
+          mediaTracks.append(
             .spatialVideo(
               output: assetReaderOutput, input: assetWriterInput,
-              inputSize: track.load(.naturalSize), receiver: receiver))
+              inputSize: encodedInputSize, receiver: receiver))
         } else {
           let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: assetWriterInput,
             sourcePixelBufferAttributes: PixelBufferAttributes.bgra(size: outputSize)
           )
-          try await mediaTracks.append(
+          mediaTracks.append(
             .video(
               output: assetReaderOutput, input: assetWriterInput,
-              inputSize: track.load(.naturalSize), adaptor: adaptor))
+              inputSize: encodedInputSize, adaptor: adaptor))
         }
 
       case .audio:
