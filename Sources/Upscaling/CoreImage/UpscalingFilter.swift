@@ -24,14 +24,10 @@ public final class UpscalingFilter: CIFilter, @unchecked Sendable {
 
       // Normalize to integer pixel dimensions so fractional `extent` differences don't create
       // mismatched scaler/texture pairs.
-      let normalizedInputSize = CGSize(
-        width: Int(inputImage.extent.width.rounded()),
-        height: Int(inputImage.extent.height.rounded())
-      )
-      let normalizedOutputSize = CGSize(
-        width: Int(outputSize.width.rounded()),
-        height: Int(outputSize.height.rounded())
-      )
+      let (inW, inH) = inputImage.extent.size.intDimensions
+      let normalizedInputSize = CGSize(width: inW, height: inH)
+      let (outW, outH) = outputSize.intDimensions
+      let normalizedOutputSize = CGSize(width: outW, height: outH)
 
       // Allocate a fresh scaler and intermediate texture per call. Sharing a single scaler across
       // concurrent `outputImage` evaluations was a data race: CoreImage invokes the kernel's

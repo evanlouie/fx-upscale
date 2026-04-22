@@ -5,16 +5,14 @@
     var inputSize: CGSize {
       get { CGSize(width: inputWidth, height: inputHeight) }
       set {
-        inputWidth = Int(newValue.width.rounded())
-        inputHeight = Int(newValue.height.rounded())
+        (inputWidth, inputHeight) = newValue.intDimensions
       }
     }
 
     var outputSize: CGSize {
       get { CGSize(width: outputWidth, height: outputHeight) }
       set {
-        outputWidth = Int(newValue.width.rounded())
-        outputHeight = Int(newValue.height.rounded())
+        (outputWidth, outputHeight) = newValue.intDimensions
       }
     }
 

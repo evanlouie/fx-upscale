@@ -35,13 +35,16 @@ public actor Upscaler: FrameProcessorBackend {
     #if canImport(MetalFX)
       let spatialScalerDescriptor = MTLFXSpatialScalerDescriptor.bgra8Perceptual(
         inputSize: inputSize, outputSize: outputSize)
+      // Probe: ensure a scaler can actually be created for this (device, descriptor) pair
+      // before we commit to returning a usable `Upscaler`. The per-call scaler is created
+      // inside `process(_:presentationTimeStamp:outputPool:)`.
       guard let device = MTLCreateSystemDefaultDevice(),
         let commandQueue = device.makeCommandQueue(),
-        let spatialScaler = spatialScalerDescriptor.makeSpatialScaler(device: device)
+        spatialScalerDescriptor.makeSpatialScaler(device: device) != nil
       else { return nil }
       self.device = device
       self.commandQueue = commandQueue
-      self.spatialScaler = spatialScaler
+      self.spatialScalerDescriptor = spatialScalerDescriptor
 
       var textureCache: CVMetalTextureCache?
       CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache)
@@ -80,6 +83,15 @@ public actor Upscaler: FrameProcessorBackend {
         pixelBufferPool: outputPool,
         outputPixelBuffer: nil
       )
+
+      // Bound the CVMetalTextureCache across long exports. The pool recycles IOSurfaces so
+      // stale cache entries accumulate; flushing periodically releases them without perturbing
+      // in-flight command buffers (the CVMetalTexture retains the referenced MTLTexture).
+      frameCounter &+= 1
+      if frameCounter % Self.textureCacheFlushInterval == 0 {
+        CVMetalTextureCacheFlush(textureCache, 0)
+      }
+
       try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, Swift.Error>) in
         nonisolated(unsafe) let retainedColor = cvColor
@@ -112,11 +124,41 @@ public actor Upscaler: FrameProcessorBackend {
     /// `CVPixelBufferPoolCreatePixelBuffer` at 4K frame sizes (~24 MiB each).
     private static let minimumPoolBufferCount = 5
 
+    /// Flush the `CVMetalTextureCache` every N frames. The pool recycles IOSurfaces across
+    /// frames and stale cache entries otherwise accumulate over the course of a long export.
+    /// 256 ≈ 8–10s of 30fps footage — large enough that the flush cost is negligible, small
+    /// enough that cache growth stays bounded.
+    private static let textureCacheFlushInterval: UInt64 = 256
+
+    /// Usage flags for the CVMetalTexture cache. Hoisted to `static let` so we don't
+    /// allocate a dictionary + `NSNumber` per frame on the hot path. `CFDictionary` isn't
+    /// `Sendable`, but these are immutable after initialization — `nonisolated(unsafe)`.
+    nonisolated(unsafe) private static let inputTextureAttributes: CFDictionary = [
+      kCVMetalTextureUsage as String: NSNumber(
+        value: MTLTextureUsage([.shaderRead]).rawValue)
+    ] as CFDictionary
+    /// MetalFX requires `.renderTarget`; `.shaderWrite` is required on some paths. With
+    /// both flags set, the cache-vended MTLTexture is usable as the MetalFX output target,
+    /// letting us write the upscaled result directly into the IOSurface-backed pool buffer
+    /// and skip the per-frame intermediate + blit.
+    nonisolated(unsafe) private static let outputTextureAttributes: CFDictionary = [
+      kCVMetalTextureUsage as String: NSNumber(
+        value: MTLTextureUsage([.renderTarget, .shaderWrite, .shaderRead]).rawValue)
+    ] as CFDictionary
+
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
-    private let spatialScaler: MTLFXSpatialScaler
+    /// Descriptor kept so we can build a fresh `MTLFXSpatialScaler` per `process` call.
+    /// Sharing a single scaler across concurrent / reentrant calls was a data race: the actor
+    /// suspends at `withCheckedThrowingContinuation` (committing the command buffer), and a
+    /// second entry into `process` would then mutate the shared scaler's `colorTexture` /
+    /// `outputTexture` before the first frame's `encode(commandBuffer:)` had actually been
+    /// captured by the command buffer. macOS 26 caches MetalFX shaders, so per-call scaler
+    /// construction is cheap after the first use.
+    private let spatialScalerDescriptor: MTLFXSpatialScalerDescriptor
     private let textureCache: CVMetalTextureCache
     private let pixelBufferPool: CVPixelBufferPool
+    private var frameCounter: UInt64 = 0
 
     private func upscaleCommandBuffer(
       _ pixelBuffer: sending CVPixelBuffer,
@@ -132,13 +174,12 @@ public actor Upscaler: FrameProcessorBackend {
         providedOutput: outputPixelBuffer
       )
 
-      // Input texture
       var cvColorTextureOpt: CVMetalTexture?
       let colorStatus = CVMetalTextureCacheCreateTextureFromImage(
         nil,
         textureCache,
         pixelBuffer,
-        [:] as CFDictionary,
+        Self.inputTextureAttributes,
         .bgra8Unorm,
         pixelBuffer.width,
         pixelBuffer.height,
@@ -152,13 +193,12 @@ public actor Upscaler: FrameProcessorBackend {
         throw Error.couldNotCreateMetalTexture
       }
 
-      // Output texture
       var cvUpscaledTextureOpt: CVMetalTexture?
       let upscaledStatus = CVMetalTextureCacheCreateTextureFromImage(
         nil,
         textureCache,
         output,
-        [:] as CFDictionary,
+        Self.outputTextureAttributes,
         .bgra8Unorm,
         output.width,
         output.height,
@@ -172,15 +212,8 @@ public actor Upscaler: FrameProcessorBackend {
         throw Error.couldNotCreateMetalTexture
       }
 
-      // Per-call intermediate texture — ensures concurrent in-flight command buffers don't
-      // share the same GPU memory.
-      let textureDescriptor = MTLTextureDescriptor()
-      textureDescriptor.width = Int(outputSize.width)
-      textureDescriptor.height = Int(outputSize.height)
-      textureDescriptor.pixelFormat = .bgra8Unorm
-      textureDescriptor.storageMode = .private
-      textureDescriptor.usage = [.renderTarget, .shaderRead]
-      guard let intermediateOutputTexture = device.makeTexture(descriptor: textureDescriptor) else {
+      // Fresh scaler per call — see comment on `spatialScalerDescriptor`.
+      guard let spatialScaler = spatialScalerDescriptor.makeSpatialScaler(device: device) else {
         throw Error.couldNotCreateMetalTexture
       }
 
@@ -189,14 +222,8 @@ public actor Upscaler: FrameProcessorBackend {
       }
 
       spatialScaler.colorTexture = colorTexture
-      spatialScaler.outputTexture = intermediateOutputTexture
+      spatialScaler.outputTexture = upscaledTexture
       spatialScaler.encode(commandBuffer: commandBuffer)
-
-      guard let blitCommandEncoder = commandBuffer.makeBlitCommandEncoder() else {
-        throw Error.couldNotMakeBlitCommandEncoder
-      }
-      blitCommandEncoder.copy(from: intermediateOutputTexture, to: upscaledTexture)
-      blitCommandEncoder.endEncoding()
 
       return (commandBuffer, output, cvColorTexture, cvUpscaledTexture)
     }

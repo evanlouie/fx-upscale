@@ -27,23 +27,11 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     self.frameSize = frameSize
     self.strength = try Self.validateStrength(strength)
 
-    let configuration = try Self.makeConfiguration(frameSize: frameSize)
-
-    let processor = VTFrameProcessor()
-    try processor.startSession(configuration: configuration)
-    self.processor = processor
-
-    guard
-      let pixelBufferPool = makeBGRAPixelBufferPool(
-        size: frameSize, minimumBufferCount: Self.minimumPoolBufferCount)
-    else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: .motionBlur) }
-    self.pixelBufferPool = pixelBufferPool
-  }
-
-  // Swift 6.3 cycles `ActorIsolationRequest` on `isolated deinit` under release-mode WMO,
-  // so use a plain `deinit` and mark `processor` `nonisolated(unsafe)` to reach it from here.
-  deinit {
-    processor.endSession()
+    self.core = try VTStatefulBackendCore(
+      configuration: try Self.makeConfiguration(frameSize: frameSize),
+      poolSize: frameSize,
+      minimumPoolBufferCount: Self.minimumPoolBufferCount,
+      backend: .motionBlur)
   }
 
   /// Cheap synchronous validation that only checks strength bounds and whether the
@@ -66,15 +54,8 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
-    frameIndex += 1
-
-    guard
-      let sourceFrame = VTFrameProcessorFrame(
-        buffer: pixelBuffer, presentationTimeStamp: vtPts)
-    else {
-      throw VTBackendError.vtFrameConstructionFailed(backend: .motionBlur)
-    }
+    let vtPts = core.nextPts(frameIndex: &frameIndex)
+    let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
 
     // VT returns -19730 if both previous and next reference frames are missing. This backend
     // doesn't look ahead, so the first frame has neither — pass it through unchanged and
@@ -92,13 +73,12 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
       expectedInputSize: frameSize,
       expectedOutputSize: frameSize,
       externalPool: externalPool,
-      internalPool: pixelBufferPool,
+      internalPool: core.pixelBufferPool,
       providedOutput: nil
     )
 
+    let destinationFrame = try core.makeFrame(output, pts: vtPts)
     guard
-      let destinationFrame = VTFrameProcessorFrame(
-        buffer: output, presentationTimeStamp: vtPts),
       let parameters = VTMotionBlurParameters(
         sourceFrame: sourceFrame,
         nextFrame: nil,
@@ -113,11 +93,20 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
       throw VTBackendError.vtFrameConstructionFailed(backend: .motionBlur)
     }
 
-    try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
+    try await core.run(parameters: SendableBox(parameters))
 
     self.previousSourceFrame = sourceFrame
 
     return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
+  }
+
+  public func finish(
+    outputPool _: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    // Release the retained previous source wrapper so its buffer isn't kept alive past the
+    // end of the stream. This backend doesn't look ahead, so nothing is flushed.
+    previousSourceFrame = nil
+    return []
   }
 
   // MARK: Private
@@ -132,8 +121,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
 
   private let frameSize: CGSize
   private let strength: Int
-  private nonisolated(unsafe) let processor: VTFrameProcessor
-  private let pixelBufferPool: CVPixelBufferPool
+  private let core: VTStatefulBackendCore
 
   private var frameIndex: UInt64 = 0
   private var previousSourceFrame: VTFrameProcessorFrame?
@@ -158,8 +146,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
       throw VTBackendError.notSupportedOnDevice(backend: .motionBlur)
     }
 
-    let frameWidth = Int(frameSize.width.rounded())
-    let frameHeight = Int(frameSize.height.rounded())
+    let (frameWidth, frameHeight) = frameSize.intDimensions
 
     guard
       let configuration = VTMotionBlurConfiguration(

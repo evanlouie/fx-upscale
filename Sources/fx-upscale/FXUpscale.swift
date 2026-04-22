@@ -53,7 +53,7 @@ import Upscaling
 
   @Option(
     name: .shortAndLong,
-    help: "Output codec (h264 | hevc)"
+    help: "Output codec (\(Codec.helpList))"
   )
   var codec: Codec = .h264
 
@@ -81,7 +81,7 @@ import Upscaling
   @Option(
     name: [.customShort("s"), .long],
     help: ArgumentHelp(
-      "Upscaling algorithm (spatial | super-resolution)",
+      "Upscaling algorithm (\(UpscalerKind.helpList))",
       discussion:
         "'spatial' uses MTLFXSpatialScaler (fast, arbitrary ratios). "
         + "'super-resolution' uses VTFrameProcessor's ML-based super resolution — "
@@ -128,6 +128,12 @@ import Upscaling
   )
   var fps: Double?
 
+  // MARK: Derived paths
+
+  /// Single source of truth for the output path — a pure transform of `url`. Shared by
+  /// `validate()` (pre-existing-file check) and `run()` (write destination).
+  private var outputURL: URL { url.renamed { "\($0) Upscaled" } }
+
   // MARK: Validation
 
   func validate() throws {
@@ -167,10 +173,28 @@ import Upscaling
     }
     // `--fps` finiteness / range is validated by `VTFrameRateConverter.preflight` in
     // `run()`, alongside the source-vs-target check once the source track is loaded.
+
+    // Fail fast on a pre-existing output file — the output path is a pure transform of
+    // the input URL and CLI flags, so we can compute it here without loading the asset.
+    // This avoids running the (potentially slow) preflight and model download before
+    // discovering the output would be rejected anyway.
+    if FileManager.default.fileExists(atPath: outputURL.path(percentEncoded: false)), !force {
+      throw ValidationError(
+        "Output file already exists at \(outputURL.path(percentEncoded: false)). "
+          + "Pass --force to overwrite.")
+    }
   }
 
   // MARK: Run
 
+  /// Exit codes:
+  /// - `0` on success.
+  /// - `1` (`ExitCode.failure`) on runtime export errors — see the `catch` around
+  ///   `exportSession.export()`.
+  /// - `2` (`ExitCode.validationFailure`) on `ValidationError`s from `validate()` or the
+  ///   `--fps` source-rate check. ArgumentParser applies this exit code automatically.
+  /// - `3` on preflight failures (device/config incompatibility surfaced before any I/O),
+  ///   routed through the `preflight(_:)` helper below.
   func run() async throws {
     let asset = AVURLAsset(url: url)
     guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -192,13 +216,19 @@ import Upscaling
     }
 
     let wantsScaling = scale != nil || width != nil || height != nil
-    let outputSize: CGSize =
-      wantsScaling
-      ? calculateOutputDimensions(
-        inputSize: inputSize,
-        requestedWidth: scale.map { Int(inputSize.width) * $0 } ?? width,
-        requestedHeight: scale.map { Int(inputSize.height) * $0 } ?? height)
-      : inputSize
+    let outputSize: CGSize
+    if wantsScaling {
+      do {
+        outputSize = try DimensionCalculation.calculateOutputDimensions(
+          inputSize: inputSize,
+          requestedWidth: scale.map { Int(inputSize.width) * $0 } ?? width,
+          requestedHeight: scale.map { Int(inputSize.height) * $0 } ?? height)
+      } catch {
+        throw ValidationError(error.localizedDescription)
+      }
+    } else {
+      outputSize = inputSize
+    }
 
     guard outputSize.width > 0, outputSize.height > 0 else {
       throw ValidationError("Computed output dimensions are invalid.")
@@ -244,16 +274,14 @@ import Upscaling
 
     let outputCodec: AVVideoCodecType = codec.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
-    let outputURL = url.renamed { "\($0) Upscaled" }
 
-    if FileManager.default.fileExists(atPath: outputURL.path(percentEncoded: false)) {
-      if force {
-        try FileManager.default.removeItem(at: outputURL)
-      } else {
-        throw ValidationError(
-          "Output file already exists at \(outputURL.path(percentEncoded: false)). "
-            + "Pass --force to overwrite.")
-      }
+    // `validate()` already rejected a pre-existing output unless --force was given.
+    // In the --force case, remove the stale file now that we're committed to running.
+    // `try?` both swallows a benign "file not found" (avoiding the TOCTOU existence check)
+    // and any other removal failure — the asset writer will surface a clear error shortly
+    // if the path is actually unusable.
+    if force {
+      try? FileManager.default.removeItem(at: outputURL)
     }
 
     let metricsCollector = PipelineMetricsCollector()
@@ -316,11 +344,15 @@ import Upscaling
 
     do {
       try await exportSession.export()
-      // Disarm the cleanup closure BEFORE we acknowledge success. A `defer`
-      // here would run after `Terminal.success`, leaving a window in which
-      // a SIGINT would delete the very file we just announced we wrote.
+      // Disarm the cleanup closure BEFORE we acknowledge success (or let the deferred
+      // `ProgressBar.stop()` run). A `defer` here would fire after `Terminal.success`,
+      // leaving a window in which a SIGINT would delete the very file we just announced
+      // we wrote.
       SignalHandlers.clearCleanup()
     } catch {
+      // Tear down the progress block immediately so the red error line on stderr doesn't
+      // interleave with the still-visible bar on a TTY. The deferred `ProgressBar.stop()`
+      // above still runs, but `stop()` is idempotent.
       ProgressBar.stop()
       try? FileManager.default.removeItem(at: outputURL)
       Terminal.error(error.localizedDescription)
@@ -330,21 +362,37 @@ import Upscaling
     Terminal.metricsSummary(metricsCollector.snapshot())
   }
 
-  /// Runs a preflight check and rewraps any thrown error as a `ValidationError` so
-  /// ArgumentParser surfaces it the same way it surfaces its own argument-level errors.
+  /// Runs a preflight check and, on failure, prints the error and exits with code 3 so
+  /// preflight failures are distinguishable from both validation errors (exit 2) and
+  /// mid-export runtime failures (exit 1). Preflight errors are not usage errors, so we
+  /// don't wrap them as `ValidationError` (which would trigger ArgumentParser to print
+  /// command usage alongside the message).
   private func preflight(_ check: () throws -> Void) throws {
-    do { try check() } catch { throw ValidationError(error.localizedDescription) }
+    do { try check() } catch {
+      Terminal.error(error.localizedDescription)
+      throw ExitCode(rawValue: 3)
+    }
   }
+}
+
+// MARK: - CLI argument helpers
+
+/// Pipe-separated rendering of a string-backed enum's cases, used for dynamic
+/// `ArgumentHelp` strings (e.g. "h264 | hevc").
+protocol ArgumentHelpListing: CaseIterable, RawRepresentable where RawValue == String {}
+
+extension ArgumentHelpListing {
+  static var helpList: String { allCases.map(\.rawValue).joined(separator: " | ") }
 }
 
 // MARK: - UpscalerKind + ExpressibleByArgument
 
-extension UpscalerKind: ExpressibleByArgument {}
+extension UpscalerKind: ExpressibleByArgument, ArgumentHelpListing {}
 
 // MARK: - Codec
 
 extension FXUpscale {
-  enum Codec: String, ExpressibleByArgument, CaseIterable {
+  enum Codec: String, ExpressibleByArgument, CaseIterable, ArgumentHelpListing {
     case h264
     case hevc
 

@@ -203,7 +203,12 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     }
 
     // N stages ⟹ N+1 channels (feeder→stage[0], stage[k]→stage[k+1], stage[N-1]→consumer).
-    // Capacity 1 is enough to decouple adjacent stages without holding extra 24 MiB 4K frames.
+    // Capacity 2 lets adjacent stages overlap: one frame buffered in the channel plus one
+    // in-flight in the downstream stage, so a stage need not wait for the next to drain
+    // before producing its next output. This roughly doubles steady-state throughput for
+    // multi-stage chains while still bounding extra memory (≤ one additional 4K frame per
+    // channel, ~24 MiB — comparable to the existing `sampleBufferBufferDepth = 4` reader
+    // buffer) and keeping ordering strict within each stage.
     let channels = (0...stages.count).map { _ in
       PipelineChannel<[FrameProcessorOutput]>(capacity: Self.interStageChannelCapacity)
     }
@@ -267,6 +272,13 @@ public actor FrameProcessorChain: FrameProcessorBackend {
           try Task.checkCancellation()
           let flushStart = ContinuousClock.now
           let flushed = try await stage.finish(outputPool: poolForStage)
+          // NOTE: flush emission must be symmetric across identical chains run on
+          // identical input cadences. `UpscalingExportSession`'s stereo path pairs
+          // left/right batches positionally (including this terminal flush batch) and
+          // relies on both eyes producing the same number of batches in the same order.
+          // If a future stage's flush becomes content-dependent (e.g. motion-adaptive
+          // lookahead that emits on one eye but not the other), the stereo assembly
+          // will desync — revisit that pairing before introducing such a stage.
           if !flushed.isEmpty {
             if let metricsCollector, let idx = metricsIndex {
               metricsCollector.record(
@@ -289,7 +301,7 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     }
   }
 
-  private static let interStageChannelCapacity = 1
+  private static let interStageChannelCapacity = 2
 
   // MARK: Private
 

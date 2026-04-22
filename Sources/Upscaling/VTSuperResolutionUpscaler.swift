@@ -45,21 +45,11 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       try await Self.downloadModel(configuration: configuration)
     }
 
-    let processor = VTFrameProcessor()
-    try processor.startSession(configuration: configuration)
-    self.processor = processor
-
-    guard
-      let pixelBufferPool = makeBGRAPixelBufferPool(
-        size: outputSize, minimumBufferCount: Self.minimumPoolBufferCount)
-    else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: .superResolution) }
-    self.pixelBufferPool = pixelBufferPool
-  }
-
-  // Swift 6.3 cycles `ActorIsolationRequest` on `isolated deinit` under release-mode WMO,
-  // so use a plain `deinit` and mark `processor` `nonisolated(unsafe)` to reach it from here.
-  deinit {
-    processor.endSession()
+    self.core = try VTStatefulBackendCore(
+      configuration: configuration,
+      poolSize: outputSize,
+      minimumPoolBufferCount: Self.minimumPoolBufferCount,
+      backend: .superResolution)
   }
 
   /// Cheap synchronous validation that only checks dimensions / scale factor / device support.
@@ -87,18 +77,15 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       expectedInputSize: inputSize,
       expectedOutputSize: outputSize,
       externalPool: externalPool,
-      internalPool: pixelBufferPool,
+      internalPool: core.pixelBufferPool,
       providedOutput: nil
     )
 
-    let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
-    frameIndex += 1
+    let vtPts = core.nextPts(frameIndex: &frameIndex)
+    let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
+    let destinationFrame = try core.makeFrame(output, pts: vtPts)
 
     guard
-      let sourceFrame = VTFrameProcessorFrame(
-        buffer: pixelBuffer, presentationTimeStamp: vtPts),
-      let destinationFrame = VTFrameProcessorFrame(
-        buffer: output, presentationTimeStamp: vtPts),
       let parameters = VTSuperResolutionScalerParameters(
         sourceFrame: sourceFrame,
         previousFrame: previousSourceFrame,
@@ -111,7 +98,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       throw VTBackendError.vtFrameConstructionFailed(backend: .superResolution)
     }
 
-    try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
+    try await core.run(parameters: SendableBox(parameters))
 
     // Stash this call's source/destination wrappers as the "previous" pair for the next
     // submission. `VTFrameProcessorFrame` retains the underlying `CVPixelBuffer`, so caching
@@ -125,6 +112,16 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
   }
 
+  public func finish(
+    outputPool _: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    // Release retained temporal references so output buffers aren't kept alive past the
+    // end of the stream. This backend doesn't look ahead, so nothing is flushed.
+    previousSourceFrame = nil
+    previousOutputFrame = nil
+    return []
+  }
+
   // MARK: Private
 
   /// `kCVPixelBufferPoolMinimumBufferCountKey` value. We hold the previous output across calls,
@@ -134,8 +131,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
   /// Tolerance for "isotropic" check between width/height ratios.
   private static let ratioEpsilon: Double = 1e-3
 
-  private nonisolated(unsafe) let processor: VTFrameProcessor
-  private let pixelBufferPool: CVPixelBufferPool
+  private let core: VTStatefulBackendCore
 
   private var frameIndex: UInt64 = 0
   private var previousSourceFrame: VTFrameProcessorFrame?
@@ -182,8 +178,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       throw Error.unsupportedScaleFactor(requested: scaleFactor, supported: supported)
     }
 
-    let inputWidth = Int(inputSize.width.rounded())
-    let inputHeight = Int(inputSize.height.rounded())
+    let (inputWidth, inputHeight) = inputSize.intDimensions
 
     guard
       let configuration = VTSuperResolutionScalerConfiguration(

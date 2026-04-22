@@ -26,12 +26,20 @@ private enum ANSI {
     guard Terminal.isTTY else { return string }
     return codes.joined() + string + reset
   }
+
+  /// `style` that gates on stderr's TTY-ness — piping stderr strips escapes even when
+  /// stdout is still a TTY (and vice versa).
+  static func styleForStderr(_ string: String, _ codes: String...) -> String {
+    guard Terminal.isStderrTTY else { return string }
+    return codes.joined() + string + reset
+  }
 }
 
 // MARK: - Terminal
 
 enum Terminal {
   static let isTTY: Bool = isatty(fileno(Darwin.stdout)) != 0
+  static let isStderrTTY: Bool = isatty(fileno(Darwin.stderr)) != 0
 
   static func info(_ message: String) {
     print(ANSI.style("i ", ANSI.brightCyan, ANSI.bold) + message)
@@ -42,9 +50,11 @@ enum Terminal {
   }
 
   /// Writes a red error line to `stderr` so pipes/CI capture failures correctly and callers
-  /// can check the process exit code without parsing stdout.
+  /// can check the process exit code without parsing stdout. stderr is unbuffered by default
+  /// on POSIX, but we `fflush` explicitly as cheap defense-in-depth in case a caller (or
+  /// future test harness) has reopened stderr with buffering.
   static func error(_ message: String) {
-    let styled = ANSI.style("✗ ", ANSI.brightRed, ANSI.bold) + message + "\n"
+    let styled = ANSI.styleForStderr("✗ ", ANSI.brightRed, ANSI.bold) + message + "\n"
     fputs(styled, Darwin.stderr)
     fflush(Darwin.stderr)
   }
@@ -59,19 +69,43 @@ enum Terminal {
   }
 
   /// Number of lines currently occupied by the progress display. Written by
-  /// `ProgressBar.render()`, read by `restoreCursorUnsafe()` for signal-handler cleanup.
-  fileprivate nonisolated(unsafe) static var progressLineCount = 0
+  /// `ProgressBar.render()` and `ProgressBar.stop()` (main-actor / render Task), read by
+  /// `restoreCursorUnsafe()` from a `DispatchSource` signal queue — wrap the shared state in
+  /// an unfair lock to avoid racy reads/writes across threads.
+  private static let progressLineCountLock = OSAllocatedUnfairLock<Int>(initialState: 0)
+  fileprivate static var progressLineCount: Int {
+    get { progressLineCountLock.withLock { $0 } }
+    set { progressLineCountLock.withLock { $0 = newValue } }
+  }
 
-  /// Moves the cursor to the top of the progress block and clears all its lines.
-  /// Safe to call from `DispatchSource` signal handlers — uses only `fputs` and `fflush`.
-  static func restoreCursorUnsafe() {
-    let n = progressLineCount
-    if n > 1 {
-      fputs(ANSI.cursorUp(n - 1), Darwin.stdout)
+  /// Emits the cursor-up + clear-to-end-of-screen + show-cursor sequence that tears down an
+  /// existing progress block. Uses `fputs`/`fflush` (plus an unfair lock acquisition via
+  /// `progressLineCount` when the caller reads it) — safe to call from `DispatchSource`
+  /// signal handlers, which run on a dispatch queue rather than in async-signal context.
+  /// Does not mutate `progressLineCount` — callers reset it if appropriate.
+  ///
+  /// `trailingNewline: true` is wanted on the signal-handler path so the shell prompt lands on
+  /// its own line after the process dies. On the normal-shutdown path it is `false`: callers
+  /// (e.g. `Terminal.success`) follow immediately with their own output, and an extra `\n`
+  /// would leave a blank line.
+  fileprivate static func tearDownProgressBlock(lineCount: Int, trailingNewline: Bool) {
+    if lineCount > 1 {
+      fputs(ANSI.cursorUp(lineCount - 1), Darwin.stdout)
     }
     // `\r` moves to column 0; `\e[J` clears from cursor to end of display (all stale lines).
-    fputs("\r" + ANSI.clearToEndOfScreen + ANSI.showCursor + "\n", Darwin.stdout)
+    let tail = trailingNewline ? "\n" : ""
+    fputs("\r" + ANSI.clearToEndOfScreen + ANSI.showCursor + tail, Darwin.stdout)
     fflush(Darwin.stdout)
+  }
+
+  /// Moves the cursor to the top of the progress block and clears all its lines. Emits a
+  /// trailing newline so whatever prints next (often the shell prompt after an abort) starts
+  /// on a fresh line. Safe to call from `DispatchSource` signal handlers. No-op when stdout
+  /// is not a TTY (otherwise raw ANSI escapes would leak into pipes).
+  static func restoreCursorUnsafe() {
+    guard isTTY else { return }
+    tearDownProgressBlock(lineCount: progressLineCount, trailingNewline: true)
+    progressLineCount = 0
   }
 
   // MARK: Metrics Summary
@@ -210,17 +244,18 @@ enum ProgressBar {
   }
 
   static func stop() {
+    // Idempotent: a nil task combined with a zero line count means there's nothing to tear
+    // down (either never started, or already stopped). Without this guard, a second call
+    // would still emit `\r\e[J\e[?25h\n` and leave a stray blank line.
+    if task == nil && Terminal.progressLineCount == 0 { return }
     task?.cancel()
     task = nil
     guard Terminal.isTTY else { return }
-    // Move to the top of the progress block, then clear everything below.
-    let n = Terminal.progressLineCount
-    if n > 1 {
-      print(ANSI.cursorUp(n - 1), terminator: "")
-    }
-    print("\r" + ANSI.clearToEndOfScreen + ANSI.showCursor, terminator: "")
+    // Move to the top of the progress block, then clear everything below. No trailing newline:
+    // the next output (`Terminal.success` + metrics summary, or an error line) prints on its
+    // own line already, and an extra `\n` here would leave a visible blank line.
+    Terminal.tearDownProgressBlock(lineCount: Terminal.progressLineCount, trailingNewline: false)
     Terminal.progressLineCount = 0
-    fflush(Darwin.stdout)
   }
 
   // MARK: Private
@@ -228,6 +263,7 @@ enum ProgressBar {
   private static let frameInterval: Duration = .milliseconds(80)
   private static let minBarColumns = 10
   private static let defaultColumns = 80
+  // `" " + "%6.2f%%"` → 1 leading space + 7 chars ("  0.00%" … "100.00%") = 8 visible columns.
   private static let percentFieldWidth = 8
   private static let bracketsWidth = 2
 
@@ -260,31 +296,43 @@ enum ProgressBar {
     }
 
     let terminalWidth = Terminal.columns ?? defaultColumns
-    let barCols = max(
-      minBarColumns,
-      terminalWidth - bracketsWidth - percentFieldWidth - overallFpsVisibleWidth
-    )
     let fraction = max(0, min(1, progress.fractionCompleted))
-    let scaled = fraction * Double(barCols)
-    let completed = Int(scaled)
-    let partial = scaled - Double(completed)
+    // Locale-fixed formatting: `.formatted(.percent...)` emits `"50,00 %"` in de_DE / fr_FR,
+    // breaking the fixed-width assumption below. `%6.2f%%` always produces a 7-char field
+    // ("  0.00%", " 50.00%", "100.00%") regardless of locale.
+    let percent = String(format: "%6.2f%%", fraction * 100)
 
-    var bar = openBracket
-    bar += String(repeating: "█", count: completed)
-    if barCols - completed - 1 > 0 {
-      let frameIndex = min(
-        partialFrames.count - 1,
-        Int(partial * Double(partialFrames.count))
-      )
-      bar += partialFrames[frameIndex]
-      bar += String(repeating: " ", count: barCols - completed - 1)
+    let requiredMinimum =
+      bracketsWidth + percentFieldWidth + overallFpsVisibleWidth + minBarColumns
+
+    var lines: [String]
+    if terminalWidth < requiredMinimum {
+      // Terminal too narrow to fit a meaningful bar — degrade to just the percent so we
+      // never emit a line wider than the window (which would corrupt the redraw math).
+      lines = [ANSI.style(percent, ANSI.gray) + overallFpsText]
+    } else {
+      let barCols =
+        terminalWidth - bracketsWidth - percentFieldWidth - overallFpsVisibleWidth
+      let scaled = fraction * Double(barCols)
+      let completed = Int(scaled)
+      let partial = scaled - Double(completed)
+
+      var bar = openBracket
+      bar += String(repeating: "█", count: completed)
+      if barCols - completed - 1 > 0 {
+        let frameIndex = min(
+          partialFrames.count - 1,
+          Int(partial * Double(partialFrames.count))
+        )
+        bar += partialFrames[frameIndex]
+        bar += String(repeating: " ", count: barCols - completed - 1)
+      }
+      bar += closeBracket
+      bar += ANSI.style(" " + percent, ANSI.gray)
+      bar += overallFpsText
+
+      lines = [bar]
     }
-    bar += closeBracket
-    let percent = fraction.formatted(.percent.precision(.fractionLength(2)))
-    bar += ANSI.style(" " + percent, ANSI.gray)
-    bar += overallFpsText
-
-    var lines = [bar]
 
     // ── Lines 2+: per-stage fps ────────────────────────────────────────
 

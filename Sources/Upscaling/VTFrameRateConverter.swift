@@ -324,8 +324,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
       throw VTBackendError.notSupportedOnDevice(backend: .frameRateConversion)
     }
 
-    let frameWidth = Int(frameSize.width.rounded())
-    let frameHeight = Int(frameSize.height.rounded())
+    let (frameWidth, frameHeight) = frameSize.intDimensions
 
     guard
       let configuration = VTFrameRateConversionConfiguration(

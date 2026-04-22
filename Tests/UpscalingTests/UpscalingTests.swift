@@ -87,7 +87,9 @@ struct TestVideoGenerator {
         &pixelBuffer
       )
 
-      guard let buffer = pixelBuffer else { continue }
+      guard let buffer = pixelBuffer else {
+        throw Error.pixelBufferCreationFailed
+      }
 
       CVPixelBufferLockBaseAddress(buffer, [])
       if let baseAddress = CVPixelBufferGetBaseAddress(buffer) {
@@ -134,6 +136,12 @@ struct TestVideoGenerator {
     try? FileManager.default.removeItem(at: url)
   }
 
+  enum Error: Swift.Error {
+    case pixelBufferCreationFailed
+    case audioFormatDescriptionCreationFailed
+    case blockBufferCreationFailed
+  }
+
   /// Writes a block of silent PCM audio into the given asset writer input.
   private static func writeSilentAudio(
     into input: AVAssetWriterInput,
@@ -164,7 +172,7 @@ struct TestVideoGenerator {
       extensions: nil,
       formatDescriptionOut: &formatDescription
     )
-    guard let formatDescription else { return }
+    guard let formatDescription else { throw Error.audioFormatDescriptionCreationFailed }
 
     var framesWritten = 0
     while framesWritten < totalFrames {
@@ -183,7 +191,7 @@ struct TestVideoGenerator {
         dataLength: byteCount,
         flags: 0,
         blockBufferOut: &blockBuffer)
-      guard let blockBuffer else { return }
+      guard let blockBuffer else { throw Error.blockBufferCreationFailed }
       _ = silence.withUnsafeBytes { bytes in
         CMBlockBufferReplaceDataBytes(
           with: bytes.baseAddress!,
@@ -254,6 +262,18 @@ struct URLExtensionTests {
 
     #expect(renamed.lastPathComponent == "output.mov")
   }
+
+  @Test("URL renamed leaves extensionless paths bare")
+  func renamedNoExtension() {
+    // Documented contract in URL+Extensions.swift: when the URL has no extension,
+    // no trailing `.` is appended after the transform.
+    let url = URL(fileURLWithPath: "/tmp/input")
+    let renamed = url.renamed { "\($0)_upscaled" }
+
+    #expect(renamed.lastPathComponent == "input_upscaled")
+    #expect(renamed.pathExtension == "")
+    #expect(!renamed.lastPathComponent.hasSuffix("."))
+  }
 }
 
 // MARK: - Filter Tests
@@ -282,7 +302,7 @@ struct UpscalingFilterTests {
   }
 
   @Test("Filter is thread-safe under concurrent access")
-  func filterThreadSafety() throws {
+  func filterThreadSafety() async throws {
     let inputImage = try loadLadybird()
     let outputSize = CGSize(
       width: inputImage.extent.width * 2,
@@ -293,10 +313,21 @@ struct UpscalingFilterTests {
     filter.inputImage = inputImage
     filter.outputSize = outputSize
 
-    for _ in 0..<10 {
-      let result = filter.outputImage
-      #expect(result != nil)
-      #expect(result?.extent.size == outputSize)
+    // Concurrently read `outputImage` from N tasks against a single shared filter to exercise
+    // the internal lock + per-call scaler allocation. Return only the Sendable extent size from
+    // each task since `CIImage` itself isn't Sendable.
+    await withTaskGroup(of: CGSize?.self) { group in
+      for _ in 0..<10 {
+        group.addTask {
+          filter.outputImage?.extent.size
+        }
+      }
+      var count = 0
+      for await size in group {
+        #expect(size == outputSize)
+        count += 1
+      }
+      #expect(count == 10)
     }
   }
 
@@ -846,7 +877,15 @@ struct FrameRateConverterTests {
     // For 10 source frames: 3 × 9 + 1 = 28.
     #expect(totalOutputs == 28)
   }
+}
 
+// MARK: - Target PTS Arithmetic Tests
+
+/// Pure arithmetic over `computeTargetPTS` — no VT device dependency, so no availability gate.
+/// Extracted from `FrameRateConverterTests` so these regression guards keep running on hardware
+/// where `VTFrameRateConversionConfiguration` isn't supported.
+@Suite("Target PTS Arithmetic")
+struct TargetPTSArithmeticTests {
   @Test("targetPTS stays monotonic past old Int32 ceiling")
   func targetPTSMonotonicPastInt32Ceiling() {
     // 59.94 fps, 1 GHz fallback timescale — matches VTFrameRateConverter's non-integer path.
@@ -898,6 +937,53 @@ struct ExportSessionTests {
     #endif
   }
 
+  /// Shared fixture: synthesizes a test video, computes a unique output URL under the temp
+  /// directory, registers cleanup for both, and constructs an `UpscalingExportSession`
+  /// configured by the arguments. The body receives the session, the output URL, and the
+  /// source `AVURLAsset` so tests can introspect the input too.
+  ///
+  /// Tests that just want the default setup can rely on the defaults; tests that need an
+  /// audio track, a source transform, a larger source, or a non-default export parameter
+  /// pass the relevant arguments explicitly.
+  private func withExportFixture(
+    duration: TimeInterval = 0.5,
+    frameRate: Int = 10,
+    size: CGSize = CGSize(width: 320, height: 240),
+    includeAudio: Bool = false,
+    transform: CGAffineTransform? = nil,
+    outputSize: CGSize = CGSize(width: 640, height: 480),
+    outputCodec: AVVideoCodecType? = .h264,
+    quality: Double? = nil,
+    keyFrameInterval: TimeInterval? = nil,
+    creator: String? = nil,
+    body: (_ session: UpscalingExportSession, _ outputURL: URL, _ asset: AVURLAsset) async throws -> Void
+  ) async throws {
+    let inputURL = try await TestVideoGenerator.createTestVideo(
+      duration: duration,
+      frameRate: frameRate,
+      size: size,
+      includeAudio: includeAudio,
+      transform: transform
+    )
+    defer { TestVideoGenerator.cleanup(inputURL) }
+
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("fixture_\(UUID().uuidString).mov")
+    defer { TestVideoGenerator.cleanup(outputURL) }
+
+    let asset = AVURLAsset(url: inputURL)
+    let session = UpscalingExportSession(
+      asset: asset,
+      outputCodec: outputCodec,
+      preferredOutputURL: outputURL,
+      outputSize: outputSize,
+      quality: quality,
+      keyFrameInterval: keyFrameInterval,
+      creator: creator
+    )
+    try await body(session, outputURL, asset)
+  }
+
   @Test(
     "Export session preserves input extension",
     arguments: ["mov", "m4v", "mp4"]
@@ -934,39 +1020,19 @@ struct ExportSessionTests {
   @Test("Basic upscale produces correct output dimensions")
   func basicUpscale() async throws {
     try requireMetal()
-
-    let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
+    try await withExportFixture(outputSize: outputSize) { session, outputURL, _ in
+      try await session.export()
 
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 0.5,
-      frameRate: 10,
-      size: inputSize
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
+      #expect(FileManager.default.fileExists(atPath: outputURL.path))
 
-    let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("upscaled_\(UUID().uuidString).mov")
-    defer { TestVideoGenerator.cleanup(outputURL) }
+      let outputAsset = AVURLAsset(url: outputURL)
+      let videoTrack = try await outputAsset.loadTracks(withMediaType: .video).first
+      let trackSize = try await videoTrack?.load(.naturalSize)
 
-    let asset = AVURLAsset(url: inputURL)
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .h264,
-      preferredOutputURL: outputURL,
-      outputSize: outputSize
-    )
-
-    try await session.export()
-
-    #expect(FileManager.default.fileExists(atPath: outputURL.path))
-
-    let outputAsset = AVURLAsset(url: outputURL)
-    let videoTrack = try await outputAsset.loadTracks(withMediaType: .video).first
-    let trackSize = try await videoTrack?.load(.naturalSize)
-
-    #expect(trackSize?.width == outputSize.width)
-    #expect(trackSize?.height == outputSize.height)
+      #expect(trackSize?.width == outputSize.width)
+      #expect(trackSize?.height == outputSize.height)
+    }
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/8
@@ -974,45 +1040,24 @@ struct ExportSessionTests {
   func upscaleTransformedVideo() async throws {
     try requireMetal()
 
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
     let rotationTransform = CGAffineTransform(rotationAngle: .pi / 2)
+    try await withExportFixture(transform: rotationTransform) { session, outputURL, _ in
+      try await session.export()
 
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 0.5,
-      frameRate: 10,
-      size: inputSize,
-      transform: rotationTransform
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
+      #expect(FileManager.default.fileExists(atPath: outputURL.path))
 
-    let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("transformed_\(UUID().uuidString).mov")
-    defer { TestVideoGenerator.cleanup(outputURL) }
-
-    let asset = AVURLAsset(url: inputURL)
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .h264,
-      preferredOutputURL: outputURL,
-      outputSize: outputSize
-    )
-
-    try await session.export()
-
-    #expect(FileManager.default.fileExists(atPath: outputURL.path))
-
-    let outputAsset = AVURLAsset(url: outputURL)
-    let videoTrack = try await outputAsset.loadTracks(withMediaType: .video).first
-    let outTrack = try #require(videoTrack)
-    let outTransform = try await outTrack.load(.preferredTransform)
-    let epsilon: CGFloat = 1e-6
-    #expect(abs(outTransform.a - rotationTransform.a) < epsilon)
-    #expect(abs(outTransform.b - rotationTransform.b) < epsilon)
-    #expect(abs(outTransform.c - rotationTransform.c) < epsilon)
-    #expect(abs(outTransform.d - rotationTransform.d) < epsilon)
-    #expect(abs(outTransform.tx - rotationTransform.tx) < epsilon)
-    #expect(abs(outTransform.ty - rotationTransform.ty) < epsilon)
+      let outputAsset = AVURLAsset(url: outputURL)
+      let videoTrack = try await outputAsset.loadTracks(withMediaType: .video).first
+      let outTrack = try #require(videoTrack)
+      let outTransform = try await outTrack.load(.preferredTransform)
+      let epsilon: CGFloat = 1e-6
+      #expect(abs(outTransform.a - rotationTransform.a) < epsilon)
+      #expect(abs(outTransform.b - rotationTransform.b) < epsilon)
+      #expect(abs(outTransform.c - rotationTransform.c) < epsilon)
+      #expect(abs(outTransform.d - rotationTransform.d) < epsilon)
+      #expect(abs(outTransform.tx - rotationTransform.tx) < epsilon)
+      #expect(abs(outTransform.ty - rotationTransform.ty) < epsilon)
+    }
   }
 
   /// https://github.com/finnvoor/fx-upscale/commit/e6666afdb9a5ce1eda38437bec25b0743b740360
@@ -1020,31 +1065,10 @@ struct ExportSessionTests {
   func upscaleMissingColorInfo() async throws {
     try requireMetal()
 
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
-
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 0.5,
-      frameRate: 10,
-      size: inputSize
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
-
-    let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("no_color_\(UUID().uuidString).mov")
-    defer { TestVideoGenerator.cleanup(outputURL) }
-
-    let asset = AVURLAsset(url: inputURL)
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .h264,
-      preferredOutputURL: outputURL,
-      outputSize: outputSize
-    )
-
-    try await session.export()
-
-    #expect(FileManager.default.fileExists(atPath: outputURL.path))
+    try await withExportFixture { session, outputURL, _ in
+      try await session.export()
+      #expect(FileManager.default.fileExists(atPath: outputURL.path))
+    }
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/7
@@ -1052,37 +1076,15 @@ struct ExportSessionTests {
   func audioFormatMaintained() async throws {
     try requireMetal()
 
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
+    try await withExportFixture(includeAudio: true) { session, outputURL, asset in
+      try await session.export()
 
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 0.5,
-      frameRate: 10,
-      size: inputSize,
-      includeAudio: true
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
+      let inputAudioTracks = try await asset.loadTracks(withMediaType: .audio)
+      let outputAsset = AVURLAsset(url: outputURL)
+      let outputAudioTracks = try await outputAsset.loadTracks(withMediaType: .audio)
 
-    let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("with_audio_\(UUID().uuidString).mov")
-    defer { TestVideoGenerator.cleanup(outputURL) }
-
-    let asset = AVURLAsset(url: inputURL)
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .h264,
-      preferredOutputURL: outputURL,
-      outputSize: outputSize
-    )
-
-    try await session.export()
-
-    let inputAudioTracks = try await asset.loadTracks(withMediaType: .audio)
-    let outputAsset = AVURLAsset(url: outputURL)
-    let outputAudioTracks = try await outputAsset.loadTracks(withMediaType: .audio)
-
-    if !inputAudioTracks.isEmpty {
-      #expect(!outputAudioTracks.isEmpty, "Audio track should be preserved")
+      try #require(!inputAudioTracks.isEmpty, "Test fixture must contain an input audio track")
+      try #require(!outputAudioTracks.isEmpty, "Audio track should be preserved on output")
     }
   }
 
@@ -1091,32 +1093,32 @@ struct ExportSessionTests {
   func maintainMetadata() async throws {
     try requireMetal()
 
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
+    try await withExportFixture(creator: "TestCreator") { session, outputURL, _ in
+      try await session.export()
 
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 0.5,
-      frameRate: 10,
-      size: inputSize
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
+      #expect(FileManager.default.fileExists(atPath: outputURL.path))
 
-    let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("metadata_\(UUID().uuidString).mov")
-    defer { TestVideoGenerator.cleanup(outputURL) }
-
-    let asset = AVURLAsset(url: inputURL)
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .h264,
-      preferredOutputURL: outputURL,
-      outputSize: outputSize,
-      creator: "TestCreator"
-    )
-
-    try await session.export()
-
-    #expect(FileManager.default.fileExists(atPath: outputURL.path))
+      #if os(macOS)
+        // Creator is stored as the `kMDItemCreator` Spotlight xattr by
+        // `UpscalingExportSession` (see `creatorXattrName`). Read it back via getxattr and
+        // decode the binary plist.
+        let xattrName = "com.apple.metadata:kMDItemCreator"
+        let size = outputURL.withUnsafeFileSystemRepresentation { path -> Int in
+          getxattr(path, xattrName, nil, 0, 0, 0)
+        }
+        try #require(size > 0, "creator xattr should exist on output")
+        var data = Data(count: size)
+        let readSize = data.withUnsafeMutableBytes { bytes -> Int in
+          outputURL.withUnsafeFileSystemRepresentation { path in
+            getxattr(path, xattrName, bytes.baseAddress, size, 0, 0)
+          }
+        }
+        try #require(readSize == size)
+        let plist = try PropertyListSerialization.propertyList(
+          from: data, options: [], format: nil)
+        #expect(plist as? String == "TestCreator")
+      #endif
+    }
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/4
@@ -1124,107 +1126,284 @@ struct ExportSessionTests {
   func exportProgress() async throws {
     try requireMetal()
 
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
+    try await withExportFixture(duration: 1.0, frameRate: 15) { session, outputURL, _ in
+      #expect(session.progress.fileURL == outputURL)
 
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 1.0,
-      frameRate: 15,
-      size: inputSize
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
+      try await session.export()
 
-    let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("progress_\(UUID().uuidString).mov")
-    defer { TestVideoGenerator.cleanup(outputURL) }
-
-    let asset = AVURLAsset(url: inputURL)
-    let session = UpscalingExportSession(
-      asset: asset,
-      outputCodec: .h264,
-      preferredOutputURL: outputURL,
-      outputSize: outputSize
-    )
-
-    #expect(session.progress.fileURL == outputURL)
-
-    try await session.export()
-
-    #expect(FileManager.default.fileExists(atPath: outputURL.path))
-    #expect(session.progress.totalUnitCount > 0)
+      #expect(FileManager.default.fileExists(atPath: outputURL.path))
+      #expect(session.progress.totalUnitCount > 0)
+    }
   }
 
   @Test("Output file already exists throws error")
   func outputExistsError() async throws {
     try requireMetal()
-    let inputSize = CGSize(width: 320, height: 240)
-    let outputSize = CGSize(width: 640, height: 480)
 
-    let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 0.5,
-      frameRate: 10,
-      size: inputSize
-    )
-    defer { TestVideoGenerator.cleanup(inputURL) }
+    try await withExportFixture { session, outputURL, _ in
+      // Create a zero-byte file at the output URL *before* export, so the pre-flight check
+      // inside `export()` throws `outputURLAlreadyExists`.
+      FileManager.default.createFile(atPath: outputURL.path, contents: Data(), attributes: nil)
+
+      await #expect(throws: UpscalingExportSession.Error.self) {
+        try await session.export()
+      }
+    }
+  }
+
+  @Test("keyFrameInterval parameter is honored without error")
+  func keyFrameIntervalAccepted() async throws {
+    try requireMetal()
+
+    // Introspecting actual IDR intervals from the muxed output is non-trivial (requires
+    // parsing raw NALUs or using AVAssetReader with `trackSample`.attachments to find
+    // `kCMSampleAttachmentKey_NotSync`). The lighter contract this test pins down is the
+    // public surface: a 0.5s keyframeInterval must flow through `export()` without error
+    // and produce a valid, playable output file. Regression guard against accidentally
+    // dropping the `kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration` wiring in
+    // `videoAssetWriterInput(...)`.
+    try await withExportFixture(
+      duration: 1.0, frameRate: 30, keyFrameInterval: 0.5
+    ) { session, outputURL, _ in
+      try await session.export()
+
+      #expect(FileManager.default.fileExists(atPath: outputURL.path))
+
+      // File must be readable as a valid AVAsset with a video track at the expected size.
+      let outputAsset = AVURLAsset(url: outputURL)
+      let videoTrack = try await outputAsset.loadTracks(withMediaType: .video).first
+      let outTrack = try #require(videoTrack)
+      let size = try await outTrack.load(.naturalSize)
+      #expect(size.width == 640)
+      #expect(size.height == 480)
+    }
+  }
+
+  @Test("quality parameter is honored without error")
+  func qualityAccepted() async throws {
+    try requireMetal()
+
+    // Export the same source at two quality levels and confirm both succeed. We don't assert
+    // a strict "low < high" byte-size relationship because VT's quality-to-bitrate mapping is
+    // codec- and content-dependent, and on very short clips the size difference can be
+    // dominated by mux overhead. The value this test adds is (a) pinning down that the
+    // parameter is plumbed through without rejecting valid inputs, and (b) producing two
+    // outputs whose sizes we can log for a sanity check.
+    var sizes: [Double: Int64] = [:]
+    for quality in [0.1, 0.9] {
+      try await withExportFixture(
+        duration: 0.5, frameRate: 10, quality: quality
+      ) { session, outputURL, _ in
+        try await session.export()
+        #expect(FileManager.default.fileExists(atPath: outputURL.path))
+        let attrs = try FileManager.default.attributesOfItem(atPath: outputURL.path)
+        let bytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        #expect(bytes > 0)
+        sizes[quality] = bytes
+      }
+    }
+    #expect(sizes.count == 2)
+  }
+
+  @Test("Asset with no tracks throws noMediaTracks")
+  func noMediaTracksError() async throws {
+    // A fresh, empty `AVMutableComposition` satisfies the public `AVAsset` contract while
+    // reporting an empty `tracks` array — hits the `guard !mediaTracks.isEmpty` branch in
+    // `UpscalingExportSession.export()` without needing a custom HDR/audio-only fixture.
+    let emptyAsset = AVMutableComposition()
 
     let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("existing_\(UUID().uuidString).mov")
-
-    FileManager.default.createFile(atPath: outputURL.path, contents: Data(), attributes: nil)
+      .appendingPathComponent("no_tracks_\(UUID().uuidString).mov")
     defer { TestVideoGenerator.cleanup(outputURL) }
 
-    let asset = AVURLAsset(url: inputURL)
     let session = UpscalingExportSession(
-      asset: asset,
+      asset: emptyAsset,
       outputCodec: .h264,
       preferredOutputURL: outputURL,
-      outputSize: outputSize
+      outputSize: CGSize(width: 640, height: 480)
     )
 
     await #expect(throws: UpscalingExportSession.Error.self) {
-      try await session.export()
+      do {
+        try await session.export()
+      } catch let error as UpscalingExportSession.Error {
+        guard case .noMediaTracks = error else {
+          Issue.record("Expected .noMediaTracks, got \(error)")
+          throw error
+        }
+        throw error
+      }
     }
   }
+
+  // Note on `UpscalingExportSession.Error.unsupportedColorSpace`:
+  // Constructing an HDR (PQ/HLG) or Rec. 2020 source video in-process via AVAssetWriter is
+  // possible in principle, but reliably producing a file whose *decoded* track format
+  // description round-trips the Rec. 2020 primaries / ST 2084 transfer (so
+  // `isUnsupportedForSRGBPath` actually fires) is brittle across macOS versions and
+  // hardware encoder policies — a test run can easily end up with a file that silently
+  // re-tagged the color properties, producing a false-green pass. AGENTS.md's "Future Work"
+  // section already flags the full color-aware pipeline as a separate, larger effort; a
+  // proper HDR fixture belongs with that work, not here. Skipping this case rather than
+  // landing a flaky synthetic fixture.
 
   @Test("Cancelling mid-export cleans up the partial output")
   func cancelRemovesPartialOutput() async throws {
     try requireMetal()
 
-    // A longer video so we have time to observe the cancellation mid-pump.
-    let inputSize = CGSize(width: 640, height: 480)
-    let outputSize = CGSize(width: 1280, height: 960)
+    // Deterministic approach: inject a `FrameProcessorBackend` via `chainFactory` that
+    // signals when the export has reached the first per-frame processing call and then
+    // suspends on `Task.sleep` — a cancellation-aware suspension point. The test awaits
+    // the signal (guaranteeing the writer has started and a pixel buffer is in flight),
+    // then cancels the export task. Cancellation propagates through the task group into
+    // `Task.sleep`, which throws, and `UpscalingExportSession.export()` takes its outer
+    // catch path that removes the partial output file.
+    //
+    // No polling, no sleeps in the test itself, no dependency on real-time export speed —
+    // the smallest valid fixture (0.5s / 10fps / 320x240 → 640x480, matching other tests)
+    // is sufficient.
     let inputURL = try await TestVideoGenerator.createTestVideo(
-      duration: 2.0,
-      frameRate: 30,
-      size: inputSize
+      duration: 0.5,
+      frameRate: 10,
+      size: CGSize(width: 320, height: 240),
+      includeAudio: false,
+      transform: nil
     )
     defer { TestVideoGenerator.cleanup(inputURL) }
 
     let outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("cancel_\(UUID().uuidString).mov")
+      .appendingPathComponent("fixture_\(UUID().uuidString).mov")
     defer { TestVideoGenerator.cleanup(outputURL) }
 
-    let asset = AVURLAsset(url: inputURL)
+    let outputSize = CGSize(width: 640, height: 480)
+    let (firstFrameStream, firstFrameContinuation) = AsyncStream<Void>.makeStream()
+
     let session = UpscalingExportSession(
-      asset: asset,
+      asset: AVURLAsset(url: inputURL),
       outputCodec: .h264,
       preferredOutputURL: outputURL,
-      outputSize: outputSize
+      outputSize: outputSize,
+      chainFactory: { inputSize in
+        let backend = BlockingBackend(
+          inputSize: inputSize,
+          outputSize: outputSize,
+          onFirstProcess: { firstFrameContinuation.yield(()) }
+        )
+        return try FrameProcessorChain(
+          inputSize: inputSize, outputSize: outputSize, stages: [backend])
+      }
     )
 
-    let task = Task {
-      try await session.export()
-    }
+    let task = Task { try await session.export() }
 
-    // Give the pump a chance to start before cancelling.
-    try await Task.sleep(for: .milliseconds(50))
+    // Deterministic rendezvous: proceed the instant the backend reports its first frame.
+    var iterator = firstFrameStream.makeAsyncIterator()
+    _ = await iterator.next()
+
     task.cancel()
 
-    // The cancellation surfaces as either CancellationError or an AVFoundation error, depending
-    // on exactly where the pump was suspended — either is acceptable. What matters is that the
-    // partial output file was removed.
-    _ = try? await task.value
+    // The cancellation surfaces as either CancellationError or an AVFoundation error,
+    // depending on exactly where the pump was suspended — any error is acceptable. What
+    // matters is that (a) the task throws, and (b) the partial output file was removed.
+    await #expect(throws: (any Error).self) {
+      try await task.value
+    }
     #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+  }
+}
+
+// MARK: - BlockingBackend
+
+/// Test-only `FrameProcessorBackend` that signals on its first `process(...)` call and then
+/// suspends on a cancellation-aware sleep until the enclosing task is cancelled. Used by
+/// `cancelRemovesPartialOutput` to deterministically pin an export at a known mid-flight
+/// point without depending on wall-clock time.
+private struct BlockingBackend: FrameProcessorBackend {
+  let inputSize: CGSize
+  let outputSize: CGSize
+  let onFirstProcess: @Sendable () -> Void
+
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    onFirstProcess()
+    // Cancellation-aware suspension. `Task.sleep` throws `CancellationError` when the
+    // enclosing task is cancelled, which propagates through `FrameProcessorChain.processAll`
+    // and into `UpscalingExportSession.export()`'s cleanup path. Bounded at 60s as a
+    // safety net so a regression in cancellation propagation fails CI in a reasonable
+    // time rather than hanging for the full test duration.
+    try await Task.sleep(for: .seconds(60))
+    return []
+  }
+}
+
+// MARK: - Super Resolution Processing Tests
+
+@Suite(
+  "Super Resolution Processing Tests",
+  .enabled(
+    if: VTSuperResolutionScalerConfiguration.isSupported,
+    "VTSuperResolutionScalerConfiguration not supported on this device")
+)
+struct SuperResolutionProcessingTests {
+  @Test("Processes two frames at output size")
+  func processesTwoFrames() async throws {
+    // Pick the smallest supported factor so the output stays well within macOS limits and
+    // the test doesn't allocate huge buffers. Match the pattern used by
+    // `superResolutionAcceptsSupportedFactor` so we don't hard-code 2×.
+    let supported = VTSuperResolutionScalerConfiguration.supportedScaleFactors.sorted()
+    let factor = try #require(supported.first)
+    let inputSize = CGSize(width: 320, height: 180)
+    let outputSize = CGSize(
+      width: inputSize.width * CGFloat(factor),
+      height: inputSize.height * CGFloat(factor))
+
+    let processor: VTSuperResolutionUpscaler
+    do {
+      processor = try await VTSuperResolutionUpscaler(
+        inputSize: inputSize, outputSize: outputSize)
+    } catch {
+      // Model download or configuration may legitimately fail on devices without network /
+      // without the ML model cached. Treat as a skip rather than a failure so CI matrices
+      // without the model available don't flake.
+      throw TestSkipError(
+        "VTSuperResolutionUpscaler init failed (likely model unavailable): \(error)")
+    }
+
+    #expect(processor.inputSize == inputSize)
+    #expect(processor.outputSize == outputSize)
+    #expect(processor.requiresInstancePerStream)
+    #expect(processor.displayName == "Super resolution")
+
+    // First frame — no previous temporal reference, processor still produces a full output.
+    let first = try makeTestPixelBuffer(size: inputSize)
+    nonisolated(unsafe) let firstCaptured = first
+    let firstPts = CMTime(value: 0, timescale: 30)
+    let firstOutputs = try await processor.process(
+      firstCaptured, presentationTimeStamp: firstPts, outputPool: nil)
+    try #require(firstOutputs.count == 1)
+    #expect(CVPixelBufferGetWidth(firstOutputs[0].pixelBuffer) == Int(outputSize.width))
+    #expect(CVPixelBufferGetHeight(firstOutputs[0].pixelBuffer) == Int(outputSize.height))
+    #expect(firstOutputs[0].presentationTimeStamp == firstPts)
+
+    // Second frame — exercises the temporal-reference path where `previousSourceFrame` is
+    // non-nil. Output must match the configured upscale dimensions.
+    let second = try makeTestPixelBuffer(size: inputSize)
+    nonisolated(unsafe) let secondCaptured = second
+    let secondPts = CMTime(value: 1, timescale: 30)
+    let secondOutputs = try await processor.process(
+      secondCaptured, presentationTimeStamp: secondPts, outputPool: nil)
+    try #require(secondOutputs.count == 1)
+    #expect(CVPixelBufferGetWidth(secondOutputs[0].pixelBuffer) == Int(outputSize.width))
+    #expect(CVPixelBufferGetHeight(secondOutputs[0].pixelBuffer) == Int(outputSize.height))
+    #expect(secondOutputs[0].presentationTimeStamp == secondPts)
+
+    // Finish should release temporal references and return no flushed frames (this backend
+    // doesn't look ahead).
+    let flushed = try await processor.finish(outputPool: nil)
+    #expect(flushed.isEmpty)
   }
 }
 
@@ -1312,40 +1491,40 @@ struct TestSkipError: Error, CustomStringConvertible {
 @Suite("Dimension Calculation")
 struct DimensionCalculationTests {
   @Test("Defaults to 2x when no dimensions requested")
-  func defaultDoubles() {
-    let out = calculateOutputDimensions(
+  func defaultDoubles() throws {
+    let out = try DimensionCalculation.calculateOutputDimensions(
       inputSize: CGSize(width: 640, height: 480),
       requestedWidth: nil, requestedHeight: nil)
     #expect(out == CGSize(width: 1280, height: 960))
   }
 
   @Test("Width-only preserves aspect ratio")
-  func widthOnly() {
-    let out = calculateOutputDimensions(
+  func widthOnly() throws {
+    let out = try DimensionCalculation.calculateOutputDimensions(
       inputSize: CGSize(width: 1920, height: 1080),
       requestedWidth: 3840, requestedHeight: nil)
     #expect(out == CGSize(width: 3840, height: 2160))
   }
 
   @Test("Height-only preserves aspect ratio")
-  func heightOnly() {
-    let out = calculateOutputDimensions(
+  func heightOnly() throws {
+    let out = try DimensionCalculation.calculateOutputDimensions(
       inputSize: CGSize(width: 1920, height: 1080),
       requestedWidth: nil, requestedHeight: 2160)
     #expect(out == CGSize(width: 3840, height: 2160))
   }
 
   @Test("Both width and height honored")
-  func bothProvided() {
-    let out = calculateOutputDimensions(
+  func bothProvided() throws {
+    let out = try DimensionCalculation.calculateOutputDimensions(
       inputSize: CGSize(width: 1920, height: 1080),
       requestedWidth: 1000, requestedHeight: 800)
     #expect(out == CGSize(width: 1000, height: 800))
   }
 
   @Test("Odd widths are rounded up to even")
-  func oddDimensionsAreEvened() {
-    let out = calculateOutputDimensions(
+  func oddDimensionsAreEvened() throws {
+    let out = try DimensionCalculation.calculateOutputDimensions(
       inputSize: CGSize(width: 1001, height: 563),
       requestedWidth: 2001, requestedHeight: nil)
     #expect(Int(out.width) % 2 == 0)
@@ -1353,9 +1532,9 @@ struct DimensionCalculationTests {
   }
 
   @Test("Non-integer aspect ratios produce even dimensions")
-  func nonIntegerRatio() {
+  func nonIntegerRatio() throws {
     // 720x405 → request width 1000 → height 562.5 → rounded 563 → evened to 564
-    let out = calculateOutputDimensions(
+    let out = try DimensionCalculation.calculateOutputDimensions(
       inputSize: CGSize(width: 720, height: 405),
       requestedWidth: 1000, requestedHeight: nil)
     #expect(Int(out.width) == 1000)
@@ -1363,11 +1542,51 @@ struct DimensionCalculationTests {
   }
 
   @Test("Single-pixel input survives even-rounding")
-  func onePixelInput() {
-    let out = calculateOutputDimensions(
+  func onePixelInput() throws {
+    let out = try DimensionCalculation.calculateOutputDimensions(
       inputSize: CGSize(width: 1, height: 1),
       requestedWidth: nil, requestedHeight: nil)
     #expect(out == CGSize(width: 2, height: 2))
+  }
+
+  @Test("Non-positive requested width throws")
+  func invalidRequestedWidthThrows() {
+    #expect(throws: DimensionCalculation.Error.self) {
+      _ = try DimensionCalculation.calculateOutputDimensions(
+        inputSize: CGSize(width: 1920, height: 1080),
+        requestedWidth: 0, requestedHeight: nil)
+    }
+  }
+
+  @Test("Non-positive input size throws")
+  func invalidInputSizeThrows() {
+    #expect(throws: DimensionCalculation.Error.self) {
+      _ = try DimensionCalculation.calculateOutputDimensions(
+        inputSize: CGSize(width: 0, height: 0),
+        requestedWidth: nil, requestedHeight: nil)
+    }
+  }
+
+  @Test("Requested width smaller than input produces a downscaled output")
+  func requestedWidthSmallerThanInput() throws {
+    // Pin down the current behavior: DimensionCalculation is not special-cased for downscale.
+    // It just honors the requested width and derives the height from the input aspect ratio.
+    // Even-rounding still applies. This acts as a regression guard against accidentally
+    // adding a "reject if smaller than input" branch later — downstream (UpscalingExportSession
+    // / MetalFX) is free to require upscaling, but this helper stays scale-agnostic.
+    let out = try DimensionCalculation.calculateOutputDimensions(
+      inputSize: CGSize(width: 1920, height: 1080),
+      requestedWidth: 640, requestedHeight: nil)
+    #expect(out == CGSize(width: 640, height: 360))
+    #expect(Int(out.width) % 2 == 0)
+    #expect(Int(out.height) % 2 == 0)
+
+    // And with both dims explicit, non-matching aspect ratio is honored verbatim (up to even
+    // rounding).
+    let explicit = try DimensionCalculation.calculateOutputDimensions(
+      inputSize: CGSize(width: 1920, height: 1080),
+      requestedWidth: 100, requestedHeight: 50)
+    #expect(explicit == CGSize(width: 100, height: 50))
   }
 }
 

@@ -63,9 +63,6 @@ public final class UpscalingExportSession: @unchecked Sendable {
     }
     progress = Progress(parent: nil, userInfo: [.fileURLKey: outputURL])
     progress.isCancellable = true
-    #if os(macOS)
-      progress.publish()
-    #endif
   }
 
   // MARK: Public
@@ -86,6 +83,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
   public func export() async throws {
     #if os(macOS)
+      progress.publish()
       defer { progress.unpublish() }
     #endif
     defer { progress.cancellationHandler = nil }
@@ -302,6 +300,11 @@ public final class UpscalingExportSession: @unchecked Sendable {
     case .completed:
       break
     case .cancelled:
+      // Throw the conventional `CancellationError` so callers using the standard-library
+      // pattern (`catch is CancellationError`) can treat cooperative cancellation differently
+      // from a real export failure. `AVAssetWriter.Status.cancelled` is reached via the
+      // `progress.cancellationHandler` installed earlier in `export()`, which runs when the
+      // caller either invokes `progress.cancel()` directly or cancels the surrounding Task.
       try? FileManager.default.removeItem(at: outputURL)
       throw CancellationError()
     case .failed:
@@ -311,7 +314,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
       fallthrough
     @unknown default:
       try? FileManager.default.removeItem(at: outputURL)
-      throw Error.failedToStartWriting
+      throw assetWriter.error ?? Error.failedToStartWriting
     }
 
     #if os(macOS)
@@ -458,7 +461,6 @@ public final class UpscalingExportSession: @unchecked Sendable {
           kVTCompressionPropertyKey_HeroEye,
           kVTCompressionPropertyKey_StereoCameraBaseline,
           kVTCompressionPropertyKey_HorizontalDisparityAdjustment,
-          kCMFormatDescriptionExtension_HorizontalFieldOfView,
         ] {
           if let value = extensions.first(where: { $0.key == key })?.value {
             compressionProperties[key as String] = value
@@ -520,7 +522,10 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
     nonisolated(unsafe) let capturedAdaptor = adaptor
     nonisolated(unsafe) let capturedWriterInput = assetWriterInput
-    nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
+    guard let pool = adaptor.pixelBufferPool else {
+      throw Error.failedToStartWriting
+    }
+    nonisolated(unsafe) let capturedPool: CVPixelBufferPool? = pool
 
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
@@ -585,73 +590,131 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
     defer { assetWriterInput.markAsFinished() }
 
-    for await envelope in sampleBuffers {
-      defer { envelope.release() }
-      try Task.checkCancellation()
-      let sampleBuffer = envelope.buffer
-      let pts = sampleBuffer.presentationTimeStamp
-      updateProgress(progress, pts: pts)
-      guard let taggedBuffers = sampleBuffer.taggedBuffers else {
-        throw Error.missingTaggedBuffers
-      }
+    // Per-eye source-frame channels feed each chain's `processAll`. Per-eye output channels
+    // collect the handler-batches (one batch per source frame, plus propagated flush
+    // batches). A third channel forwards per-source-frame layer tags so the assembly task
+    // can re-tag each output group. Both eyes run deterministic, identical chains on
+    // identical input cadence, so their handler-batch sequences align one-to-one — zipping
+    // by pulling one batch from each per iteration preserves PTS ordering and lets the
+    // existing per-sample frame-count mismatch guard catch any divergence.
+    let leftInputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
+    let rightInputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
+    let leftOutputChannel = PipelineChannel<[FrameProcessorOutput]>(capacity: 2)
+    let rightOutputChannel = PipelineChannel<[FrameProcessorOutput]>(capacity: 2)
+    let tagsChannel = PipelineChannel<(left: CMTag?, right: CMTag?)>(capacity: 2)
 
-      // Preserve each source tagged buffer's `videoLayerID` rather than synthesizing 0/1 in a
-      // fixed order — downstream tools may rely on the hero-eye tag staying on its original
-      // layer. Copy the source `CMTag` directly so we don't have to parse its numeric value.
-      var leftEye: (buffer: CVPixelBuffer, layerTag: CMTag?)?
-      var rightEye: (buffer: CVPixelBuffer, layerTag: CMTag?)?
-      for tagged in taggedBuffers {
-        let stereoTag = tagged.tags.first(matchingCategory: .stereoView)
-        let layerTag = tagged.tags.first(matchingCategory: .videoLayerID)
-        guard case .pixelBuffer(let buffer) = tagged.buffer else { continue }
-        if stereoTag == .stereoView(.leftEye) {
-          leftEye = (buffer, layerTag)
-        } else if stereoTag == .stereoView(.rightEye) {
-          rightEye = (buffer, layerTag)
+    nonisolated(unsafe) let capturedReceiver = receiver
+    nonisolated(unsafe) let capturedWriterInput = assetWriterInput
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask {
+        defer {
+          leftInputChannel.finish()
+          rightInputChannel.finish()
+          tagsChannel.finish()
         }
-        if leftEye != nil, rightEye != nil { break }
-      }
-      guard let left = leftEye, let right = rightEye else {
-        throw Error.invalidTaggedBuffers
+        for await envelope in sampleBuffers {
+          defer { envelope.release() }
+          try Task.checkCancellation()
+          let sampleBuffer = envelope.buffer
+          let pts = sampleBuffer.presentationTimeStamp
+          updateProgress(progress, pts: pts)
+          guard let taggedBuffers = sampleBuffer.taggedBuffers else {
+            throw Error.missingTaggedBuffers
+          }
+
+          // Preserve each source tagged buffer's `videoLayerID` rather than synthesizing 0/1
+          // in a fixed order — downstream tools may rely on the hero-eye tag staying on its
+          // original layer. Copy the source `CMTag` directly so we don't have to parse its
+          // numeric value.
+          var leftEye: (buffer: CVPixelBuffer, layerTag: CMTag?)?
+          var rightEye: (buffer: CVPixelBuffer, layerTag: CMTag?)?
+          for tagged in taggedBuffers {
+            let stereoTag = tagged.tags.first(matchingCategory: .stereoView)
+            let layerTag = tagged.tags.first(matchingCategory: .videoLayerID)
+            guard case .pixelBuffer(let buffer) = tagged.buffer else { continue }
+            if stereoTag == .stereoView(.leftEye) {
+              leftEye = (buffer, layerTag)
+            } else if stereoTag == .stereoView(.rightEye) {
+              rightEye = (buffer, layerTag)
+            }
+            if leftEye != nil, rightEye != nil { break }
+          }
+          guard let left = leftEye, let right = rightEye else {
+            throw Error.invalidTaggedBuffers
+          }
+
+          nonisolated(unsafe) let leftBuf = left.buffer
+          nonisolated(unsafe) let rightBuf = right.buffer
+          await leftInputChannel.send(
+            FrameProcessorOutput(pixelBuffer: leftBuf, presentationTimeStamp: pts))
+          await rightInputChannel.send(
+            FrameProcessorOutput(pixelBuffer: rightBuf, presentationTimeStamp: pts))
+          await tagsChannel.send((left.layerTag, right.layerTag))
+        }
       }
 
-      nonisolated(unsafe) let leftCaptured = left.buffer
-      nonisolated(unsafe) let rightCaptured = right.buffer
-      async let leftOutputsTask = leftChain.process(
-        leftCaptured, presentationTimeStamp: pts, outputPool: nil)
-      async let rightOutputsTask = rightChain.process(
-        rightCaptured, presentationTimeStamp: pts, outputPool: nil)
-      let leftOutputs = try await leftOutputsTask
-      let rightOutputs = try await rightOutputsTask
-
-      // Both eyes must emit the same number of frames on the same PTS schedule. 1:1 stages
-      // always produce a single output; FRC stages emit M interpolated frames but — because
-      // both eyes run the same chain with the same input PTS — the emitted counts and
-      // timestamps must agree.
-      guard leftOutputs.count == rightOutputs.count else {
-        throw Error.spatialFrameCountMismatch(left: leftOutputs.count, right: rightOutputs.count)
+      // Left-eye pipeline.
+      group.addTask {
+        defer { leftOutputChannel.finish() }
+        try await leftChain.processAll(
+          from: leftInputChannel,
+          outputPool: nil
+        ) { batch in
+          await leftOutputChannel.send(batch)
+        }
       }
 
-      try await appendStereo(
-        leftOutputs: leftOutputs, rightOutputs: rightOutputs,
-        leftLayerTag: left.layerTag, rightLayerTag: right.layerTag,
-        receiver: receiver, input: assetWriterInput)
+      // Right-eye pipeline.
+      group.addTask {
+        defer { rightOutputChannel.finish() }
+        try await rightChain.processAll(
+          from: rightInputChannel,
+          outputPool: nil
+        ) { batch in
+          await rightOutputChannel.send(batch)
+        }
+      }
+
+      // Assembly: zip per-eye handler-batches, re-attach layer tags, and append.
+      group.addTask {
+        var leftIter = leftOutputChannel.makeAsyncIterator()
+        var rightIter = rightOutputChannel.makeAsyncIterator()
+        var tagsIter = tagsChannel.makeAsyncIterator()
+        while true {
+          try Task.checkCancellation()
+          let leftBatch = await leftIter.next()
+          let rightBatch = await rightIter.next()
+          switch (leftBatch, rightBatch) {
+          case (nil, nil):
+            return
+          case (.some(let l), nil):
+            throw Error.spatialFrameCountMismatch(left: l.count, right: 0)
+          case (nil, .some(let r)):
+            throw Error.spatialFrameCountMismatch(left: 0, right: r.count)
+          case (.some(let leftOutputs), .some(let rightOutputs)):
+            // Both eyes must emit the same number of frames on the same PTS schedule.
+            // 1:1 stages always produce a single output; FRC stages emit M interpolated
+            // frames but — because both eyes run the same chain with the same input
+            // PTS — the emitted counts and timestamps must agree.
+            guard leftOutputs.count == rightOutputs.count else {
+              throw Error.spatialFrameCountMismatch(
+                left: leftOutputs.count, right: rightOutputs.count)
+            }
+            // `tagsIter` yields one pair per source frame, then returns nil for any
+            // subsequent flush-emitted batches — those fall back to the
+            // `.videoLayerID(0/1)` defaults inside `appendStereo`.
+            let tags = await tagsIter.next()
+            try await appendStereo(
+              leftOutputs: leftOutputs, rightOutputs: rightOutputs,
+              leftLayerTag: tags?.left, rightLayerTag: tags?.right,
+              receiver: capturedReceiver, input: capturedWriterInput)
+          }
+        }
+      }
+
+      try await group.waitForAll()
     }
-
-    // Emit any frames the chains were holding back waiting for more input.
-    async let leftFinalTask = leftChain.finish(outputPool: nil)
-    async let rightFinalTask = rightChain.finish(outputPool: nil)
-    let leftFinal = try await leftFinalTask
-    let rightFinal = try await rightFinalTask
-    guard leftFinal.count == rightFinal.count else {
-      throw Error.spatialFrameCountMismatch(left: leftFinal.count, right: rightFinal.count)
-    }
-    // We no longer have the source tagged-buffer for these flushed frames, so fall back to
-    // the `.videoLayerID(0/1)` defaults that `appendStereo` supplies.
-    try await appendStereo(
-      leftOutputs: leftFinal, rightOutputs: rightFinal,
-      leftLayerTag: nil, rightLayerTag: nil,
-      receiver: receiver, input: assetWriterInput)
   }
 
   private static func appendStereo(
