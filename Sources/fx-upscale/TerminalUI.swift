@@ -13,8 +13,14 @@ private enum ANSI {
   static let brightRed = "\u{1B}[91m"
   static let gray = "\u{1B}[90m"
   static let clearToEndOfLine = "\u{1B}[0K"
+  static let clearToEndOfScreen = "\u{1B}[J"
   static let hideCursor = "\u{1B}[?25l"
   static let showCursor = "\u{1B}[?25h"
+
+  /// Moves the cursor up `n` lines. No-op when `n <= 0`.
+  static func cursorUp(_ n: Int) -> String {
+    n > 0 ? "\u{1B}[\(n)A" : ""
+  }
 
   static func style(_ string: String, _ codes: String...) -> String {
     guard Terminal.isTTY else { return string }
@@ -52,14 +58,19 @@ enum Terminal {
     return Int(size.ws_col)
   }
 
-  fileprivate static func clearLine() {
-    print("\r" + ANSI.clearToEndOfLine, terminator: "")
-    fflush(Darwin.stdout)
-  }
+  /// Number of lines currently occupied by the progress display. Written by
+  /// `ProgressBar.render()`, read by `restoreCursorUnsafe()` for signal-handler cleanup.
+  fileprivate nonisolated(unsafe) static var progressLineCount = 0
 
-  /// Emits the sequences needed to restore the cursor from a signal handler.
+  /// Moves the cursor to the top of the progress block and clears all its lines.
+  /// Safe to call from `DispatchSource` signal handlers — uses only `fputs` and `fflush`.
   static func restoreCursorUnsafe() {
-    fputs("\r" + ANSI.clearToEndOfLine + ANSI.showCursor + "\n", Darwin.stdout)
+    let n = progressLineCount
+    if n > 1 {
+      fputs(ANSI.cursorUp(n - 1), Darwin.stdout)
+    }
+    // `\r` moves to column 0; `\e[J` clears from cursor to end of display (all stale lines).
+    fputs("\r" + ANSI.clearToEndOfScreen + ANSI.showCursor + "\n", Darwin.stdout)
     fflush(Darwin.stdout)
   }
 
@@ -202,8 +213,13 @@ enum ProgressBar {
     task?.cancel()
     task = nil
     guard Terminal.isTTY else { return }
-    Terminal.clearLine()
-    print(ANSI.showCursor, terminator: "")
+    // Move to the top of the progress block, then clear everything below.
+    let n = Terminal.progressLineCount
+    if n > 1 {
+      print(ANSI.cursorUp(n - 1), terminator: "")
+    }
+    print("\r" + ANSI.clearToEndOfScreen + ANSI.showCursor, terminator: "")
+    Terminal.progressLineCount = 0
     fflush(Darwin.stdout)
   }
 
@@ -229,50 +245,89 @@ enum ProgressBar {
     progress: Progress,
     metricsCollector: PipelineMetricsCollector?
   ) {
-    // Build the fps suffix first so we can account for its visible width when sizing the bar.
-    let fpsSuffix: String
-    let fpsSuffixVisibleWidth: Int
-    if let metricsCollector {
-      let snapshot = metricsCollector.snapshot()
-      if snapshot.framesProcessed > 0, snapshot.framesPerSecond > 0 {
-        let formatted = String(format: "%.1f fps", snapshot.framesPerSecond)
-        fpsSuffix = ANSI.style("  " + formatted, ANSI.gray)
-        fpsSuffixVisibleWidth = 2 + formatted.count  // "  " + "123.4 fps"
-      } else {
-        fpsSuffix = ""
-        fpsSuffixVisibleWidth = 0
-      }
+    let snapshot = metricsCollector?.snapshot()
+
+    // ── Line 1: progress bar with overall fps ──────────────────────────
+
+    let overallFpsText: String
+    var overallFpsVisibleWidth = 0
+    if let snapshot, snapshot.framesProcessed > 0, snapshot.framesPerSecond > 0 {
+      let text = String(format: "  %.1f fps", snapshot.framesPerSecond)
+      overallFpsText = ANSI.style(text, ANSI.gray)
+      overallFpsVisibleWidth = text.count
     } else {
-      fpsSuffix = ""
-      fpsSuffixVisibleWidth = 0
+      overallFpsText = ""
     }
 
-    let cols = max(
+    let terminalWidth = Terminal.columns ?? defaultColumns
+    let barCols = max(
       minBarColumns,
-      (Terminal.columns ?? defaultColumns) - bracketsWidth - percentFieldWidth
-        - fpsSuffixVisibleWidth
+      terminalWidth - bracketsWidth - percentFieldWidth - overallFpsVisibleWidth
     )
     let fraction = max(0, min(1, progress.fractionCompleted))
-    let scaled = fraction * Double(cols)
+    let scaled = fraction * Double(barCols)
     let completed = Int(scaled)
     let partial = scaled - Double(completed)
 
-    var components = [openBracket]
-    components.append(String(repeating: "█", count: completed))
-    if cols - completed - 1 > 0 {
+    var bar = openBracket
+    bar += String(repeating: "█", count: completed)
+    if barCols - completed - 1 > 0 {
       let frameIndex = min(
         partialFrames.count - 1,
         Int(partial * Double(partialFrames.count))
       )
-      components.append(partialFrames[frameIndex])
-      components.append(String(repeating: " ", count: cols - completed - 1))
+      bar += partialFrames[frameIndex]
+      bar += String(repeating: " ", count: barCols - completed - 1)
     }
-    components.append(closeBracket)
+    bar += closeBracket
     let percent = fraction.formatted(.percent.precision(.fractionLength(2)))
-    components.append(ANSI.style(" " + percent, ANSI.gray))
-    components.append(fpsSuffix)
+    bar += ANSI.style(" " + percent, ANSI.gray)
+    bar += overallFpsText
 
-    print("\r" + ANSI.clearToEndOfLine + components.joined(), terminator: "")
+    var lines = [bar]
+
+    // ── Lines 2+: per-stage fps ────────────────────────────────────────
+
+    if let snapshot, snapshot.framesProcessed > 0 {
+      let active = snapshot.stages.filter { $0.framesProcessed > 0 && $0.framesPerSecond > 0 }
+      if let nameWidth = active.map(\.name.count).max() {
+        for stage in active {
+          let stageText =
+            "  "
+            + stage.name.padding(toLength: nameWidth, withPad: " ", startingAt: 0)
+            + String(format: "  %7.1f fps", stage.framesPerSecond)
+          lines.append(ANSI.style(stageText, ANSI.gray))
+        }
+      }
+    }
+
+    // ── Emit with cursor management ────────────────────────────────────
+
+    let prev = Terminal.progressLineCount
+
+    // Move cursor back to the top of the previously rendered block.
+    if prev > 1 {
+      print(ANSI.cursorUp(prev - 1), terminator: "")
+    }
+
+    // Write each line, clearing any stale content to the right.
+    for (index, line) in lines.enumerated() {
+      print("\r" + ANSI.clearToEndOfLine + line, terminator: "")
+      if index < lines.count - 1 {
+        print("", terminator: "\n")
+      }
+    }
+
+    // If the previous render had more lines, clear the stale rows below.
+    if prev > lines.count {
+      print("", terminator: "\n")
+      print(ANSI.clearToEndOfScreen, terminator: "")
+      // Move back up to the last content line so the next render cycle starts
+      // from the right position.
+      print(ANSI.cursorUp(1), terminator: "")
+    }
+
+    Terminal.progressLineCount = lines.count
     fflush(Darwin.stdout)
   }
 }
