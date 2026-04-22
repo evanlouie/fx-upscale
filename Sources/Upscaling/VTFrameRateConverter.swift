@@ -257,9 +257,10 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
 
   /// `kCVPixelBufferPoolMinimumBufferCountKey` value. Each source pair emits up to
   /// `target/source - 1` destination buffers in one shot, plus in-flight consumption
-  /// downstream. 12 covers every realistic ratio (≤ ~10×) without forcing the pool to
-  /// fall back to `CVPixelBufferPoolCreatePixelBuffer`.
-  private static let minimumPoolBufferCount = 12
+  /// downstream (including one held by the next stage while we start the next frame).
+  /// 13 covers every realistic ratio (≤ ~10×) without fall-back to
+  /// `CVPixelBufferPoolCreatePixelBuffer`.
+  private static let minimumPoolBufferCount = 13
 
   /// Fallback `CMTime` timescale used for the target period when `targetFrameRate` isn't a
   /// clean integer. Chosen large enough that per-period rounding stays well under one frame

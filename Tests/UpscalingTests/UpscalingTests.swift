@@ -5,6 +5,7 @@ import Foundation
 import Metal
 import Testing
 import VideoToolbox
+import os
 
 @testable import Upscaling
 
@@ -1578,5 +1579,210 @@ struct PipelineMetricsTests {
     let interval = d.timeInterval
     // 3.5 seconds — allow tiny floating-point tolerance.
     #expect(abs(interval - 3.5) < 1e-9)
+  }
+}
+
+// MARK: - Pipeline Channel Tests
+
+@Suite("Pipeline Channel Tests")
+struct PipelineChannelTests {
+  @Test("Single element flows through channel")
+  func singleElement() async {
+    let channel = PipelineChannel<Int>(capacity: 1)
+    await channel.send(42)
+    channel.finish()
+    var iterator = channel.makeAsyncIterator()
+    let value = await iterator.next()
+    #expect(value == 42)
+    let end = await iterator.next()
+    #expect(end == nil)
+  }
+
+  @Test("Multiple elements flow in order")
+  func multipleElements() async {
+    let channel = PipelineChannel<Int>(capacity: 2)
+    await channel.send(1)
+    await channel.send(2)
+    channel.finish()
+    var results: [Int] = []
+    for await value in channel {
+      results.append(value)
+    }
+    #expect(results == [1, 2])
+  }
+
+  @Test("Backpressure suspends producer when full")
+  func backpressure() async {
+    let channel = PipelineChannel<Int>(capacity: 1)
+    // Fill the buffer.
+    await channel.send(1)
+    // Consume concurrently to unblock the producer.
+    async let producer: Void = channel.send(2)
+    var iter = channel.makeAsyncIterator()
+    let first = await iter.next()
+    await producer
+    channel.finish()
+    #expect(first == 1)
+  }
+
+  @Test("Finish signals end to waiting consumer")
+  func finishWakesConsumer() async {
+    let channel = PipelineChannel<Int>(capacity: 1)
+    let task = Task {
+      var iter = channel.makeAsyncIterator()
+      return await iter.next()
+    }
+    // Brief yield to let the consumer park.
+    try? await Task.sleep(for: .milliseconds(10))
+    channel.finish()
+    let value = await task.value
+    #expect(value == nil)
+  }
+
+  @Test("Cancelled consumer returns nil")
+  func cancelledConsumer() async {
+    let channel = PipelineChannel<Int>(capacity: 1)
+    let task = Task {
+      var iter = channel.makeAsyncIterator()
+      return await iter.next()
+    }
+    // Let the consumer park, then cancel.
+    try? await Task.sleep(for: .milliseconds(10))
+    task.cancel()
+    let value = await task.value
+    #expect(value == nil)
+  }
+
+  @Test("Cancelled producer drops element")
+  func cancelledProducer() async {
+    let channel = PipelineChannel<Int>(capacity: 1)
+    await channel.send(1) // fill buffer
+    let task = Task {
+      await channel.send(2) // should suspend (buffer full)
+    }
+    try? await Task.sleep(for: .milliseconds(10))
+    task.cancel()
+    await task.value
+    // Consumer should get 1 from the buffer, then nil after finish.
+    channel.finish()
+    var iter = channel.makeAsyncIterator()
+    #expect(await iter.next() == 1)
+    #expect(await iter.next() == nil)
+  }
+
+  @Test("Producer-consumer pipeline transfers all elements")
+  func producerConsumerPipeline() async {
+    let channel = PipelineChannel<Int>(capacity: 2)
+    let count = 100
+    async let producer: Void = {
+      for i in 0..<count {
+        await channel.send(i)
+      }
+      channel.finish()
+    }()
+    var received: [Int] = []
+    for await value in channel {
+      received.append(value)
+    }
+    await producer
+    #expect(received == Array(0..<count))
+  }
+}
+
+// MARK: - Pipeline processAll Tests
+
+@Suite("Pipeline processAll Tests")
+struct PipelineProcessAllTests {
+  @Test("processAll produces same output as sequential process for single stage")
+  func singleStageEquivalence() async throws {
+    let size = CGSize(width: 320, height: 240)
+    let outputSize = CGSize(width: 640, height: 480)
+    guard let backend = Upscaler(inputSize: size, outputSize: outputSize) else {
+      throw TestSkipError("Metal device not available")
+    }
+    let chain = try FrameProcessorChain(
+      inputSize: size, outputSize: outputSize, stages: [backend])
+
+    let frameCount = 5
+    let inputBuffers = try (0..<frameCount).map { _ in try makeTestPixelBuffer(size: size) }
+
+    // Feed frames through processAll
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
+    let outputCollector = OSAllocatedUnfairLock(initialState: [[FrameProcessorOutput]]())
+
+    async let feeder: Void = {
+      for (i, buffer) in inputBuffers.enumerated() {
+        nonisolated(unsafe) let captured = buffer
+        await inputChannel.send(
+          FrameProcessorOutput(
+            pixelBuffer: captured,
+            presentationTimeStamp: CMTime(value: CMTimeValue(i), timescale: 30)))
+      }
+      inputChannel.finish()
+    }()
+
+    try await chain.processAll(from: inputChannel, outputPool: nil) { batch in
+      outputCollector.withLock { $0.append(batch) }
+    }
+    await feeder
+
+    let outputs = outputCollector.withLock { $0 }
+    #expect(outputs.count == frameCount)
+    for batch in outputs {
+      #expect(batch.count == 1) // 1:1 stage
+      let buf = batch[0].pixelBuffer
+      #expect(CVPixelBufferGetWidth(buf) == Int(outputSize.width))
+      #expect(CVPixelBufferGetHeight(buf) == Int(outputSize.height))
+    }
+  }
+
+  @Test("processAll identity chain passes through frames")
+  func identityChain() async throws {
+    let size = CGSize(width: 320, height: 240)
+    let chain = try FrameProcessorChain(
+      inputSize: size, outputSize: size, stages: [])
+
+    let buffer = try makeTestPixelBuffer(size: size)
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 1)
+    nonisolated(unsafe) let captured = buffer
+    await inputChannel.send(
+      FrameProcessorOutput(
+        pixelBuffer: captured, presentationTimeStamp: CMTime(value: 1, timescale: 30)))
+    inputChannel.finish()
+
+    let countBox = OSAllocatedUnfairLock(initialState: 0)
+    try await chain.processAll(from: inputChannel, outputPool: nil) { batch in
+      countBox.withLock { $0 += batch.count }
+    }
+    #expect(countBox.withLock { $0 } == 1)
+  }
+
+  @Test("processAll records metrics")
+  func metricsRecording() async throws {
+    let size = CGSize(width: 320, height: 240)
+    let outputSize = CGSize(width: 640, height: 480)
+    guard let backend = Upscaler(inputSize: size, outputSize: outputSize) else {
+      throw TestSkipError("Metal device not available")
+    }
+    let collector = PipelineMetricsCollector()
+    let chain = try FrameProcessorChain(
+      inputSize: size, outputSize: outputSize, stages: [backend],
+      metricsCollector: collector)
+
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 1)
+    let buf = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let captured = buf
+    await inputChannel.send(
+      FrameProcessorOutput(
+        pixelBuffer: captured, presentationTimeStamp: .zero))
+    inputChannel.finish()
+
+    try await chain.processAll(from: inputChannel, outputPool: nil) { _ in }
+
+    let snapshot = collector.snapshot()
+    #expect(snapshot.stages.count == 1)
+    #expect(snapshot.stages[0].framesProcessed == 1)
+    #expect(snapshot.framesProcessed == 1)
+    #expect(snapshot.framesEmitted == 1)
   }
 }

@@ -123,9 +123,8 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
   // MARK: Private
 
   /// `kCVPixelBufferPoolMinimumBufferCountKey` value. We hold the previous source wrapper
-  /// across calls, so the pool needs at least one more live buffer than a purely stateless
-  /// path would.
-  private static let minimumPoolBufferCount = 3
+  /// across calls, and the next stage may hold our output while we start the next frame.
+  private static let minimumPoolBufferCount = 4
 
   /// API-documented strength bounds from `VTMotionBlurParameters`.
   private static let minStrength = 1

@@ -128,8 +128,8 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
   // MARK: Private
 
   /// `kCVPixelBufferPoolMinimumBufferCountKey` value. We hold the previous output across calls,
-  /// so the pool needs at least one more live buffer than the MetalFX path.
-  private static let minimumPoolBufferCount = 4
+  /// and the next stage may hold our output buffer while we start the next frame.
+  private static let minimumPoolBufferCount = 5
 
   /// Tolerance for "isotropic" check between width/height ratios.
   private static let ratioEpsilon: Double = 1e-3

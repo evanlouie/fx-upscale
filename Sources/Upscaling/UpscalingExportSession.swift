@@ -516,39 +516,53 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
     defer { assetWriterInput.markAsFinished() }
 
-    for await envelope in sampleBuffers {
-      defer { envelope.release() }
-      try Task.checkCancellation()
-      let sampleBuffer = envelope.buffer
-      let pts = sampleBuffer.presentationTimeStamp
-      updateProgress(progress, pts: pts)
-      guard let imageBuffer = sampleBuffer.imageBuffer else {
-        throw Error.missingImageBuffer
-      }
-      nonisolated(unsafe) let capturedBuffer = imageBuffer
-      nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
-      let outputs = try await chain.process(
-        capturedBuffer, presentationTimeStamp: pts, outputPool: capturedPool)
-      for output in outputs {
-        try await waitForInputReady(assetWriterInput)
-        if !adaptor.append(output.pixelBuffer, withPresentationTime: output.presentationTimeStamp)
-        {
-          throw Error.appendFailed(output.presentationTimeStamp)
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
+
+    nonisolated(unsafe) let capturedAdaptor = adaptor
+    nonisolated(unsafe) let capturedWriterInput = assetWriterInput
+    nonisolated(unsafe) let capturedPool = adaptor.pixelBufferPool
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask {
+        defer { inputChannel.finish() }
+        for await envelope in sampleBuffers {
+          defer { envelope.release() }
+          try Task.checkCancellation()
+          let sampleBuffer = envelope.buffer
+          let pts = sampleBuffer.presentationTimeStamp
+          updateProgress(progress, pts: pts)
+          guard let imageBuffer = sampleBuffer.imageBuffer else {
+            throw Error.missingImageBuffer
+          }
+          nonisolated(unsafe) let capturedBuffer = imageBuffer
+          await inputChannel.send(
+            FrameProcessorOutput(
+              pixelBuffer: capturedBuffer,
+              presentationTimeStamp: pts))
         }
       }
-    }
 
-    // Emit any frames the chain was holding back waiting for more input.
-    nonisolated(unsafe) let finalPool = adaptor.pixelBufferPool
-    let finalOutputs = try await chain.finish(outputPool: finalPool)
-    for output in finalOutputs {
-      try await waitForInputReady(assetWriterInput)
-      if !adaptor.append(output.pixelBuffer, withPresentationTime: output.presentationTimeStamp) {
-        throw Error.appendFailed(output.presentationTimeStamp)
+      group.addTask {
+        try await chain.processAll(
+          from: inputChannel,
+          outputPool: capturedPool
+        ) { outputs in
+          for output in outputs {
+            try await waitForInputReady(capturedWriterInput)
+            if !capturedAdaptor.append(
+              output.pixelBuffer, withPresentationTime: output.presentationTimeStamp)
+            {
+              throw Error.appendFailed(output.presentationTimeStamp)
+            }
+          }
+        }
       }
+
+      try await group.waitForAll()
     }
   }
 
+  /// Processes spatial (MV-HEVC) video samples through per-eye chains.
   private static func processSpatialVideoSamples(
     from assetReaderOutput: AVAssetReaderOutput,
     to assetWriterInput: AVAssetWriterInput,
