@@ -256,6 +256,8 @@ import Upscaling
       }
     }
 
+    let metricsCollector = PipelineMetricsCollector()
+
     let chainFactory: UpscalingExportSession.ChainFactory = {
       [scaler, denoise, fps, motionBlur, wantsScaling] inputSize in
       var stages: [any FrameProcessorBackend] = []
@@ -275,7 +277,8 @@ import Upscaling
           try await VTMotionBlurProcessor(frameSize: outputSize, strength: motionBlur))
       }
       return try FrameProcessorChain(
-        inputSize: inputSize, outputSize: outputSize, stages: stages)
+        inputSize: inputSize, outputSize: outputSize, stages: stages,
+        metricsCollector: metricsCollector)
     }
 
     let exportSession = UpscalingExportSession(
@@ -308,7 +311,7 @@ import Upscaling
       try? FileManager.default.removeItem(at: outputURL)
     }
 
-    ProgressBar.start(progress: exportSession.progress)
+    ProgressBar.start(progress: exportSession.progress, metricsCollector: metricsCollector)
     defer { ProgressBar.stop() }
 
     do {
@@ -324,6 +327,7 @@ import Upscaling
       throw ExitCode.failure
     }
     Terminal.success("Wrote \(outputURL.path(percentEncoded: false))")
+    Terminal.metricsSummary(metricsCollector.snapshot())
   }
 
   /// Runs a preflight check and rewraps any thrown error as a `ValidationError` so

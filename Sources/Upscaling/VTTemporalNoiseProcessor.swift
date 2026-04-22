@@ -58,6 +58,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
 
   public nonisolated var inputSize: CGSize { frameSize }
   public nonisolated var outputSize: CGSize { frameSize }
+  public nonisolated let displayName = "Denoise"
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 

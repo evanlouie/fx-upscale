@@ -1369,3 +1369,214 @@ struct DimensionCalculationTests {
     #expect(out == CGSize(width: 2, height: 2))
   }
 }
+
+// MARK: - Pipeline Metrics Tests
+
+@Suite("Pipeline Metrics")
+struct PipelineMetricsTests {
+
+  // MARK: StageMetrics computed properties
+
+  @Test("StageMetrics fps and average duration with recorded data")
+  func stageMetricsComputedProperties() {
+    let stage = StageMetrics(
+      name: "Test stage",
+      framesProcessed: 100,
+      totalDuration: .seconds(2)
+    )
+    #expect(stage.framesPerSecond == 50.0)
+    #expect(stage.averageDuration == .milliseconds(20))
+  }
+
+  @Test("StageMetrics returns zero for no frames")
+  func stageMetricsZeroFrames() {
+    let stage = StageMetrics(
+      name: "Empty",
+      framesProcessed: 0,
+      totalDuration: .zero
+    )
+    #expect(stage.framesPerSecond == 0)
+    #expect(stage.averageDuration == .zero)
+  }
+
+  // MARK: PipelineMetrics computed properties
+
+  @Test("PipelineMetrics fps from frames and elapsed time")
+  func pipelineMetricsFPS() {
+    let metrics = PipelineMetrics(
+      stages: [],
+      framesProcessed: 300,
+      framesEmitted: 300,
+      elapsed: .seconds(10)
+    )
+    #expect(metrics.framesPerSecond == 30.0)
+  }
+
+  @Test("PipelineMetrics returns zero fps before any frames")
+  func pipelineMetricsZeroBeforeStart() {
+    let metrics = PipelineMetrics(
+      stages: [],
+      framesProcessed: 0,
+      framesEmitted: 0,
+      elapsed: .zero
+    )
+    #expect(metrics.framesPerSecond == 0)
+  }
+
+  // MARK: PipelineMetricsCollector
+
+  @Test("Collector registers stages and records data correctly")
+  func collectorBasicRecording() {
+    let collector = PipelineMetricsCollector()
+    let idx0 = collector.addStage(name: "Scale")
+    let idx1 = collector.addStage(name: "Denoise")
+
+    collector.record(stageIndex: idx0, duration: .milliseconds(10))
+    collector.record(stageIndex: idx0, duration: .milliseconds(12))
+    collector.record(stageIndex: idx1, duration: .milliseconds(5))
+    collector.recordChainCompletion(outputCount: 1)
+    collector.recordChainCompletion(outputCount: 1)
+
+    let snapshot = collector.snapshot()
+    #expect(snapshot.stages.count == 2)
+    #expect(snapshot.stages[0].name == "Scale")
+    #expect(snapshot.stages[0].framesProcessed == 2)
+    #expect(snapshot.stages[1].name == "Denoise")
+    #expect(snapshot.stages[1].framesProcessed == 1)
+    #expect(snapshot.framesProcessed == 2)
+    #expect(snapshot.framesEmitted == 2)
+    #expect(snapshot.elapsed > .zero)
+  }
+
+  @Test("Collector snapshot is empty before any recording")
+  func collectorEmptySnapshot() {
+    let collector = PipelineMetricsCollector()
+    _ = collector.addStage(name: "Unused")
+
+    let snapshot = collector.snapshot()
+    #expect(snapshot.stages.count == 1)
+    #expect(snapshot.stages[0].framesProcessed == 0)
+    #expect(snapshot.framesProcessed == 0)
+    #expect(snapshot.framesEmitted == 0)
+    #expect(snapshot.elapsed == .zero)
+  }
+
+  @Test("Collector accumulates durations")
+  func collectorDurationAccumulation() {
+    let collector = PipelineMetricsCollector()
+    let idx = collector.addStage(name: "Scale")
+
+    let d1 = Duration.milliseconds(10)
+    let d2 = Duration.milliseconds(20)
+    collector.record(stageIndex: idx, duration: d1)
+    collector.record(stageIndex: idx, duration: d2)
+
+    let snapshot = collector.snapshot()
+    #expect(snapshot.stages[0].totalDuration == d1 + d2)
+  }
+
+  @Test("Collector tracks frame emission count for 1:N stages")
+  func collectorFrameEmission() {
+    let collector = PipelineMetricsCollector()
+    _ = collector.addStage(name: "FRC")
+
+    // Simulate: 3 source frames, first emits 0, second emits 3, third emits 2.
+    collector.recordChainCompletion(outputCount: 0)
+    collector.recordChainCompletion(outputCount: 3)
+    collector.recordChainCompletion(outputCount: 2)
+
+    let snapshot = collector.snapshot()
+    #expect(snapshot.framesProcessed == 3)
+    #expect(snapshot.framesEmitted == 5)
+  }
+
+  // MARK: FrameProcessorChain metrics integration
+
+  @Test("Chain populates metrics collector during processing")
+  func chainPopulatesMetrics() async throws {
+    let inputSize = CGSize(width: 320, height: 240)
+    let outputSize = CGSize(width: 640, height: 480)
+
+    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
+      throw TestSkipError("Metal device not available")
+    }
+
+    let collector = PipelineMetricsCollector()
+    let chain = try FrameProcessorChain(
+      inputSize: inputSize, outputSize: outputSize,
+      stages: [upscaler],
+      metricsCollector: collector
+    )
+
+    let inputBuffer = try makeTestPixelBuffer(size: inputSize)
+    _ = try await chain.process(inputBuffer, presentationTimeStamp: .zero, outputPool: nil)
+
+    let snapshot = collector.snapshot()
+    #expect(snapshot.stages.count == 1)
+    #expect(snapshot.stages[0].name == "MetalFX spatial")
+    #expect(snapshot.stages[0].framesProcessed == 1)
+    #expect(snapshot.stages[0].totalDuration > .zero)
+    #expect(snapshot.framesProcessed == 1)
+    #expect(snapshot.framesEmitted == 1)
+  }
+
+  @Test("Chain without collector works normally")
+  func chainWithoutCollector() async throws {
+    let inputSize = CGSize(width: 320, height: 240)
+    let outputSize = CGSize(width: 640, height: 480)
+
+    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
+      throw TestSkipError("Metal device not available")
+    }
+
+    let chain = try FrameProcessorChain(
+      inputSize: inputSize, outputSize: outputSize,
+      stages: [upscaler]
+    )
+
+    let inputBuffer = try makeTestPixelBuffer(size: inputSize)
+    let outputs = try await chain.process(inputBuffer, presentationTimeStamp: .zero, outputPool: nil)
+    #expect(outputs.count == 1)
+  }
+
+  @Test("Identity chain records no stage metrics")
+  func identityChainMetrics() async throws {
+    let size = CGSize(width: 320, height: 240)
+    let collector = PipelineMetricsCollector()
+    let chain = try FrameProcessorChain(
+      inputSize: size, outputSize: size, stages: [],
+      metricsCollector: collector
+    )
+
+    let inputBuffer = try makeTestPixelBuffer(size: size)
+    _ = try await chain.process(inputBuffer, presentationTimeStamp: .zero, outputPool: nil)
+
+    let snapshot = collector.snapshot()
+    #expect(snapshot.stages.isEmpty)
+    #expect(snapshot.framesProcessed == 1)
+  }
+
+  // MARK: displayName
+
+  @Test("Upscaler has expected display name")
+  func upscalerDisplayName() throws {
+    let u = Upscaler(
+      inputSize: CGSize(width: 320, height: 240),
+      outputSize: CGSize(width: 640, height: 480)
+    )
+    guard let upscaler = u else {
+      throw TestSkipError("Metal device not available")
+    }
+    #expect(upscaler.displayName == "MetalFX spatial")
+  }
+
+  // MARK: Duration.timeInterval
+
+  @Test("Duration.timeInterval converts correctly")
+  func durationTimeInterval() {
+    let d = Duration.seconds(3) + .milliseconds(500)
+    let interval = d.timeInterval
+    // 3.5 seconds — allow tiny floating-point tolerance.
+    #expect(abs(interval - 3.5) < 1e-9)
+  }
+}

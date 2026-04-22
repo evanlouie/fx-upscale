@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Upscaling
 import os
 
 // MARK: - ANSI
@@ -61,6 +62,71 @@ enum Terminal {
     fputs("\r" + ANSI.clearToEndOfLine + ANSI.showCursor + "\n", Darwin.stdout)
     fflush(Darwin.stdout)
   }
+
+  // MARK: Metrics Summary
+
+  /// Prints a per-stage timing breakdown table after export completes.
+  ///
+  /// Skips output when there are no stages (identity/re-encode-only chain) or when not attached
+  /// to a TTY (piped/CI output stays machine-parseable).
+  static func metricsSummary(_ metrics: PipelineMetrics) {
+    guard isTTY, !metrics.stages.isEmpty, metrics.framesProcessed > 0 else { return }
+
+    // Column widths — sized so realistic values align without excess padding.
+    let nameWidth = max(21, metrics.stages.map(\.name.count).max() ?? 0)
+    let framesWidth = 8
+    let avgWidth = 10
+    let totalWidth = 11
+    let fpsWidth = 9
+
+    let header =
+      "  " + "Stage".padding(toLength: nameWidth, withPad: " ", startingAt: 0)
+      + "Frames".leftPad(framesWidth)
+      + "Avg (ms)".leftPad(avgWidth)
+      + "Total (s)".leftPad(totalWidth)
+      + "FPS".leftPad(fpsWidth)
+    let divider =
+      "  " + String(repeating: "\u{2500}", count: nameWidth)
+      + "  " + String(repeating: "\u{2500}", count: framesWidth)
+      + "  " + String(repeating: "\u{2500}", count: avgWidth)
+      + "  " + String(repeating: "\u{2500}", count: totalWidth)
+      + "  " + String(repeating: "\u{2500}", count: fpsWidth)
+
+    print(ANSI.style(header, ANSI.gray))
+    print(ANSI.style(divider, ANSI.gray))
+
+    for stage in metrics.stages {
+      let avgMs = stage.averageDuration.timeInterval * 1000.0
+      let totalS = stage.totalDuration.timeInterval
+      let row =
+        "  " + stage.name.padding(toLength: nameWidth, withPad: " ", startingAt: 0)
+        + String(stage.framesProcessed).leftPad(framesWidth)
+        + String(format: "%.2f", avgMs).leftPad(avgWidth)
+        + String(format: "%.2f", totalS).leftPad(totalWidth)
+        + String(format: "%.1f", stage.framesPerSecond).leftPad(fpsWidth)
+      print(row)
+    }
+
+    print(ANSI.style(divider, ANSI.gray))
+
+    let pipelineRow =
+      "  " + "Pipeline".padding(toLength: nameWidth, withPad: " ", startingAt: 0)
+      + String(metrics.framesProcessed).leftPad(framesWidth)
+      + "".leftPad(avgWidth)
+      + String(format: "%.2f", metrics.elapsed.timeInterval).leftPad(totalWidth)
+      + String(format: "%.1f", metrics.framesPerSecond).leftPad(fpsWidth)
+    print(ANSI.style(pipelineRow, ANSI.bold))
+  }
+}
+
+// MARK: - String + leftPad
+
+extension String {
+  /// Right-aligns this string within a field of `width` characters plus a two-space left gutter.
+  fileprivate func leftPad(_ width: Int) -> String {
+    let padded = count < width ? String(repeating: " ", count: width - count) + self : self
+    return "  " + padded
+  }
 }
 
 // MARK: - SignalHandlers
@@ -118,7 +184,7 @@ enum SignalHandlers {
 enum ProgressBar {
   // MARK: Public
 
-  static func start(progress: Progress) {
+  static func start(progress: Progress, metricsCollector: PipelineMetricsCollector? = nil) {
     stop()
     // No animated redraw when not attached to a TTY — signal handling is already installed by
     // the caller, so Ctrl-C still cleans up output files.
@@ -126,7 +192,7 @@ enum ProgressBar {
     print(ANSI.hideCursor, terminator: "")
     task = Task {
       while !Task.isCancelled {
-        render(progress: progress)
+        render(progress: progress, metricsCollector: metricsCollector)
         try? await Task.sleep(for: frameInterval)
       }
     }
@@ -159,10 +225,32 @@ enum ProgressBar {
   /// CLI invokes from its single `async run()` flow.
   private nonisolated(unsafe) static var task: Task<Void, Never>?
 
-  private static func render(progress: Progress) {
+  private static func render(
+    progress: Progress,
+    metricsCollector: PipelineMetricsCollector?
+  ) {
+    // Build the fps suffix first so we can account for its visible width when sizing the bar.
+    let fpsSuffix: String
+    let fpsSuffixVisibleWidth: Int
+    if let metricsCollector {
+      let snapshot = metricsCollector.snapshot()
+      if snapshot.framesProcessed > 0, snapshot.framesPerSecond > 0 {
+        let formatted = String(format: "%.1f fps", snapshot.framesPerSecond)
+        fpsSuffix = ANSI.style("  " + formatted, ANSI.gray)
+        fpsSuffixVisibleWidth = 2 + formatted.count  // "  " + "123.4 fps"
+      } else {
+        fpsSuffix = ""
+        fpsSuffixVisibleWidth = 0
+      }
+    } else {
+      fpsSuffix = ""
+      fpsSuffixVisibleWidth = 0
+    }
+
     let cols = max(
       minBarColumns,
       (Terminal.columns ?? defaultColumns) - bracketsWidth - percentFieldWidth
+        - fpsSuffixVisibleWidth
     )
     let fraction = max(0, min(1, progress.fractionCompleted))
     let scaled = fraction * Double(cols)
@@ -182,6 +270,7 @@ enum ProgressBar {
     components.append(closeBracket)
     let percent = fraction.formatted(.percent.precision(.fractionLength(2)))
     components.append(ANSI.style(" " + percent, ANSI.gray))
+    components.append(fpsSuffix)
 
     print("\r" + ANSI.clearToEndOfLine + components.joined(), terminator: "")
     fflush(Darwin.stdout)

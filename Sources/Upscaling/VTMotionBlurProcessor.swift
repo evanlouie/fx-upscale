@@ -57,6 +57,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
 
   public nonisolated var inputSize: CGSize { frameSize }
   public nonisolated var outputSize: CGSize { frameSize }
+  public nonisolated let displayName = "Motion blur"
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 

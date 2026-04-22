@@ -25,14 +25,32 @@ public actor FrameProcessorChain: FrameProcessorBackend {
   /// stage → chain output — agrees on size. For an empty chain, this collapses to the
   /// single check `inputSize == outputSize`. Throws on any mismatch so callers catch the
   /// error at preflight time, before any file I/O.
+  ///
+  /// - Parameters:
+  ///   - inputSize: Expected input dimensions for the first stage.
+  ///   - outputSize: Expected output dimensions from the last stage.
+  ///   - stages: Ordered list of backends that frames pass through.
+  ///   - metricsCollector: Optional collector for per-stage timing. When provided, the chain
+  ///     registers each stage's ``FrameProcessorBackend/displayName`` and records wall-clock
+  ///     durations on every `process(...)` and `finish(...)` call. Pass `nil` to opt out.
   public init(
     inputSize: CGSize,
     outputSize: CGSize,
-    stages: [any FrameProcessorBackend]
+    stages: [any FrameProcessorBackend],
+    metricsCollector: PipelineMetricsCollector? = nil
   ) throws {
     self.inputSize = inputSize
     self.outputSize = outputSize
     self.stages = stages
+    self.metricsCollector = metricsCollector
+
+    if let metricsCollector {
+      self.stageMetricsIndices = stages.map { stage in
+        metricsCollector.addStage(name: stage.displayName)
+      }
+    } else {
+      self.stageMetricsIndices = nil
+    }
 
     var cursor = inputSize
     for (index, stage) in stages.enumerated() {
@@ -82,6 +100,9 @@ public actor FrameProcessorChain: FrameProcessorBackend {
         (stageIndex == lastIndex) ? terminalPool : nil
       var nextFrames: [FrameProcessorOutput] = []
       nextFrames.reserveCapacity(currentFrames.count)
+
+      let stageStart = ContinuousClock.now
+
       for frame in currentFrames {
         nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
         let outputs = try await stage.process(
@@ -91,7 +112,17 @@ public actor FrameProcessorChain: FrameProcessorBackend {
         )
         nextFrames.append(contentsOf: outputs)
       }
+
+      if let metricsCollector, let indices = stageMetricsIndices {
+        let elapsed = ContinuousClock.now - stageStart
+        metricsCollector.record(stageIndex: indices[stageIndex], duration: elapsed)
+      }
+
       currentFrames = nextFrames
+    }
+
+    if let metricsCollector {
+      metricsCollector.recordChainCompletion(outputCount: currentFrames.count)
     }
 
     return currentFrames
@@ -113,6 +144,9 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     for (stageIndex, stage) in stages.enumerated() {
       nonisolated(unsafe) let poolForStage: CVPixelBufferPool? =
         (stageIndex == lastIndex) ? terminalPool : nil
+
+      let stageStart = ContinuousClock.now
+
       var nextFrames: [FrameProcessorOutput] = []
       for frame in running {
         nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
@@ -125,14 +159,29 @@ public actor FrameProcessorChain: FrameProcessorBackend {
       }
       let flushed = try await stage.finish(outputPool: poolForStage)
       nextFrames.append(contentsOf: flushed)
+
+      if let metricsCollector, let indices = stageMetricsIndices {
+        let elapsed = ContinuousClock.now - stageStart
+        metricsCollector.record(stageIndex: indices[stageIndex], duration: elapsed)
+      }
+
       running = nextFrames
     }
+
+    if let metricsCollector, !running.isEmpty {
+      metricsCollector.recordChainCompletion(outputCount: running.count)
+    }
+
     return running
   }
 
   // MARK: Private
 
   private nonisolated let stages: [any FrameProcessorBackend]
+  private nonisolated let metricsCollector: PipelineMetricsCollector?
+  /// Maps each stage's position in `stages` to its registered index in `metricsCollector`.
+  /// `nil` when no collector is attached.
+  private nonisolated let stageMetricsIndices: [Int]?
 }
 
 // MARK: FrameProcessorChain.Error

@@ -39,6 +39,13 @@ public protocol FrameProcessorBackend: Sendable {
   var inputSize: CGSize { get }
   var outputSize: CGSize { get }
 
+  /// Human-readable name for this processing stage, used in metrics reporting.
+  ///
+  /// The default implementation returns the type's unqualified Swift name, which is fine for
+  /// ad-hoc debugging but should be overridden by concrete backends with a user-facing label
+  /// (e.g. "MetalFX spatial", "Denoise").
+  var displayName: String { get }
+
   /// Whether each independent stream (e.g. each eye of a stereo pair) needs its own
   /// instance of this backend. Stateful backends that accumulate prior-frame references
   /// must return `true` — sharing one instance across streams would let one stream's
@@ -79,6 +86,8 @@ public protocol FrameProcessorBackend: Sendable {
 }
 
 extension FrameProcessorBackend {
+  public var displayName: String { String(describing: type(of: self)) }
+
   public var requiresInstancePerStream: Bool { false }
 
   public func finish(
