@@ -88,55 +88,72 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    let output = try resolveProcessorOutputBuffer(
-      input: pixelBuffer,
-      expectedInputSize: inputSize,
-      expectedOutputSize: outputSize,
-      externalPool: externalPool,
-      internalPool: core.pixelBufferPool,
-      providedOutput: nil,
-      expectedPixelFormat: pixelFormat
-    )
-
-    let vtPts = core.nextPts(frameIndex: &frameIndex)
-    let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
-    let destinationFrame = try core.makeFrame(output, pts: vtPts)
-
-    guard
-      let parameters = VTSuperResolutionScalerParameters(
-        sourceFrame: sourceFrame,
-        previousFrame: previousSourceFrame,
-        previousOutputFrame: previousOutputFrame,
-        opticalFlow: nil,
-        submissionMode: .sequential,
-        destinationFrame: destinationFrame
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      let output = try resolveProcessorOutputBuffer(
+        input: pixelBuffer,
+        expectedInputSize: inputSize,
+        expectedOutputSize: outputSize,
+        externalPool: externalPool,
+        internalPool: core.pixelBufferPool,
+        providedOutput: nil,
+        expectedPixelFormat: pixelFormat
       )
-    else {
-      throw VTBackendError.vtFrameConstructionFailed(backend: .superResolution)
+
+      let vtPts = core.nextPts(frameIndex: &frameIndex)
+      let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
+      let destinationFrame = try core.makeFrame(output, pts: vtPts)
+
+      guard
+        let parameters = VTSuperResolutionScalerParameters(
+          sourceFrame: sourceFrame,
+          previousFrame: previousSourceFrame,
+          previousOutputFrame: previousOutputFrame,
+          opticalFlow: nil,
+          submissionMode: .sequential,
+          destinationFrame: destinationFrame
+        )
+      else {
+        throw VTBackendError.vtFrameConstructionFailed(backend: .superResolution)
+      }
+
+      try await core.run(parameters: SendableBox(parameters))
+
+      // Stash this call's source/destination wrappers as the "previous" pair for the next
+      // submission. `VTFrameProcessorFrame` retains the underlying `CVPixelBuffer`, so caching
+      // the wrappers avoids re-allocating two wrappers per frame — and also retains the output
+      // buffer past the return. The caller consumes `output` via the asset writer (pixel reads);
+      // the next call passes it to VT as a temporal reference (also pixel reads). Both are
+      // reads of a finalized buffer — safe despite the compiler not being able to prove it.
+      previousSourceFrame = sourceFrame
+      previousOutputFrame = destinationFrame
+
+      let result = [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
+      await processingGate.release()
+      return result
+    } catch {
+      await processingGate.release()
+      throw error
     }
-
-    try await core.run(parameters: SendableBox(parameters))
-
-    // Stash this call's source/destination wrappers as the "previous" pair for the next
-    // submission. `VTFrameProcessorFrame` retains the underlying `CVPixelBuffer`, so caching
-    // the wrappers avoids re-allocating two wrappers per frame — and also retains the output
-    // buffer past the return. The caller consumes `output` via the asset writer (pixel reads);
-    // the next call passes it to VT as a temporal reference (also pixel reads). Both are
-    // reads of a finalized buffer — safe despite the compiler not being able to prove it.
-    previousSourceFrame = sourceFrame
-    previousOutputFrame = destinationFrame
-
-    return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
   }
 
   public func finish(
     outputPool _: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    // Release retained temporal references so output buffers aren't kept alive past the
-    // end of the stream. This backend doesn't look ahead, so nothing is flushed.
-    previousSourceFrame = nil
-    previousOutputFrame = nil
-    return []
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      // Release retained temporal references so output buffers aren't kept alive past the
+      // end of the stream. This backend doesn't look ahead, so nothing is flushed.
+      previousSourceFrame = nil
+      previousOutputFrame = nil
+      await processingGate.release()
+      return []
+    } catch {
+      await processingGate.release()
+      throw error
+    }
   }
 
   // MARK: Private
@@ -149,6 +166,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
   private static let ratioEpsilon: Double = 1e-3
 
   private let core: VTStatefulBackendCore
+  private let processingGate = NonReentrantAsyncGate()
 
   private var frameIndex: UInt64 = 0
   private var previousSourceFrame: VTFrameProcessorFrame?

@@ -56,57 +56,78 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    let vtPts = core.nextPts(frameIndex: &frameIndex)
-    let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      try validateProcessorInput(pixelBuffer, expectedInputSize: frameSize)
 
-    // The API requires at least one reference frame (previous or next). This backend doesn't
-    // look ahead, so the first frame has neither — pass it through unchanged and apply the
-    // filter from the second frame onward.
-    guard let previousSourceFrame else {
-      self.previousSourceFrame = sourceFrame
-      nonisolated(unsafe) let passthrough = pixelBuffer
-      return [
-        FrameProcessorOutput(pixelBuffer: passthrough, presentationTimeStamp: presentationTimeStamp)
-      ]
-    }
+      let vtPts = core.nextPts(frameIndex: &frameIndex)
+      let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
 
-    let output = try resolveProcessorOutputBuffer(
-      input: pixelBuffer,
-      expectedInputSize: frameSize,
-      expectedOutputSize: frameSize,
-      externalPool: externalPool,
-      internalPool: core.pixelBufferPool,
-      providedOutput: nil
-    )
+      // The API requires at least one reference frame (previous or next). This backend doesn't
+      // look ahead, so the first frame has neither — pass it through unchanged and apply the
+      // filter from the second frame onward.
+      guard let previousSourceFrame else {
+        self.previousSourceFrame = sourceFrame
+        nonisolated(unsafe) let passthrough = pixelBuffer
+        let result = [
+          FrameProcessorOutput(pixelBuffer: passthrough, presentationTimeStamp: presentationTimeStamp)
+        ]
+        await processingGate.release()
+        return result
+      }
 
-    let destinationFrame = try core.makeFrame(output, pts: vtPts)
-    guard
-      let parameters = VTTemporalNoiseFilterParameters(
-        sourceFrame: sourceFrame,
-        nextFrames: [],
-        previousFrames: [previousSourceFrame],
-        destinationFrame: destinationFrame,
-        filterStrength: filterStrength,
-        hasDiscontinuity: false
+      let output = try resolveProcessorOutputBuffer(
+        input: pixelBuffer,
+        expectedInputSize: frameSize,
+        expectedOutputSize: frameSize,
+        externalPool: externalPool,
+        internalPool: core.pixelBufferPool,
+        providedOutput: nil
       )
-    else {
-      throw VTBackendError.vtFrameConstructionFailed(backend: .temporalNoise)
+
+      let destinationFrame = try core.makeFrame(output, pts: vtPts)
+      guard
+        let parameters = VTTemporalNoiseFilterParameters(
+          sourceFrame: sourceFrame,
+          nextFrames: [],
+          previousFrames: [previousSourceFrame],
+          destinationFrame: destinationFrame,
+          filterStrength: filterStrength,
+          hasDiscontinuity: false
+        )
+      else {
+        throw VTBackendError.vtFrameConstructionFailed(backend: .temporalNoise)
+      }
+
+      try await core.run(parameters: SendableBox(parameters))
+
+      self.previousSourceFrame = sourceFrame
+
+      let result = [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
+      await processingGate.release()
+      return result
+    } catch {
+      await processingGate.release()
+      throw error
     }
-
-    try await core.run(parameters: SendableBox(parameters))
-
-    self.previousSourceFrame = sourceFrame
-
-    return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
   }
 
   public func finish(
     outputPool _: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    // Release the retained previous source wrapper so its buffer isn't kept alive past the
-    // end of the stream. This backend doesn't look ahead, so nothing is flushed.
-    previousSourceFrame = nil
-    return []
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      // Release the retained previous source wrapper so its buffer isn't kept alive past the
+      // end of the stream. This backend doesn't look ahead, so nothing is flushed.
+      previousSourceFrame = nil
+      await processingGate.release()
+      return []
+    } catch {
+      await processingGate.release()
+      throw error
+    }
   }
 
   // MARK: Private
@@ -125,6 +146,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
   private let frameSize: CGSize
   private let filterStrength: Float
   private let core: VTStatefulBackendCore
+  private let processingGate = NonReentrantAsyncGate()
 
   private var frameIndex: UInt64 = 0
   private var previousSourceFrame: VTFrameProcessorFrame?

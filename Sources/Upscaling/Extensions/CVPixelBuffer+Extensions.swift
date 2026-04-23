@@ -102,14 +102,8 @@ func resolveProcessorOutputBuffer(
   providedOutput: CVPixelBuffer?,
   expectedPixelFormat: OSType = kCVPixelFormatType_32BGRA
 ) throws -> CVPixelBuffer {
-  guard CVPixelBufferGetPixelFormatType(pixelBuffer) == expectedPixelFormat else {
-    throw PixelBufferIOError.unsupportedPixelFormat
-  }
-  guard pixelBuffer.width == Int(inputSize.width),
-    pixelBuffer.height == Int(inputSize.height)
-  else {
-    throw PixelBufferIOError.inputSizeMismatch
-  }
+  try validateProcessorInput(
+    pixelBuffer, expectedInputSize: inputSize, expectedPixelFormat: expectedPixelFormat)
 
   if let providedOutput {
     guard providedOutput.width == Int(outputSize.width),
@@ -126,4 +120,19 @@ func resolveProcessorOutputBuffer(
     throw PixelBufferIOError.couldNotCreatePixelBuffer
   }
   return buffer
+}
+
+func validateProcessorInput(
+  _ pixelBuffer: CVPixelBuffer,
+  expectedInputSize inputSize: CGSize,
+  expectedPixelFormat: OSType = kCVPixelFormatType_32BGRA
+) throws {
+  guard CVPixelBufferGetPixelFormatType(pixelBuffer) == expectedPixelFormat else {
+    throw PixelBufferIOError.unsupportedPixelFormat
+  }
+  guard pixelBuffer.width == Int(inputSize.width),
+    pixelBuffer.height == Int(inputSize.height)
+  else {
+    throw PixelBufferIOError.inputSizeMismatch
+  }
 }

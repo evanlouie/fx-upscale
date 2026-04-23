@@ -85,9 +85,9 @@ import Upscaling
 
   @Option(
     name: .shortAndLong,
-    help: "Output codec (\(Codec.helpList))"
+    help: "Output codec (\(Codec.helpList); default: preserve source codec)"
   )
-  var codec: Codec = .h264
+  var codec: Codec?
 
   @Option(
     name: .shortAndLong,
@@ -251,14 +251,27 @@ import Upscaling
 
     let effectiveScaler: UpscalerKind = scaler ?? .spatial
 
-    let scalerOutputSize: CGSize =
-      if let scale {
-        CGSize(
-          width: evenCeil(Int(inputSize.width) * scale),
-          height: evenCeil(Int(inputSize.height) * scale))
-      } else {
-        inputSize
+    let inputWidth = Int(inputSize.width)
+    let inputHeight = Int(inputSize.height)
+    let scalerOutputSize: CGSize
+    if let scale {
+      let scaledWidth = inputWidth.multipliedReportingOverflow(by: scale)
+      let scaledHeight = inputHeight.multipliedReportingOverflow(by: scale)
+      guard !scaledWidth.overflow, !scaledHeight.overflow,
+        scaledWidth.partialValue < Int.max,
+        scaledHeight.partialValue < Int.max
+      else {
+        throw ValidationError(
+          "--scale \(scale) overflows the supported dimension range for source "
+            + "\(inputWidth)x\(inputHeight). Maximum supported width/height: "
+            + "\(UpscalingExportSession.maxOutputSize).")
       }
+      scalerOutputSize = CGSize(
+        width: evenCeil(scaledWidth.partialValue),
+        height: evenCeil(scaledHeight.partialValue))
+    } else {
+      scalerOutputSize = inputSize
+    }
 
     // Reject requests that would silently clamp inside `calculateFinalOutputDimensions`:
     // without `--scale`, a request > source is an implicit-upscale attempt; with `--scale`, a
@@ -368,13 +381,16 @@ import Upscaling
       }
     }
 
-    let outputCodec: AVVideoCodecType = codec.avCodec
+    let outputCodec: AVVideoCodecType? = codec?.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
 
-    if formatDescription?.isHDR == true, codec == .h264 {
-      throw ValidationError(
-        "HDR sources require `--codec hevc` to preserve HDR metadata; H.264 cannot carry "
-          + "it cleanly. Omit `--codec` to preserve the source codec, or pass `--codec hevc`.")
+    if formatDescription?.isHDR == true {
+      let effectiveOutputCodec = outputCodec ?? formatDescription?.videoCodecType ?? .hevc
+      guard effectiveOutputCodec != .h264 else {
+        throw ValidationError(
+          "HDR sources require HEVC output to preserve HDR metadata; H.264 cannot carry "
+            + "it cleanly. Pass `--codec hevc`, or omit `--codec` when the source is already HEVC.")
+      }
     }
     if formatDescription?.hasDolbyVision == true {
       Terminal.warning(
@@ -399,21 +415,28 @@ import Upscaling
     // First sRGB-only stage in the pipeline, if any. Derived from the CLI flags rather than
     // by inspecting a constructed chain so the session can consult it before any ML model
     // downloads. A non-nil value means the chain can't accept HDR / 10-bit input.
-    let srgbOnlyStageName: String? = {
-      if needsDownsample { return CILanczosDownsampler.displayName }
+    let srgbRejectingStageName: String? = {
       if denoise != nil { return VTTemporalNoiseProcessor.displayName }
-      if motionBlur != nil { return VTMotionBlurProcessor.displayName }
-      if fps != nil { return VTFrameRateConverter.displayName }
       if wantsScaler, effectiveScaler == .spatial { return Upscaler.displayName }
+      if fps != nil { return VTFrameRateConverter.displayName }
+      if motionBlur != nil { return VTMotionBlurProcessor.displayName }
+      if needsDownsample { return CILanczosDownsampler.displayName }
       return nil
     }()
-    let chainIsHDRCapable =
-      wantsScaler && effectiveScaler == .superResolution && srgbOnlyStageName == nil
+    let sourcePrefers10Bit =
+      formatDescription?.isHDR == true
+      || (formatDescription?.bitsPerComponent ?? 8) >= 10
+    let canUseHDRSuperResolution =
+      wantsScaler && effectiveScaler == .superResolution && srgbRejectingStageName == nil
+    let pipelinePixelFormat: OSType =
+      canUseHDRSuperResolution && sourcePrefers10Bit
+        ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        : kCVPixelFormatType_32BGRA
 
     let chainFactory: UpscalingExportSession.ChainFactory = {
       [
         effectiveScaler, wantsScaler, denoise, fps, motionBlur,
-        scalerOutputSize, finalOutputSize, needsDownsample, chainIsHDRCapable,
+        scalerOutputSize, finalOutputSize, needsDownsample, pipelinePixelFormat,
         metricsCollector
       ] inputSize in
       var stages: [any FrameProcessorBackend] = []
@@ -422,11 +445,11 @@ import Upscaling
           try await VTTemporalNoiseProcessor(frameSize: inputSize, strength: denoise))
       }
       if wantsScaler {
-        if effectiveScaler == .superResolution, chainIsHDRCapable {
+        if effectiveScaler == .superResolution {
           stages.append(
             try await VTSuperResolutionUpscaler(
               inputSize: inputSize, outputSize: scalerOutputSize,
-              pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange))
+              pixelFormat: pipelinePixelFormat))
         } else {
           stages.append(
             try await effectiveScaler.makeBackend(
@@ -452,17 +475,14 @@ import Upscaling
     }
 
     let chainCapabilities: UpscalingExportSession.ChainCapabilities =
-      chainIsHDRCapable
+      canUseHDRSuperResolution
         ? UpscalingExportSession.ChainCapabilities(
-            supportedSourceInputFormats: [
-              kCVPixelFormatType_32BGRA,
-              kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-            ],
-            producedOutputFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+            supportedSourceInputFormats: [pipelinePixelFormat],
+            producedOutputFormat: pipelinePixelFormat)
         : UpscalingExportSession.ChainCapabilities(
             supportedSourceInputFormats: [kCVPixelFormatType_32BGRA],
             producedOutputFormat: kCVPixelFormatType_32BGRA,
-            srgbRejectingStageName: srgbOnlyStageName)
+            srgbRejectingStageName: srgbRejectingStageName)
 
     let exportSession = UpscalingExportSession(
       asset: asset,
@@ -480,6 +500,10 @@ import Upscaling
     let denoiseInfo = denoise.map { ", denoise: \($0)" } ?? ""
     let fpsInfo = fps.map { ", fps: \(String(format: "%g", $0))" } ?? ""
     let motionBlurInfo = motionBlur.map { ", motion-blur: \($0)" } ?? ""
+    let codecInfo =
+      outputCodec?.rawValue
+      ?? formatDescription?.videoCodecType?.rawValue.appending(" (source)")
+      ?? "source/default"
     let source = "\(Int(inputSize.width))x\(Int(inputSize.height))"
     let scalerOut = "\(Int(scalerOutputSize.width))x\(Int(scalerOutputSize.height))"
     let final = "\(Int(finalOutputSize.width))x\(Int(finalOutputSize.height))"
@@ -487,18 +511,18 @@ import Upscaling
     switch (wantsScaler, needsDownsample) {
     case (false, false):
       summary =
-        "Processing at \(source), codec: \(outputCodec.rawValue)\(qualityInfo)"
+        "Processing at \(source), codec: \(codecInfo)\(qualityInfo)"
     case (true, false):
       summary =
         "Upscaling from \(source) to \(scalerOut) using \(effectiveScaler.displayName), "
-        + "codec: \(outputCodec.rawValue)\(qualityInfo)"
+        + "codec: \(codecInfo)\(qualityInfo)"
     case (false, true):
       summary =
-        "Downsampling from \(source) to \(final), codec: \(outputCodec.rawValue)\(qualityInfo)"
+        "Downsampling from \(source) to \(final), codec: \(codecInfo)\(qualityInfo)"
     case (true, true):
       summary =
         "Upscaling from \(source) to \(scalerOut) using \(effectiveScaler.displayName), "
-        + "then downsampling to \(final), codec: \(outputCodec.rawValue)\(qualityInfo)"
+        + "then downsampling to \(final), codec: \(codecInfo)\(qualityInfo)"
     }
     Terminal.info(summary + denoiseInfo + fpsInfo + motionBlurInfo)
 
@@ -523,7 +547,7 @@ import Upscaling
       // interleave with the still-visible bar on a TTY. The deferred `ProgressBar.stop()`
       // above still runs, but `stop()` is idempotent.
       ProgressBar.stop()
-      try? FileManager.default.removeItem(at: outputURL)
+      SignalHandlers.clearCleanup()
       Terminal.error(error.localizedDescription)
       throw ExitCode.failure
     }

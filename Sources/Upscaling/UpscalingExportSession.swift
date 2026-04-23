@@ -475,7 +475,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
   /// Picks the pipeline pixel format: the first format the chain accepts that also
   /// corresponds plausibly to the source's encoded precision. For an HDR or explicitly
   /// 10-bit source with a chain accepting 10-bit YUV, pick 10-bit 420 video-range.
-  /// Otherwise stay on BGRA (the compatibility default).
+  /// Otherwise stay on BGRA when the chain accepts it, or fall back to one of the chain's
+  /// declared formats so the reader output never contradicts the advertised chain contract.
   private static func resolvePipelinePixelFormat(
     formatDescription: CMFormatDescription,
     accepted: Set<OSType>
@@ -487,6 +488,12 @@ public final class UpscalingExportSession: @unchecked Sendable {
       accepted.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
     {
       return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    }
+    if accepted.contains(kCVPixelFormatType_32BGRA) {
+      return kCVPixelFormatType_32BGRA
+    }
+    if let firstAccepted = accepted.sorted().first {
+      return firstAccepted
     }
     return kCVPixelFormatType_32BGRA
   }

@@ -105,15 +105,17 @@ extension FrameProcessorBackend {
   ) async throws -> [FrameProcessorOutput] { [] }
 
   /// 1:1 convenience wrapper for single-frame callers. Returns the first (and only, for
-  /// 1:1 backends) output buffer. Throws if the backend produced zero outputs — that would
-  /// be a backend bug.
+  /// 1:1 backends) output buffer. Throws unless the backend produced exactly one output.
   @discardableResult public func processSingle(
     _ pixelBuffer: sending CVPixelBuffer
   ) async throws -> sending CVPixelBuffer {
     let outputs = try await process(
       pixelBuffer, presentationTimeStamp: .zero, outputPool: nil)
-    guard let first = outputs.first else {
+    guard !outputs.isEmpty else {
       throw FrameProcessorError.noOutputProduced
+    }
+    guard outputs.count == 1, let first = outputs.first else {
+      throw FrameProcessorError.multipleOutputsProduced(outputs.count)
     }
     nonisolated(unsafe) let transferred = first.pixelBuffer
     return transferred
@@ -124,11 +126,14 @@ extension FrameProcessorBackend {
 
 public enum FrameProcessorError: Swift.Error, LocalizedError {
   case noOutputProduced
+  case multipleOutputsProduced(Int)
 
   public var errorDescription: String? {
     switch self {
     case .noOutputProduced:
-      "Frame processor returned no output buffers for an input frame."
+      "Frame processor did not return exactly one output buffer for an input frame."
+    case .multipleOutputsProduced(let count):
+      "Frame processor returned \(count) output buffers for an API that expects exactly one."
     }
   }
 }

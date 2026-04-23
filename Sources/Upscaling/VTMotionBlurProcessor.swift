@@ -55,59 +55,80 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    let vtPts = core.nextPts(frameIndex: &frameIndex)
-    let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      try validateProcessorInput(pixelBuffer, expectedInputSize: frameSize)
 
-    // VT returns -19730 if both previous and next reference frames are missing. This backend
-    // doesn't look ahead, so the first frame has neither — pass it through unchanged and
-    // apply motion blur from the second frame onward.
-    guard let previousSourceFrame else {
-      self.previousSourceFrame = sourceFrame
-      nonisolated(unsafe) let passthrough = pixelBuffer
-      return [
-        FrameProcessorOutput(pixelBuffer: passthrough, presentationTimeStamp: presentationTimeStamp)
-      ]
-    }
+      let vtPts = core.nextPts(frameIndex: &frameIndex)
+      let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
 
-    let output = try resolveProcessorOutputBuffer(
-      input: pixelBuffer,
-      expectedInputSize: frameSize,
-      expectedOutputSize: frameSize,
-      externalPool: externalPool,
-      internalPool: core.pixelBufferPool,
-      providedOutput: nil
-    )
+      // VT returns -19730 if both previous and next reference frames are missing. This backend
+      // doesn't look ahead, so the first frame has neither — pass it through unchanged and
+      // apply motion blur from the second frame onward.
+      guard let previousSourceFrame else {
+        self.previousSourceFrame = sourceFrame
+        nonisolated(unsafe) let passthrough = pixelBuffer
+        let result = [
+          FrameProcessorOutput(pixelBuffer: passthrough, presentationTimeStamp: presentationTimeStamp)
+        ]
+        await processingGate.release()
+        return result
+      }
 
-    let destinationFrame = try core.makeFrame(output, pts: vtPts)
-    guard
-      let parameters = VTMotionBlurParameters(
-        sourceFrame: sourceFrame,
-        nextFrame: nil,
-        previousFrame: previousSourceFrame,
-        nextOpticalFlow: nil,
-        previousOpticalFlow: nil,
-        motionBlurStrength: strength,
-        submissionMode: .sequential,
-        destinationFrame: destinationFrame
+      let output = try resolveProcessorOutputBuffer(
+        input: pixelBuffer,
+        expectedInputSize: frameSize,
+        expectedOutputSize: frameSize,
+        externalPool: externalPool,
+        internalPool: core.pixelBufferPool,
+        providedOutput: nil
       )
-    else {
-      throw VTBackendError.vtFrameConstructionFailed(backend: .motionBlur)
+
+      let destinationFrame = try core.makeFrame(output, pts: vtPts)
+      guard
+        let parameters = VTMotionBlurParameters(
+          sourceFrame: sourceFrame,
+          nextFrame: nil,
+          previousFrame: previousSourceFrame,
+          nextOpticalFlow: nil,
+          previousOpticalFlow: nil,
+          motionBlurStrength: strength,
+          submissionMode: .sequential,
+          destinationFrame: destinationFrame
+        )
+      else {
+        throw VTBackendError.vtFrameConstructionFailed(backend: .motionBlur)
+      }
+
+      try await core.run(parameters: SendableBox(parameters))
+
+      self.previousSourceFrame = sourceFrame
+
+      let result = [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
+      await processingGate.release()
+      return result
+    } catch {
+      await processingGate.release()
+      throw error
     }
-
-    try await core.run(parameters: SendableBox(parameters))
-
-    self.previousSourceFrame = sourceFrame
-
-    return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
   }
 
   public func finish(
     outputPool _: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    // Release the retained previous source wrapper so its buffer isn't kept alive past the
-    // end of the stream. This backend doesn't look ahead, so nothing is flushed.
-    previousSourceFrame = nil
-    return []
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      // Release the retained previous source wrapper so its buffer isn't kept alive past the
+      // end of the stream. This backend doesn't look ahead, so nothing is flushed.
+      previousSourceFrame = nil
+      await processingGate.release()
+      return []
+    } catch {
+      await processingGate.release()
+      throw error
+    }
   }
 
   // MARK: Private
@@ -123,6 +144,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
   private let frameSize: CGSize
   private let strength: Int
   private let core: VTStatefulBackendCore
+  private let processingGate = NonReentrantAsyncGate()
 
   private var frameIndex: UInt64 = 0
   private var previousSourceFrame: VTFrameProcessorFrame?

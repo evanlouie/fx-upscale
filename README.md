@@ -19,7 +19,7 @@ OPTIONS:
   -H, --height <height>   Final encoded height
   -x, --scale <scale>     Uniform integer scale factor for the scaler stage
                           (e.g. 2 for 2×). Independent of --width / --height.
-  -c, --codec <codec>     Output codec: h264 | hevc (default: h264)
+  -c, --codec <codec>     Output codec: h264 | hevc (default: preserve source codec)
   -q, --quality <quality> Encoder quality 1-100 (default: encoder default)
   -k, --keyframe-interval <s>
                           Max seconds between keyframes (default: 1.0)

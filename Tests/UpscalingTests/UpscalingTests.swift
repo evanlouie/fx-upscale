@@ -532,6 +532,39 @@ struct FrameProcessorChainTests {
     }
   }
 
+  @Test("processSingle rejects backends that emit multiple outputs")
+  func processSingleRejectsMultipleOutputs() async throws {
+    struct MultiOutputStage: FrameProcessorBackend {
+      let inputSize: CGSize
+      let outputSize: CGSize
+      let displayName = "Fake multi-output stage"
+
+      func process(
+        _ pixelBuffer: sending CVPixelBuffer,
+        presentationTimeStamp: CMTime,
+        outputPool: sending CVPixelBufferPool?
+      ) async throws -> [FrameProcessorOutput] {
+        nonisolated(unsafe) let first = pixelBuffer
+        nonisolated(unsafe) let second = pixelBuffer
+        return [
+          FrameProcessorOutput(pixelBuffer: first, presentationTimeStamp: presentationTimeStamp),
+          FrameProcessorOutput(
+            pixelBuffer: second,
+            presentationTimeStamp: presentationTimeStamp + CMTime(value: 1, timescale: 30)),
+        ]
+      }
+    }
+
+    let size = CGSize(width: 320, height: 240)
+    let stage = MultiOutputStage(inputSize: size, outputSize: size)
+    let buffer = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let captured = buffer
+
+    await #expect(throws: FrameProcessorError.self) {
+      _ = try await stage.processSingle(captured)
+    }
+  }
+
   @Test("Single-stage chain behaves like the backend")
   func singleStagePassthrough() async throws {
     let inputSize = CGSize(width: 320, height: 240)
@@ -627,6 +660,19 @@ let size = CGSize(width: 640, height: 480)
     #expect(secondOutputs[0].presentationTimeStamp == secondPts)
   }
 
+  @Test("First frame rejects mismatched input size")
+  func firstFrameRejectsMismatchedInputSize() async throws {
+    let size = CGSize(width: 640, height: 480)
+    let processor = try await VTMotionBlurProcessor(frameSize: size, strength: 50)
+    let wrong = try makeTestPixelBuffer(size: CGSize(width: 320, height: 240))
+    nonisolated(unsafe) let captured = wrong
+
+    await #expect(throws: PixelBufferIOError.inputSizeMismatch) {
+      _ = try await processor.process(
+        captured, presentationTimeStamp: .zero, outputPool: nil)
+    }
+  }
+
   @Test("Composes after a spatial upscaler in a chain")
   func composesAfterSpatialUpscaler() async throws {
 let inputSize = CGSize(width: 320, height: 240)
@@ -716,6 +762,19 @@ struct TemporalNoiseProcessorTests {
     #expect(CVPixelBufferGetWidth(secondOutputs[0].pixelBuffer) == Int(size.width))
     #expect(CVPixelBufferGetHeight(secondOutputs[0].pixelBuffer) == Int(size.height))
     #expect(secondOutputs[0].presentationTimeStamp == secondPts)
+  }
+
+  @Test("First frame rejects mismatched input size")
+  func firstFrameRejectsMismatchedInputSize() async throws {
+    let size = CGSize(width: 640, height: 480)
+    let processor = try await VTTemporalNoiseProcessor(frameSize: size, strength: 50)
+    let wrong = try makeTestPixelBuffer(size: CGSize(width: 320, height: 240))
+    nonisolated(unsafe) let captured = wrong
+
+    await #expect(throws: PixelBufferIOError.inputSizeMismatch) {
+      _ = try await processor.process(
+        captured, presentationTimeStamp: .zero, outputPool: nil)
+    }
   }
 
   @Test("Composes before a spatial upscaler in a chain")
@@ -1351,13 +1410,7 @@ struct ExportSessionTests {
       chainFactory: chainFactory,
       chainCapabilities: capabilities)
 
-    do {
-      try await session.export()
-    } catch let error as TestSkipError {
-      throw error
-    } catch {
-      throw TestSkipError("HDR export failed on this device: \(error)")
-    }
+    try await session.export()
 
     // Inspect output format metadata.
     let outAsset = AVURLAsset(url: outputURL)

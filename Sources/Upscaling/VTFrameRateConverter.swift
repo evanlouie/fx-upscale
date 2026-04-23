@@ -105,16 +105,55 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      let result = try await processPermitted(
+        pixelBuffer, presentationTimeStamp: presentationTimeStamp, outputPool: externalPool)
+      await processingGate.release()
+      return result
+    } catch {
+      await processingGate.release()
+      throw error
+    }
+  }
+
+  public func finish(
+    outputPool _: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    guard await processingGate.acquire() else { throw CancellationError() }
+    do {
+      try Task.checkCancellation()
+      // Emit the final buffered source frame at its original PTS. Any target PTS that fall
+      // strictly beyond the last source frame are dropped — we have no "next" frame to
+      // interpolate against, and synthesising pixels past the input would distort duration.
+      guard let buffered = bufferedFrame else {
+        await processingGate.release()
+        return []
+      }
+      bufferedFrame = nil
+      nonisolated(unsafe) let passthroughBuffer = buffered.buffer
+      let result = [
+        FrameProcessorOutput(pixelBuffer: passthroughBuffer, presentationTimeStamp: buffered.pts)
+      ]
+      await processingGate.release()
+      return result
+    } catch {
+      await processingGate.release()
+      throw error
+    }
+  }
+
+  // MARK: Private
+
+  private func processPermitted(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool externalPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
     // Validate and wrap the incoming frame. Each source frame is wrapped exactly once; the
     // same wrapper serves as `nextFrame` on this submission and `sourceFrame` on the next.
-    guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
-      throw PixelBufferIOError.unsupportedPixelFormat
-    }
-    guard pixelBuffer.width == Int(frameSize.width),
-      pixelBuffer.height == Int(frameSize.height)
-    else {
-      throw PixelBufferIOError.inputSizeMismatch
-    }
+    try validateProcessorInput(pixelBuffer, expectedInputSize: frameSize)
 
     let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
     frameIndex += 1
@@ -157,14 +196,14 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     //
     // Upper bound on emitted frames from this pair: one target period per slot plus one for
     // rounding. `nextPTS - prevPTS` is at most one source period at steady rates, so this is
-    // `ceil(target/source) + 1` in the common case. Planning scratch (`interpolationPhases`,
-    // `interpolatedOutputPTSs`, `destinationBuffers`, `destinationFrames`) lives on the actor
-    // and is reused with `keepingCapacity: true` so the steady-state case hits no heap growth.
+    // `ceil(target/source) + 1` in the common case.
     let emittedUpperBound = max(1, Int((intervalSeconds * targetFrameRate).rounded(.up)) + 1)
     var outputs: [FrameProcessorOutput] = []
     outputs.reserveCapacity(emittedUpperBound)
-    interpolationPhases.removeAll(keepingCapacity: true)
-    interpolatedOutputPTSs.removeAll(keepingCapacity: true)
+    var interpolationPhases: [Float] = []
+    interpolationPhases.reserveCapacity(emittedUpperBound)
+    var interpolatedOutputPTSs: [CMTime] = []
+    interpolatedOutputPTSs.reserveCapacity(emittedUpperBound)
     while true {
       let candidatePTS = targetPTS(forIndex: targetOutputIndex)
       if candidatePTS >= nextPTS { break }
@@ -184,8 +223,10 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     if !interpolationPhases.isEmpty {
       // Allocate one destination buffer per interpolated frame and wrap each. VT needs the
       // same count in `interpolationPhase` and `destinationFrames`.
-      destinationBuffers.removeAll(keepingCapacity: true)
-      destinationFrames.removeAll(keepingCapacity: true)
+      var destinationBuffers: [CVPixelBuffer] = []
+      destinationBuffers.reserveCapacity(interpolationPhases.count)
+      var destinationFrames: [VTFrameProcessorFrame] = []
+      destinationFrames.reserveCapacity(interpolationPhases.count)
       for _ in interpolationPhases {
         let dest = try resolveProcessorOutputBuffer(
           input: pixelBuffer,
@@ -236,26 +277,6 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     return outputs
   }
 
-  public func finish(
-    outputPool _: sending CVPixelBufferPool?
-  ) async throws -> [FrameProcessorOutput] {
-    // Emit the final buffered source frame at its original PTS. Any target PTS that fall
-    // strictly beyond the last source frame are dropped — we have no "next" frame to
-    // interpolate against, and synthesising pixels past the input would distort duration.
-    guard let buffered = bufferedFrame else { return [] }
-    bufferedFrame = nil
-    // Release retained planning scratch so the last emitted frame doesn't keep destination
-    // buffers alive past the end of the stream.
-    destinationBuffers.removeAll(keepingCapacity: false)
-    destinationFrames.removeAll(keepingCapacity: false)
-    nonisolated(unsafe) let passthroughBuffer = buffered.buffer
-    return [
-      FrameProcessorOutput(pixelBuffer: passthroughBuffer, presentationTimeStamp: buffered.pts)
-    ]
-  }
-
-  // MARK: Private
-
   /// `kCVPixelBufferPoolMinimumBufferCountKey` value. Each source pair emits up to
   /// `target/source - 1` destination buffers in one shot, plus in-flight consumption
   /// downstream (including one held by the next stage while we start the next frame).
@@ -287,18 +308,12 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   private let targetPeriod: CMTime
   private nonisolated(unsafe) let processor: VTFrameProcessor
   private let pixelBufferPool: CVPixelBufferPool
+  private let processingGate = NonReentrantAsyncGate()
 
   private var frameIndex: UInt64 = 0
   private var bufferedFrame: BufferedFrame?
   private var anchorPTS: CMTime = .zero
   private var targetOutputIndex: Int64 = 0
-
-  // Per-call planning scratch. Stored on the actor and reused with `removeAll(keepingCapacity:)`
-  // so steady-state processing allocates nothing beyond the per-call output array.
-  private var interpolationPhases: [Float] = []
-  private var interpolatedOutputPTSs: [CMTime] = []
-  private var destinationBuffers: [CVPixelBuffer] = []
-  private var destinationFrames: [VTFrameProcessorFrame] = []
 
   /// PTS of the target output at index `k`, computed exactly (for integer rates) or with
   /// sub-nanosecond drift (for non-integer rates).

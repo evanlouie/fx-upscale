@@ -11,14 +11,13 @@ on:
 jobs:
   build:
     name: Build
-    runs-on: macOS-15
-    strategy:
-      matrix:
-        destination:
-          - "generic/platform=iOS"
-          - "platform=macOS"
+    runs-on: macos-26
 
     steps:
       - uses: actions/checkout@v3
-      - name: Build platform ${{ matrix.destination }}
-        run: set -o pipefail && xcodebuild build -scheme Upscaling -destination "${{ matrix.destination }}" | xcbeautify --renderer github-actions
+      - name: Build release
+        run: swift build -c release --product fx-upscale
+      - name: Test
+        run: swift test
+      - name: Build with Xcode
+        run: xcodebuild build -scheme Upscaling -destination "platform=macOS"
