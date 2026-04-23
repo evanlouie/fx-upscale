@@ -60,7 +60,8 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
 
   public nonisolated let inputSize: CGSize
   public nonisolated let outputSize: CGSize
-  public nonisolated let displayName = "Lanczos downsample"
+  public static let displayName = "Lanczos downsample"
+  public nonisolated var displayName: String { Self.displayName }
   public nonisolated var requiresInstancePerStream: Bool { true }
 
   public func process(

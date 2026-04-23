@@ -28,8 +28,10 @@ import Upscaling
       downsample, so their input caps (8192×4320 for --fps and --motion-blur) apply at the \
       scaler output size, not the final encoded size.
 
-      HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected because the 8-bit BGRA \
-      path would silently clip or shift those values.
+      HDR / Rec. 2020 inputs require `--scaler super-resolution` (without `--width` / \
+      `--height`) so the chain can round-trip 10-bit 420 YUV end-to-end. The spatial path \
+      remains 8-bit sRGB-only; other chains that mix sRGB-only stages (Lanczos, denoise, \
+      motion blur, frame-rate conversion) also reject HDR for now.
 
       Two upscaling algorithms are available via --scaler:
         spatial (default)   MTLFXSpatialScaler — fast, arbitrary ratios.
@@ -369,6 +371,18 @@ import Upscaling
     let outputCodec: AVVideoCodecType = codec.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
 
+    if formatDescription?.isHDR == true, codec == .h264 {
+      throw ValidationError(
+        "HDR sources require `--codec hevc` to preserve HDR metadata; H.264 cannot carry "
+          + "it cleanly. Omit `--codec` to preserve the source codec, or pass `--codec hevc`.")
+    }
+    if formatDescription?.hasDolbyVision == true {
+      Terminal.warning(
+        "Source carries Dolby Vision metadata. This tool preserves HDR10 static metadata "
+          + "(ST 2086 + MaxCLL/MaxFALL) but not Dolby Vision RPU side-data — the output "
+          + "will play as HDR10.")
+    }
+
     // `validate()` already rejected a pre-existing output unless --force was given.
     // In the --force case, remove the stale file now that we're committed to running.
     // `try?` both swallows a benign "file not found" (avoiding the TOCTOU existence check)
@@ -380,12 +394,27 @@ import Upscaling
 
     let metricsCollector = PipelineMetricsCollector()
 
-    // Explicit capture list for release-WMO concurrency hygiene.
     let wantsScaler = scale != nil
+
+    // First sRGB-only stage in the pipeline, if any. Derived from the CLI flags rather than
+    // by inspecting a constructed chain so the session can consult it before any ML model
+    // downloads. A non-nil value means the chain can't accept HDR / 10-bit input.
+    let srgbOnlyStageName: String? = {
+      if needsDownsample { return CILanczosDownsampler.displayName }
+      if denoise != nil { return VTTemporalNoiseProcessor.displayName }
+      if motionBlur != nil { return VTMotionBlurProcessor.displayName }
+      if fps != nil { return VTFrameRateConverter.displayName }
+      if wantsScaler, effectiveScaler == .spatial { return Upscaler.displayName }
+      return nil
+    }()
+    let chainIsHDRCapable =
+      wantsScaler && effectiveScaler == .superResolution && srgbOnlyStageName == nil
+
     let chainFactory: UpscalingExportSession.ChainFactory = {
       [
         effectiveScaler, wantsScaler, denoise, fps, motionBlur,
-        scalerOutputSize, finalOutputSize, needsDownsample, metricsCollector
+        scalerOutputSize, finalOutputSize, needsDownsample, chainIsHDRCapable,
+        metricsCollector
       ] inputSize in
       var stages: [any FrameProcessorBackend] = []
       if let denoise {
@@ -393,9 +422,16 @@ import Upscaling
           try await VTTemporalNoiseProcessor(frameSize: inputSize, strength: denoise))
       }
       if wantsScaler {
-        stages.append(
-          try await effectiveScaler.makeBackend(
-            inputSize: inputSize, outputSize: scalerOutputSize))
+        if effectiveScaler == .superResolution, chainIsHDRCapable {
+          stages.append(
+            try await VTSuperResolutionUpscaler(
+              inputSize: inputSize, outputSize: scalerOutputSize,
+              pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange))
+        } else {
+          stages.append(
+            try await effectiveScaler.makeBackend(
+              inputSize: inputSize, outputSize: scalerOutputSize))
+        }
       }
       if let fps {
         stages.append(
@@ -415,6 +451,19 @@ import Upscaling
         metricsCollector: metricsCollector)
     }
 
+    let chainCapabilities: UpscalingExportSession.ChainCapabilities =
+      chainIsHDRCapable
+        ? UpscalingExportSession.ChainCapabilities(
+            supportedSourceInputFormats: [
+              kCVPixelFormatType_32BGRA,
+              kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            ],
+            producedOutputFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        : UpscalingExportSession.ChainCapabilities(
+            supportedSourceInputFormats: [kCVPixelFormatType_32BGRA],
+            producedOutputFormat: kCVPixelFormatType_32BGRA,
+            srgbRejectingStageName: srgbOnlyStageName)
+
     let exportSession = UpscalingExportSession(
       asset: asset,
       outputCodec: outputCodec,
@@ -423,7 +472,8 @@ import Upscaling
       quality: normalizedQuality,
       keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
       creator: "fx-upscale",
-      chainFactory: chainFactory
+      chainFactory: chainFactory,
+      chainCapabilities: chainCapabilities
     )
 
     let qualityInfo = quality.map { ", quality: \($0)" } ?? ""

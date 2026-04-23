@@ -497,6 +497,41 @@ struct FrameProcessorChainTests {
     }
   }
 
+  @Test("Chain rejects pixel-format adjacency mismatch")
+  func mismatchedStageFormats() throws {
+    struct BGRAOutStage: FrameProcessorBackend {
+      let inputSize: CGSize
+      let outputSize: CGSize
+      let displayName = "Fake BGRA stage"
+      var producedOutputFormat: OSType { kCVPixelFormatType_32BGRA }
+      var supportedInputFormats: Set<OSType> { [kCVPixelFormatType_32BGRA] }
+      func process(
+        _ pixelBuffer: sending CVPixelBuffer, presentationTimeStamp: CMTime,
+        outputPool: sending CVPixelBufferPool?
+      ) async throws -> [FrameProcessorOutput] { [] }
+    }
+    struct TenBitOnlyStage: FrameProcessorBackend {
+      let inputSize: CGSize
+      let outputSize: CGSize
+      let displayName = "Fake 10-bit stage"
+      var producedOutputFormat: OSType { kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange }
+      var supportedInputFormats: Set<OSType> {
+        [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange]
+      }
+      func process(
+        _ pixelBuffer: sending CVPixelBuffer, presentationTimeStamp: CMTime,
+        outputPool: sending CVPixelBufferPool?
+      ) async throws -> [FrameProcessorOutput] { [] }
+    }
+    let size = CGSize(width: 320, height: 240)
+    let bgra = BGRAOutStage(inputSize: size, outputSize: size)
+    let tenBit = TenBitOnlyStage(inputSize: size, outputSize: size)
+    #expect(throws: FrameProcessorChain.Error.self) {
+      _ = try FrameProcessorChain(
+        inputSize: size, outputSize: size, stages: [bgra, tenBit])
+    }
+  }
+
   @Test("Single-stage chain behaves like the backend")
   func singleStagePassthrough() async throws {
     let inputSize = CGSize(width: 320, height: 240)
@@ -1236,16 +1271,279 @@ struct ExportSessionTests {
     }
   }
 
-  // Note on `UpscalingExportSession.Error.unsupportedColorSpace`:
-  // Constructing an HDR (PQ/HLG) or Rec. 2020 source video in-process via AVAssetWriter is
-  // possible in principle, but reliably producing a file whose *decoded* track format
-  // description round-trips the Rec. 2020 primaries / ST 2084 transfer (so
-  // `isUnsupportedForSRGBPath` actually fires) is brittle across macOS versions and
-  // hardware encoder policies — a test run can easily end up with a file that silently
-  // re-tagged the color properties, producing a false-green pass. AGENTS.md's "Future Work"
-  // section already flags the full color-aware pipeline as a separate, larger effort; a
-  // proper HDR fixture belongs with that work, not here. Skipping this case rather than
-  // landing a flaky synthetic fixture.
+  // HDR tests use ffmpeg-generated fixtures under `Tests/UpscalingTests/Resources/`. The
+  // `gradient_pq_hdr.mov` fixture is a 1s 480×270 10-bit PQ/Rec.2020 HEVC clip with mastering
+  // display + content light level side-data; `gradient_rec709_10bit.mov` is the Rec.709 10-bit
+  // regression fixture for the tightened `isUnsupportedForSRGBPath` check.
+
+  @Test("Spatial path rejects PQ source with .unsupportedColorSpace")
+  func spatialRejectsPQSource() async throws {
+    let url = try #require(
+      Bundle.module.url(forResource: "gradient_pq_hdr", withExtension: "mov"))
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pq_spatial_\(UUID().uuidString).mov")
+    defer { TestVideoGenerator.cleanup(outputURL) }
+
+    let session = UpscalingExportSession(
+      asset: AVURLAsset(url: url),
+      outputCodec: .hevc,
+      preferredOutputURL: outputURL,
+      outputSize: CGSize(width: 960, height: 540))
+
+    await #expect(throws: UpscalingExportSession.Error.self) {
+      do {
+        try await session.export()
+      } catch let error as UpscalingExportSession.Error {
+        guard case .unsupportedColorSpace = error else {
+          Issue.record("Expected .unsupportedColorSpace, got \(error)")
+          throw error
+        }
+        throw error
+      }
+    }
+    #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+  }
+
+  @Test("Super-resolution path accepts PQ source and round-trips color metadata")
+  func superResolutionRoundTripsPQ() async throws {
+    guard VTSuperResolutionScalerConfiguration.isSupported else {
+      throw TestSkipError("VTSuperResolutionScaler not supported on this device")
+    }
+    let supported = VTSuperResolutionScalerConfiguration.supportedScaleFactors.sorted()
+    let factor = try #require(supported.first)
+
+    let url = try #require(
+      Bundle.module.url(forResource: "gradient_pq_hdr", withExtension: "mov"))
+    let inputSize = CGSize(width: 480, height: 270)
+    let outputSize = CGSize(
+      width: inputSize.width * CGFloat(factor),
+      height: inputSize.height * CGFloat(factor))
+
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pq_super_\(UUID().uuidString).mov")
+    defer { TestVideoGenerator.cleanup(outputURL) }
+
+    // Single-stage super-resolution chain opts into 10-bit 420 video-range round-trip.
+    let chainFactory: UpscalingExportSession.ChainFactory = { inputSize in
+      let backend: any FrameProcessorBackend
+      do {
+        backend = try await VTSuperResolutionUpscaler(
+          inputSize: inputSize, outputSize: outputSize,
+          pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+      } catch {
+        throw TestSkipError(
+          "VTSuperResolutionUpscaler init failed (likely model unavailable): \(error)")
+      }
+      return try FrameProcessorChain(
+        inputSize: inputSize, outputSize: outputSize, stages: [backend])
+    }
+    let capabilities = UpscalingExportSession.ChainCapabilities(
+      supportedSourceInputFormats: [
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+      ],
+      producedOutputFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+
+    let session = UpscalingExportSession(
+      asset: AVURLAsset(url: url),
+      outputCodec: .hevc,
+      preferredOutputURL: outputURL,
+      outputSize: outputSize,
+      chainFactory: chainFactory,
+      chainCapabilities: capabilities)
+
+    do {
+      try await session.export()
+    } catch let error as TestSkipError {
+      throw error
+    } catch {
+      throw TestSkipError("HDR export failed on this device: \(error)")
+    }
+
+    // Inspect output format metadata.
+    let outAsset = AVURLAsset(url: outputURL)
+    let outTrack = try #require(
+      try await outAsset.loadTracks(withMediaType: .video).first)
+    let outFormat = try #require(try await outTrack.load(.formatDescriptions).first)
+
+    #expect(outFormat.colorPrimaries == AVVideoColorPrimaries_ITU_R_2020)
+    #expect(outFormat.colorTransferFunction == AVVideoTransferFunction_SMPTE_ST_2084_PQ)
+    #expect(outFormat.colorYCbCrMatrix == AVVideoYCbCrMatrix_ITU_R_2020)
+    #expect(outFormat.isHDR)
+    #expect(outFormat.masteringDisplayColorVolume != nil)
+    #expect(outFormat.contentLightLevelInfo != nil)
+  }
+
+  @Test("Spatial path rejects 10-bit Rec. 709 source")
+  func spatialRejects10BitRec709() async throws {
+    let url = try #require(
+      Bundle.module.url(forResource: "gradient_rec709_10bit", withExtension: "mov"))
+    let asset = AVURLAsset(url: url)
+    let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+    let fmt = try #require(try await track.load(.formatDescriptions).first)
+    // Sanity-check that the fixture surfaced as 10-bit in the format description. If the OS
+    // decoder didn't propagate the `BitsPerComponent` extension, skip rather than fail:
+    // this is specifically testing the tightened reject, which relies on that extension.
+    guard (fmt.bitsPerComponent ?? 8) >= 10 else {
+      throw TestSkipError("10-bit source decoded without BitsPerComponent; skipping")
+    }
+    #expect(fmt.isUnsupportedForSRGBPath)
+
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("rec709_10bit_\(UUID().uuidString).mov")
+    defer { TestVideoGenerator.cleanup(outputURL) }
+
+    let session = UpscalingExportSession(
+      asset: asset,
+      outputCodec: .hevc,
+      preferredOutputURL: outputURL,
+      outputSize: CGSize(width: 960, height: 540))
+
+    await #expect(throws: UpscalingExportSession.Error.self) {
+      do {
+        try await session.export()
+      } catch let error as UpscalingExportSession.Error {
+        guard case .unsupportedColorSpace = error else {
+          Issue.record("Expected .unsupportedColorSpace, got \(error)")
+          throw error
+        }
+        throw error
+      }
+    }
+  }
+
+  @Test("Chain with Lanczos rejects with a stage-named error")
+  func chainLevelSRGBRejectNamesStage() async throws {
+    let url = try #require(
+      Bundle.module.url(forResource: "gradient_pq_hdr", withExtension: "mov"))
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pq_chain_reject_\(UUID().uuidString).mov")
+    defer { TestVideoGenerator.cleanup(outputURL) }
+
+    let capabilities = UpscalingExportSession.ChainCapabilities(
+      supportedSourceInputFormats: [kCVPixelFormatType_32BGRA],
+      producedOutputFormat: kCVPixelFormatType_32BGRA,
+      srgbRejectingStageName: "Lanczos downsample")
+    let session = UpscalingExportSession(
+      asset: AVURLAsset(url: url),
+      outputCodec: .hevc,
+      preferredOutputURL: outputURL,
+      outputSize: CGSize(width: 240, height: 135),
+      chainCapabilities: capabilities)
+
+    do {
+      try await session.export()
+      Issue.record("Expected export to throw")
+    } catch let error as UpscalingExportSession.Error {
+      guard case .unsupportedColorSpace(let name) = error else {
+        Issue.record("Expected .unsupportedColorSpace, got \(error)")
+        throw error
+      }
+      #expect(name == "Lanczos downsample")
+      #expect(error.errorDescription?.contains("Lanczos downsample") == true)
+    }
+  }
+
+  @Test("Identity re-encode of PQ source preserves HDR metadata")
+  func identityReEncodePreservesHDRMetadata() async throws {
+    let url = try #require(
+      Bundle.module.url(forResource: "gradient_pq_hdr", withExtension: "mov"))
+    let inputSize = CGSize(width: 480, height: 270)
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pq_identity_\(UUID().uuidString).mov")
+    defer { TestVideoGenerator.cleanup(outputURL) }
+
+    // Identity chain — no stages, source size = output size. The capability preview declares
+    // 10-bit support so the session reads 10-bit YUV and passes it through to the writer.
+    let capabilities = UpscalingExportSession.ChainCapabilities(
+      supportedSourceInputFormats: [
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+      ],
+      producedOutputFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+    let chainFactory: UpscalingExportSession.ChainFactory = { inputSize in
+      try FrameProcessorChain(inputSize: inputSize, outputSize: inputSize, stages: [])
+    }
+
+    let session = UpscalingExportSession(
+      asset: AVURLAsset(url: url),
+      outputCodec: .hevc,
+      preferredOutputURL: outputURL,
+      outputSize: inputSize,
+      chainFactory: chainFactory,
+      chainCapabilities: capabilities)
+
+    try await session.export()
+
+    let outAsset = AVURLAsset(url: outputURL)
+    let outTrack = try #require(try await outAsset.loadTracks(withMediaType: .video).first)
+    let outFormat = try #require(try await outTrack.load(.formatDescriptions).first)
+
+    #expect(outFormat.colorPrimaries == AVVideoColorPrimaries_ITU_R_2020)
+    #expect(outFormat.colorTransferFunction == AVVideoTransferFunction_SMPTE_ST_2084_PQ)
+    #expect(outFormat.colorYCbCrMatrix == AVVideoYCbCrMatrix_ITU_R_2020)
+    #expect(outFormat.isHDR)
+    #expect(outFormat.masteringDisplayColorVolume != nil)
+    #expect(outFormat.contentLightLevelInfo != nil)
+  }
+
+  @Test("Per-PTS attachment cache matches exact and latest-before source PTS")
+  func perPTSAttachmentCacheLookup() throws {
+    let cache = PerPTSAttachmentCache()
+    let timescale: CMTimeScale = 600
+    let pts0 = CMTime(value: 0, timescale: timescale)
+    let pts1 = CMTime(value: 600, timescale: timescale)
+    let pts2 = CMTime(value: 1200, timescale: timescale)
+    let dict0 = ["k": "source0"] as CFDictionary
+    let dict1 = ["k": "source1"] as CFDictionary
+    let dict2 = ["k": "source2"] as CFDictionary
+    cache.store(pts: pts0, attachments: dict0)
+    cache.store(pts: pts1, attachments: dict1)
+    cache.store(pts: pts2, attachments: dict2)
+
+    // Exact match pops the matching entry and evicts older ones.
+    let exact = cache.popMatching(pts: pts1)
+    let exactValue = (exact as? [String: String])?["k"]
+    #expect(exactValue == "source1")
+    // pts0 and pts1 should both be evicted; pts2 remains.
+    #expect(cache.popMatching(pts: pts0) == nil)
+    let remaining = cache.popMatching(pts: pts2)
+    let remainingValue = (remaining as? [String: String])?["k"]
+    #expect(remainingValue == "source2")
+    #expect(cache.popMatching(pts: pts2) == nil)
+  }
+
+  @Test("Per-PTS attachment cache falls back to latest-before for interpolated PTSs")
+  func perPTSAttachmentCacheInterpolatedLookup() throws {
+    let cache = PerPTSAttachmentCache()
+    let timescale: CMTimeScale = 600
+    let pts0 = CMTime(value: 0, timescale: timescale)
+    let pts1 = CMTime(value: 600, timescale: timescale)
+    let interpolated = CMTime(value: 300, timescale: timescale)
+    let dict0 = ["k": "source0"] as CFDictionary
+    let dict1 = ["k": "source1"] as CFDictionary
+    cache.store(pts: pts0, attachments: dict0)
+    cache.store(pts: pts1, attachments: dict1)
+
+    // Output PTS between two source PTSs picks the latest source ≤ output.
+    let matched = cache.popMatching(pts: interpolated)
+    let matchedValue = (matched as? [String: String])?["k"]
+    #expect(matchedValue == "source0")
+    // pts0 is evicted; pts1 remains available for the next source frame.
+    let next = cache.popMatching(pts: pts1)
+    let nextValue = (next as? [String: String])?["k"]
+    #expect(nextValue == "source1")
+  }
+
+  @Test("Per-PTS attachment cache returns nil when no source is at or before query")
+  func perPTSAttachmentCacheNoMatch() throws {
+    let cache = PerPTSAttachmentCache()
+    let timescale: CMTimeScale = 600
+    let pts1 = CMTime(value: 600, timescale: timescale)
+    let earlier = CMTime(value: 100, timescale: timescale)
+    cache.store(pts: pts1, attachments: ["k": "source1"] as CFDictionary)
+    #expect(cache.popMatching(pts: earlier) == nil)
+    // Entry is not evicted when nothing matches.
+    #expect(cache.popMatching(pts: pts1) != nil)
+  }
 
   @Test("Cancelling mid-export cleans up the partial output")
   func cancelRemovesPartialOutput() async throws {

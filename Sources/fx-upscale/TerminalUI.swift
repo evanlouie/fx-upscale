@@ -11,6 +11,7 @@ private enum ANSI {
   static let brightCyan = "\u{1B}[96m"
   static let brightGreen = "\u{1B}[92m"
   static let brightRed = "\u{1B}[91m"
+  static let brightYellow = "\u{1B}[93m"
   static let gray = "\u{1B}[90m"
   static let clearToEndOfLine = "\u{1B}[0K"
   static let clearToEndOfScreen = "\u{1B}[J"
@@ -55,6 +56,15 @@ enum Terminal {
   /// future test harness) has reopened stderr with buffering.
   static func error(_ message: String) {
     let styled = ANSI.styleForStderr("✗ ", ANSI.brightRed, ANSI.bold) + message + "\n"
+    fputs(styled, Darwin.stderr)
+    fflush(Darwin.stderr)
+  }
+
+  /// Non-fatal warning: the operation will still complete, but something notable happened
+  /// (degraded output, unsupported feature silently ignored, etc.). Writes to stderr with
+  /// the same flush discipline as `error` so pipes/CI capture both on the same stream.
+  static func warning(_ message: String) {
+    let styled = ANSI.styleForStderr("! ", ANSI.brightYellow, ANSI.bold) + message + "\n"
     fputs(styled, Darwin.stderr)
     fflush(Darwin.stderr)
   }

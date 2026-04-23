@@ -72,27 +72,53 @@ extension CMFormatDescription {
     return false
   }
 
+  /// True when the source's transfer function is PQ (ST 2084) or HLG — i.e. HDR.
+  public var isHDR: Bool {
+    guard let transfer = colorTransferFunction else { return false }
+    return transfer == (AVVideoTransferFunction_SMPTE_ST_2084_PQ as String)
+      || transfer == (AVVideoTransferFunction_ITU_R_2100_HLG as String)
+  }
+
+  /// Raw ST 2086 mastering-display color-volume blob (24 bytes) when present. Carried
+  /// through to VideoToolbox's compression properties under
+  /// `kVTCompressionPropertyKey_MasteringDisplayColorVolume` so HDR10 side-data round-trips.
+  public var masteringDisplayColorVolume: Data? {
+    extensions[kCMFormatDescriptionExtension_MasteringDisplayColorVolume] as? Data
+  }
+
+  /// Raw CTA-861.3 content-light-level info blob (4 bytes: MaxCLL, MaxFALL). Round-tripped
+  /// as `kVTCompressionPropertyKey_ContentLightLevelInfo`.
+  public var contentLightLevelInfo: Data? {
+    extensions[kCMFormatDescriptionExtension_ContentLightLevelInfo] as? Data
+  }
+
+  /// Declared bits-per-component from the format description extensions, or `nil` if the
+  /// codec didn't report it. Used by the tightened `isUnsupportedForSRGBPath` check so
+  /// 10-bit Rec. 709 sources stop silently truncating to 8-bit on the spatial path.
+  public var bitsPerComponent: Int? {
+    (extensions[kCMFormatDescriptionExtension_BitsPerComponent] as? NSNumber)?.intValue
+  }
+
+  /// True when the source carries a Dolby Vision configuration record. This tool does not
+  /// preserve DV RPU side-data — callers warn and continue as HDR10.
+  public var hasDolbyVision: Bool {
+    // Extension key is a CFString published by CoreMedia on macOS builds where the OS
+    // supports DV; fall back to the documented string name so this also compiles on builds
+    // that haven't bridged the constant yet.
+    if extensions["DolbyVisionConfiguration" as CFString] != nil { return true }
+    switch mediaSubType.rawValue {
+    case 0x64766831 /* 'dvh1' */, 0x64766865 /* 'dvhe' */: return true
+    default: return false
+    }
+  }
+
   /// True when the source's color characteristics can't be faithfully processed by the 8-bit
-  /// BGRA sRGB-perceptual MetalFX path. Covers:
-  ///
-  /// - HDR transfer functions (PQ / HLG). Decoding to 8-bit BGRA would silently clip.
-  /// - Rec. 2020 primaries. The perceptual-sRGB scaler squeezes the wider gamut through an
-  ///   sRGB-shaped curve; re-tagging the output Rec. 2020 produces shifted colors.
-  ///
-  /// Rec. 2020 content also happens to always be 10-bit in practice, so this single check also
-  /// protects against 10-bit sources silently losing precision on the BGRA path.
+  /// BGRA sRGB-perceptual MetalFX path — HDR, Rec. 2020 primaries, or ≥10-bit would clip
+  /// highlights, shift gamut, or silently truncate precision through a BGRA8 detour.
   var isUnsupportedForSRGBPath: Bool {
-    if let transfer = colorTransferFunction,
-      transfer == (AVVideoTransferFunction_SMPTE_ST_2084_PQ as String)
-        || transfer == (AVVideoTransferFunction_ITU_R_2100_HLG as String)
-    {
-      return true
-    }
-    if let primaries = colorPrimaries,
-      primaries == (AVVideoColorPrimaries_ITU_R_2020 as String)
-    {
-      return true
-    }
+    if isHDR { return true }
+    if colorPrimaries == (AVVideoColorPrimaries_ITU_R_2020 as String) { return true }
+    if let bpc = bitsPerComponent, bpc >= 10 { return true }
     return false
   }
 }

@@ -20,6 +20,32 @@ public final class UpscalingExportSession: @unchecked Sendable {
     _ inputSize: CGSize
   ) async throws -> FrameProcessorChain
 
+  // MARK: ChainCapabilities
+
+  /// Synchronous snapshot of what the `chainFactory`'s output would accept and produce. The
+  /// session consults this before opening any reader/writer — so HDR chains can ask for a
+  /// 10-bit 420 round-trip without paying `VTSuperResolutionUpscaler.init`'s model-download
+  /// cost up front.
+  public struct ChainCapabilities: Sendable {
+    public let supportedSourceInputFormats: Set<OSType>
+    public let producedOutputFormat: OSType
+    public let srgbRejectingStageName: String?
+
+    public init(
+      supportedSourceInputFormats: Set<OSType>,
+      producedOutputFormat: OSType,
+      srgbRejectingStageName: String? = nil
+    ) {
+      self.supportedSourceInputFormats = supportedSourceInputFormats
+      self.producedOutputFormat = producedOutputFormat
+      self.srgbRejectingStageName = srgbRejectingStageName
+    }
+
+    public static let bgraSRGB = ChainCapabilities(
+      supportedSourceInputFormats: [kCVPixelFormatType_32BGRA],
+      producedOutputFormat: kCVPixelFormatType_32BGRA)
+  }
+
   // MARK: Lifecycle
 
   /// Creates a new upscaling export session.
@@ -38,6 +64,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
   ///     `nil` (default), a single-stage `MTLFXSpatialScaler` chain sized to `outputSize`
   ///     is used — callers that need other effects (super resolution, denoise, motion blur,
   ///     frame-rate conversion) provide their own factory and encode ordering there.
+  ///   - chainCapabilities: Declares what the `chainFactory`'s output accepts and produces
+  ///     — consulted before opening any reader/writer. Defaults to `.bgraSRGB`.
   public init(
     asset: AVAsset,
     outputCodec: AVVideoCodecType? = nil,
@@ -46,7 +74,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
     quality: Double? = nil,
     keyFrameInterval: TimeInterval? = nil,
     creator: String? = nil,
-    chainFactory: ChainFactory? = nil
+    chainFactory: ChainFactory? = nil,
+    chainCapabilities: ChainCapabilities = .bgraSRGB
   ) {
     self.asset = asset
     self.outputCodec = outputCodec
@@ -61,6 +90,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
       return try FrameProcessorChain(
         inputSize: inputSize, outputSize: outputSize, stages: [backend])
     }
+    self.chainCapabilities = chainCapabilities
     progress = Progress(parent: nil, userInfo: [.fileURLKey: outputURL])
     progress.isCancellable = true
   }
@@ -78,6 +108,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   public let keyFrameInterval: TimeInterval?
   public let creator: String?
   private let chainFactory: ChainFactory
+  private let chainCapabilities: ChainCapabilities
 
   public let progress: Progress
 
@@ -128,17 +159,29 @@ public final class UpscalingExportSession: @unchecked Sendable {
         minStartTime = timeRange.start
       }
 
-      if mediaType == .video, formatDescription?.isUnsupportedForSRGBPath == true {
-        // Reject HDR / wide-gamut inputs: the 8-bit BGRA sRGB-perceptual MetalFX path would
-        // silently clip or shift these values while propagating the source's color metadata.
-        throw Error.unsupportedColorSpace
-      }
-
       switch mediaType {
       case .video:
+        // Use encoded pixel dimensions, not naturalSize. AVAssetReaderTrackOutput delivers
+        // decoded frames at encoded dimensions; naturalSize can differ due to PAR or transforms.
+        guard let formatDescription else { continue }
+        let encodedInputSize = CMVideoFormatDescriptionGetDimensions(formatDescription).cgSize
+
+        let chainRequiresSRGB =
+          chainCapabilities.supportedSourceInputFormats == [kCVPixelFormatType_32BGRA]
+        if formatDescription.isUnsupportedForSRGBPath, chainRequiresSRGB {
+          throw Error.unsupportedColorSpace(
+            stageName: chainCapabilities.srgbRejectingStageName)
+        }
+
+        let pipelinePixelFormat = Self.resolvePipelinePixelFormat(
+          formatDescription: formatDescription,
+          accepted: chainCapabilities.supportedSourceInputFormats)
+
         guard
           let assetReaderOutput = Self.videoAssetReaderOutput(
-            for: track, formatDescription: formatDescription),
+            for: track,
+            formatDescription: formatDescription,
+            pixelFormat: pipelinePixelFormat),
           let assetWriterInput = try await Self.videoAssetWriterInput(
             for: track, formatDescription: formatDescription,
             outputSize: outputSize, outputCodec: outputCodec, quality: quality,
@@ -154,28 +197,31 @@ public final class UpscalingExportSession: @unchecked Sendable {
         }
         assetWriter.add(assetWriterInput)
 
-        // Use encoded pixel dimensions, not naturalSize. AVAssetReaderTrackOutput delivers
-        // decoded frames at encoded dimensions; naturalSize can differ due to PAR or transforms.
-        guard let formatDescription else { continue }
-        let encodedInputSize = CMVideoFormatDescriptionGetDimensions(formatDescription).cgSize
-
         progress.totalUnitCount += Self.videoTrackProgressWeight
+        // iPhone-captured HDR clips carry per-sample MaxCLL/MaxFALL / ambient-viewing-environment
+        // as CVBuffer attachments on each decoded pixel buffer rather than on the format
+        // description. Route those through to the writer for HDR sources so the encoded output
+        // preserves them; SDR sources stay on the fast path with no attachment-cache overhead.
+        let preserveHDRAttachments = formatDescription.isHDR
         if formatDescription.hasLeftAndRightEye {
           let receiver = assetWriter.inputTaggedPixelBufferGroupReceiver(
             for: assetWriterInput, pixelBufferAttributes: nil)
           mediaTracks.append(
             .spatialVideo(
               output: assetReaderOutput, input: assetWriterInput,
-              inputSize: encodedInputSize, receiver: receiver))
+              inputSize: encodedInputSize, receiver: receiver,
+              preserveHDRAttachments: preserveHDRAttachments))
         } else {
           let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: assetWriterInput,
-            sourcePixelBufferAttributes: PixelBufferAttributes.bgra(size: outputSize)
+            sourcePixelBufferAttributes: PixelBufferAttributes.formatted(
+              chainCapabilities.producedOutputFormat, size: outputSize)
           )
           mediaTracks.append(
             .video(
               output: assetReaderOutput, input: assetWriterInput,
-              inputSize: encodedInputSize, adaptor: adaptor))
+              inputSize: encodedInputSize, adaptor: adaptor,
+              preserveHDRAttachments: preserveHDRAttachments))
         }
 
       case .audio:
@@ -247,7 +293,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
               }
               try await Self.processPassthroughSamples(
                 from: output, to: input, progress: childProgress)
-            case .video(let output, let input, let inputSize, let adaptor):
+            case .video(let output, let input, let inputSize, let adaptor, let preserveHDRAttachments):
               let childProgress = Progress(totalUnitCount: durationUnits)
               self.progress.addChild(
                 childProgress, withPendingUnitCount: Self.videoTrackProgressWeight)
@@ -255,8 +301,9 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 from: output, to: input, adaptor: adaptor,
                 inputSize: inputSize,
                 chainFactory: self.chainFactory,
+                preserveHDRAttachments: preserveHDRAttachments,
                 progress: childProgress)
-            case .spatialVideo(let output, let input, let inputSize, let receiver):
+            case .spatialVideo(let output, let input, let inputSize, let receiver, let preserveHDRAttachments):
               let childProgress = Progress(totalUnitCount: durationUnits)
               self.progress.addChild(
                 childProgress, withPendingUnitCount: Self.videoTrackProgressWeight)
@@ -264,6 +311,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
                 from: output, to: input, receiver: receiver,
                 inputSize: inputSize,
                 chainFactory: self.chainFactory,
+                preserveHDRAttachments: preserveHDRAttachments,
                 progress: childProgress)
             }
           }
@@ -380,13 +428,15 @@ public final class UpscalingExportSession: @unchecked Sendable {
       output: AVAssetReaderOutput,
       input: AVAssetWriterInput,
       inputSize: CGSize,
-      adaptor: AVAssetWriterInputPixelBufferAdaptor
+      adaptor: AVAssetWriterInputPixelBufferAdaptor,
+      preserveHDRAttachments: Bool
     )
     case spatialVideo(
       output: AVAssetReaderOutput,
       input: AVAssetWriterInput,
       inputSize: CGSize,
-      receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver
+      receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver,
+      preserveHDRAttachments: Bool
     )
   }
 
@@ -408,9 +458,10 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
   private static func videoAssetReaderOutput(
     for track: AVAssetTrack,
-    formatDescription: CMFormatDescription?
+    formatDescription: CMFormatDescription?,
+    pixelFormat: OSType = kCVPixelFormatType_32BGRA
   ) -> AVAssetReaderOutput? {
-    var outputSettings: [String: Any] = PixelBufferAttributes.bgra
+    var outputSettings: [String: Any] = PixelBufferAttributes.formatted(pixelFormat)
     if formatDescription?.hasLeftAndRightEye ?? false {
       outputSettings[AVVideoDecompressionPropertiesKey] = [
         kVTDecompressionPropertyKey_RequestedMVHEVCVideoLayerIDs: [0, 1]
@@ -419,6 +470,25 @@ public final class UpscalingExportSession: @unchecked Sendable {
     let assetReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
     assetReaderOutput.alwaysCopiesSampleData = false
     return assetReaderOutput
+  }
+
+  /// Picks the pipeline pixel format: the first format the chain accepts that also
+  /// corresponds plausibly to the source's encoded precision. For an HDR or explicitly
+  /// 10-bit source with a chain accepting 10-bit YUV, pick 10-bit 420 video-range.
+  /// Otherwise stay on BGRA (the compatibility default).
+  private static func resolvePipelinePixelFormat(
+    formatDescription: CMFormatDescription,
+    accepted: Set<OSType>
+  ) -> OSType {
+    let prefers10Bit =
+      formatDescription.isHDR
+      || (formatDescription.bitsPerComponent ?? 8) >= 10
+    if prefers10Bit,
+      accepted.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+    {
+      return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    }
+    return kCVPixelFormatType_32BGRA
   }
 
   private static func videoAssetWriterInput(
@@ -453,6 +523,22 @@ public final class UpscalingExportSession: @unchecked Sendable {
       // detection. That breaks keyframe-snap seeking (e.g. IINA arrow keys jump to start).
       compressionProperties[kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration as String] =
         keyFrameInterval
+    }
+    if let mastering = formatDescription?.masteringDisplayColorVolume {
+      compressionProperties[
+        kVTCompressionPropertyKey_MasteringDisplayColorVolume as String] = mastering
+    }
+    if let cll = formatDescription?.contentLightLevelInfo {
+      compressionProperties[
+        kVTCompressionPropertyKey_ContentLightLevelInfo as String] = cll
+    }
+    if formatDescription?.isHDR == true {
+      // Without this, VideoToolbox may write a file that plays but doesn't self-identify as
+      // HDR in Quick Look / macOS metadata. `.auto` lets VT decide whether to insert SEI or
+      // box-level metadata based on the codec/container.
+      compressionProperties[
+        kVTCompressionPropertyKey_HDRMetadataInsertionMode as String] =
+        kVTHDRMetadataInsertionMode_Auto
     }
     if formatDescription?.hasLeftAndRightEye ?? false {
       compressionProperties[kVTCompressionPropertyKey_MVHEVCVideoLayerIDs as String] = [0, 1]
@@ -509,6 +595,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     adaptor: AVAssetWriterInputPixelBufferAdaptor,
     inputSize: CGSize,
     chainFactory: ChainFactory,
+    preserveHDRAttachments: Bool,
     progress: Progress
   ) async throws {
     let chain = try await chainFactory(inputSize)
@@ -519,6 +606,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
     defer { assetWriterInput.markAsFinished() }
 
     let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
+    let attachmentCache: PerPTSAttachmentCache? =
+      preserveHDRAttachments ? PerPTSAttachmentCache() : nil
 
     nonisolated(unsafe) let capturedAdaptor = adaptor
     nonisolated(unsafe) let capturedWriterInput = assetWriterInput
@@ -539,6 +628,11 @@ public final class UpscalingExportSession: @unchecked Sendable {
           guard let imageBuffer = sampleBuffer.imageBuffer else {
             throw Error.missingImageBuffer
           }
+          if let attachmentCache,
+            let attachments = CVBufferCopyAttachments(imageBuffer, .shouldPropagate)
+          {
+            attachmentCache.store(pts: pts, attachments: attachments)
+          }
           nonisolated(unsafe) let capturedBuffer = imageBuffer
           await inputChannel.send(
             FrameProcessorOutput(
@@ -553,6 +647,11 @@ public final class UpscalingExportSession: @unchecked Sendable {
           outputPool: capturedPool
         ) { outputs in
           for output in outputs {
+            if let attachmentCache,
+              let attachments = attachmentCache.popMatching(pts: output.presentationTimeStamp)
+            {
+              CVBufferSetAttachments(output.pixelBuffer, attachments, .shouldPropagate)
+            }
             try await waitForInputReady(capturedWriterInput)
             if !capturedAdaptor.append(
               output.pixelBuffer, withPresentationTime: output.presentationTimeStamp)
@@ -574,8 +673,13 @@ public final class UpscalingExportSession: @unchecked Sendable {
     receiver: AVAssetWriterInput.TaggedPixelBufferGroupReceiver,
     inputSize: CGSize,
     chainFactory: ChainFactory,
+    preserveHDRAttachments: Bool,
     progress: Progress
   ) async throws {
+    let leftAttachmentCache: PerPTSAttachmentCache? =
+      preserveHDRAttachments ? PerPTSAttachmentCache() : nil
+    let rightAttachmentCache: PerPTSAttachmentCache? =
+      preserveHDRAttachments ? PerPTSAttachmentCache() : nil
     // If any stage is stateful, each eye must get its own chain so prior-frame references
     // don't cross-pollute between eyes. A fully stateless chain (e.g. MetalFX spatial only)
     // can safely be shared, saving the ~30 MiB second pool at 4K output.
@@ -644,6 +748,17 @@ public final class UpscalingExportSession: @unchecked Sendable {
             throw Error.invalidTaggedBuffers
           }
 
+          if let leftAttachmentCache,
+            let attachments = CVBufferCopyAttachments(left.buffer, .shouldPropagate)
+          {
+            leftAttachmentCache.store(pts: pts, attachments: attachments)
+          }
+          if let rightAttachmentCache,
+            let attachments = CVBufferCopyAttachments(right.buffer, .shouldPropagate)
+          {
+            rightAttachmentCache.store(pts: pts, attachments: attachments)
+          }
+
           nonisolated(unsafe) let leftBuf = left.buffer
           nonisolated(unsafe) let rightBuf = right.buffer
           await leftInputChannel.send(
@@ -661,6 +776,15 @@ public final class UpscalingExportSession: @unchecked Sendable {
           from: leftInputChannel,
           outputPool: nil
         ) { batch in
+          if let leftAttachmentCache {
+            for output in batch {
+              if let attachments = leftAttachmentCache.popMatching(
+                pts: output.presentationTimeStamp)
+              {
+                CVBufferSetAttachments(output.pixelBuffer, attachments, .shouldPropagate)
+              }
+            }
+          }
           await leftOutputChannel.send(batch)
         }
       }
@@ -672,6 +796,15 @@ public final class UpscalingExportSession: @unchecked Sendable {
           from: rightInputChannel,
           outputPool: nil
         ) { batch in
+          if let rightAttachmentCache {
+            for output in batch {
+              if let attachments = rightAttachmentCache.popMatching(
+                pts: output.presentationTimeStamp)
+              {
+                CVBufferSetAttachments(output.pixelBuffer, attachments, .shouldPropagate)
+              }
+            }
+          }
           await rightOutputChannel.send(batch)
         }
       }
@@ -796,6 +929,50 @@ private struct SampleBufferEnvelope: @unchecked Sendable {
   let release: @Sendable () -> Void
 }
 
+// MARK: - PerPTSAttachmentCache
+
+/// Lock-protected per-PTS map for CVBuffer `.shouldPropagate` attachments. Used to round-trip
+/// per-sample HDR metadata (MaxCLL/MaxFALL, ambient-viewing-environment) that iPhone HDR clips
+/// carry on each decoded pixel buffer rather than on the format description — the chain
+/// allocates fresh output buffers, so source attachments need to be replayed onto the output
+/// just before `adaptor.append` / `receiver.appendImmediately`.
+///
+/// Lookups tolerate FRC-shaped 1:N chains (output PTS between source PTSs) by matching the
+/// latest source PTS at or before the query, then evicting everything up to and including
+/// that key so the cache stays bounded at pipeline depth.
+final class PerPTSAttachmentCache: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [CMTime: CFDictionary] = [:]
+
+  func store(pts: CMTime, attachments: CFDictionary) {
+    lock.lock()
+    defer { lock.unlock() }
+    storage[pts] = attachments
+  }
+
+  /// Returns attachments for the source PTS exactly matching `pts`, or — when no exact match
+  /// exists — the latest source PTS ≤ `pts`. Evicts every entry ≤ the chosen key so 1:1 chains
+  /// keep the map at steady state and 1:N chains drop source frames once they slide out of the
+  /// interpolation window.
+  func popMatching(pts: CMTime) -> CFDictionary? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !storage.isEmpty else { return nil }
+    var bestKey: CMTime?
+    for key in storage.keys where key <= pts {
+      if let current = bestKey {
+        if key > current { bestKey = key }
+      } else {
+        bestKey = key
+      }
+    }
+    guard let bestKey else { return nil }
+    let value = storage[bestKey]
+    storage = storage.filter { $0.key > bestKey }
+    return value
+  }
+}
+
 // MARK: UpscalingExportSession.Error
 
 extension UpscalingExportSession {
@@ -809,7 +986,7 @@ extension UpscalingExportSession {
     case failedToStartWriting
     case failedToStartReading
     case appendFailed(CMTime)
-    case unsupportedColorSpace
+    case unsupportedColorSpace(stageName: String?)
     case noMediaTracks
     case spatialFrameCountMismatch(left: Int, right: Int)
 
@@ -833,10 +1010,11 @@ extension UpscalingExportSession {
         "AVAssetReader failed to start reading."
       case .appendFailed(let time):
         "Failed to append sample at time \(time.seconds)s."
-      case .unsupportedColorSpace:
-        "Unsupported color space. This 8-bit sRGB-perceptual MetalFX path only supports "
-          + "Rec. 709 / sRGB SDR sources. HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs "
-          + "are rejected because they would be silently clipped or shifted."
+      case .unsupportedColorSpace(let stageName):
+        "\(stageName ?? "This chain") requires Rec. 709 / sRGB SDR input; HDR (PQ / HLG) / "
+          + "Rec. 2020 / 10-bit sources are rejected to avoid silent clipping or precision "
+          + "loss. Try `--scaler super-resolution` (without `--width` / `--height`) for "
+          + "HDR-capable upscaling, or pre-convert the source to 8-bit Rec. 709 SDR."
       case .noMediaTracks:
         "Input asset contains no media tracks to export."
       case .spatialFrameCountMismatch(let left, let right):

@@ -54,6 +54,12 @@ public protocol FrameProcessorBackend: Sendable {
   /// exports don't pay double the pool memory.
   var requiresInstancePerStream: Bool { get }
 
+  /// The pixel formats this stage accepts as input. Defaults to `[32BGRA]`.
+  var supportedInputFormats: Set<OSType> { get }
+
+  /// The single pixel format this stage emits. Defaults to `32BGRA`.
+  var producedOutputFormat: OSType { get }
+
   /// Processes a single input frame, returning one or more output frames.
   ///
   /// - Parameters:
@@ -89,6 +95,10 @@ extension FrameProcessorBackend {
   public var displayName: String { String(describing: type(of: self)) }
 
   public var requiresInstancePerStream: Bool { false }
+
+  public var supportedInputFormats: Set<OSType> { [kCVPixelFormatType_32BGRA] }
+
+  public var producedOutputFormat: OSType { kCVPixelFormatType_32BGRA }
 
   public func finish(
     outputPool: sending CVPixelBufferPool?

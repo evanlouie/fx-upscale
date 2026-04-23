@@ -66,6 +66,21 @@ public actor FrameProcessorChain: FrameProcessorBackend {
         expected: outputSize, actual: cursor,
         at: stages.isEmpty ? "identity chain" : "stage \(stages.count - 1) output → chain output")
     }
+
+    // Validate pixel-format adjacency: each stage's produced format must appear in the next
+    // stage's accepted-input set. Without this, e.g. a [VT 10-bit denoise → MetalFX 8-bit
+    // spatial] chain would silently corrupt buffers mid-pipeline; surfacing it here turns a
+    // cryptic downstream CVMetalTexture failure into a clear chain-construction error.
+    for (index, stage) in stages.enumerated().dropFirst() {
+      let upstream = stages[index - 1]
+      let produced = upstream.producedOutputFormat
+      guard stage.supportedInputFormats.contains(produced) else {
+        throw Error.formatMismatch(
+          expected: stage.supportedInputFormats,
+          actual: produced,
+          at: "stage \(index - 1) (\(upstream.displayName)) → stage \(index) (\(stage.displayName))")
+      }
+    }
   }
 
   // MARK: Public
@@ -77,6 +92,17 @@ public actor FrameProcessorChain: FrameProcessorBackend {
   /// chain across streams would route every stream through that stage's shared state.
   public nonisolated var requiresInstancePerStream: Bool {
     stages.contains { $0.requiresInstancePerStream }
+  }
+
+  /// The chain as a whole accepts exactly what its first stage accepts (or BGRA for an
+  /// identity chain, preserving pre-capability behavior).
+  public nonisolated var supportedInputFormats: Set<OSType> {
+    stages.first?.supportedInputFormats ?? [kCVPixelFormatType_32BGRA]
+  }
+
+  /// The chain emits exactly what its last stage emits (or BGRA for an identity chain).
+  public nonisolated var producedOutputFormat: OSType {
+    stages.last?.producedOutputFormat ?? kCVPixelFormatType_32BGRA
   }
 
   public func process(
@@ -317,6 +343,7 @@ public actor FrameProcessorChain: FrameProcessorBackend {
 extension FrameProcessorChain {
   public enum Error: Swift.Error, LocalizedError {
     case sizeMismatch(expected: CGSize, actual: CGSize, at: String)
+    case formatMismatch(expected: Set<OSType>, actual: OSType, at: String)
 
     public var errorDescription: String? {
       switch self {
@@ -324,7 +351,34 @@ extension FrameProcessorChain {
         "Frame processor chain size mismatch at \(at): expected "
           + "\(Int(expected.width))×\(Int(expected.height)), got "
           + "\(Int(actual.width))×\(Int(actual.height))."
+      case .formatMismatch(let expected, let actual, let at):
+        "Frame processor chain pixel-format mismatch at \(at): stage produced "
+          + "\(describePixelFormat(actual)), but next stage accepts only "
+          + "\(expected.map(describePixelFormat).sorted().joined(separator: ", "))."
       }
     }
+  }
+}
+
+/// Human-readable label for a `CVPixelFormatType` four-cc. Used in chain-validation
+/// error messages so users see "32BGRA" rather than a raw integer.
+private func describePixelFormat(_ format: OSType) -> String {
+  switch format {
+  case kCVPixelFormatType_32BGRA: return "32BGRA"
+  case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return "420YpCbCr8BiPlanarVideoRange"
+  case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return "420YpCbCr10BiPlanarVideoRange"
+  default:
+    // Render the four-cc as ASCII when all four bytes are printable; otherwise fall back to
+    // the raw hex.
+    let bytes: [UInt8] = [
+      UInt8((format >> 24) & 0xFF),
+      UInt8((format >> 16) & 0xFF),
+      UInt8((format >> 8) & 0xFF),
+      UInt8(format & 0xFF),
+    ]
+    if bytes.allSatisfy({ (0x20...0x7E).contains($0) }) {
+      return String(bytes: bytes, encoding: .ascii) ?? String(format: "0x%08X", format)
+    }
+    return String(format: "0x%08X", format)
   }
 }

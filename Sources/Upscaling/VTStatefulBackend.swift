@@ -31,13 +31,14 @@ final class VTStatefulBackendCore: @unchecked Sendable {
   ///
   /// Construction order matches the three backends' original inits:
   ///   1. `VTFrameProcessor()` + `startSession(configuration:)`
-  ///   2. `makeBGRAPixelBufferPool(size:minimumBufferCount:)`
+  ///   2. `makePixelBufferPool(format:size:minimumBufferCount:)`
   /// Any failure is reported through `VTBackendError` tagged with `backend`.
   init(
     configuration: some VTFrameProcessorConfiguration,
     poolSize: CGSize,
     minimumPoolBufferCount: Int,
-    backend: VTBackendError.Backend
+    backend: VTBackendError.Backend,
+    pixelFormat: OSType = kCVPixelFormatType_32BGRA
   ) throws {
     self.backend = backend
 
@@ -46,8 +47,8 @@ final class VTStatefulBackendCore: @unchecked Sendable {
     self.processor = processor
 
     guard
-      let pixelBufferPool = makeBGRAPixelBufferPool(
-        size: poolSize, minimumBufferCount: minimumPoolBufferCount)
+      let pixelBufferPool = makePixelBufferPool(
+        format: pixelFormat, size: poolSize, minimumBufferCount: minimumPoolBufferCount)
     else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: backend) }
     self.pixelBufferPool = pixelBufferPool
   }

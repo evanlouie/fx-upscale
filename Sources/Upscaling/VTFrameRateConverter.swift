@@ -95,7 +95,8 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
 
   public nonisolated var inputSize: CGSize { frameSize }
   public nonisolated var outputSize: CGSize { frameSize }
-  public nonisolated let displayName = "Frame rate conversion"
+  public static let displayName = "Frame rate conversion"
+  public nonisolated var displayName: String { Self.displayName }
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 

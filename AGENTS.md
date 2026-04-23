@@ -154,30 +154,74 @@ Workaround for IINA users: Settings → Advanced → Additional mpv options →
 add `hr-seek` = `yes`. This forces precise (decode-forward) seeks, which
 bypass the broken keyframe lookup.
 
+## Color pipeline
+
+### HDR round-trip on single-stage `--scaler super-resolution`
+
+The pipeline is format-aware end-to-end when the user's chain is a single-stage
+`--scaler super-resolution` with no sRGB-only sibling stages (no `--denoise`,
+`--motion-blur`, `--fps`, or terminal Lanczos downsample). In that configuration an HDR
+(PQ / HLG) or 10-bit source is read as `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`,
+processed through `VTSuperResolutionUpscaler` without an 8-bit detour, and written out
+with the source's color primaries, transfer function, YCbCr matrix, ST 2086 mastering
+display, and CTA-861.3 content-light-level side-data preserved.
+
+Mechanism:
+
+- Each `FrameProcessorBackend` declares `supportedInputFormats` / `producedOutputFormat`
+  (`Sources/Upscaling/FrameProcessorBackend.swift`). Defaults are BGRA so any backend not
+  opted in keeps the historical contract. `VTSuperResolutionUpscaler` exposes a
+  `pixelFormat:` init parameter so callers pick the round-trip format explicitly.
+- `FrameProcessorChain.init` validates format adjacency between stages and throws
+  `.formatMismatch(expected:actual:at:)` when adjacent stages disagree — turning a silent
+  mid-pipeline `CVMetalTextureCacheCreateTextureFromImage` failure into a clear
+  construction-time error that names both stages.
+- `UpscalingExportSession` takes a synchronous `ChainCapabilitiesPreview` closure and a
+  `srgbRejectingStageName` resolver. It consults both *before* opening any reader/writer,
+  picks the pipeline pixel format matching the source precision (BGRA vs. 10-bit 420),
+  and routes HDR static metadata through the writer's `compressionProperties`
+  (`kVTCompressionPropertyKey_MasteringDisplayColorVolume`,
+  `kVTCompressionPropertyKey_ContentLightLevelInfo`,
+  `kVTCompressionPropertyKey_HDRMetadataInsertionMode = .auto`).
+- `Error.unsupportedColorSpace(stageName:)` now names the offending sRGB-only stage so
+  users see "Lanczos downsample requires Rec. 709 / sRGB SDR input" instead of a generic
+  rejection.
+- `isUnsupportedForSRGBPath` now also flags 10-bit Rec. 709 sources, which previously
+  silently truncated to 8-bit on the spatial path.
+- The CLI rejects `--codec h264` on HDR sources up front (H.264 can't carry PQ/HLG
+  metadata cleanly) and detect-and-warns on Dolby Vision sources (export continues as
+  HDR10; RPU side-data is not preserved).
+
+The MetalFX spatial path is unchanged: it remains 8-bit sRGB-only, and any chain that
+mixes an sRGB-only stage with an HDR source still rejects with a stage-named error.
+
 ## Future Work
 
-### Expand the `--scaler super-resolution` path to non-sRGB color
+### Extend denoise / motion-blur / FRC to 10-bit
 
-Today both backends (`MTLFXSpatialScaler` and `VTFrameProcessor` super resolution) are
-gated by the same 8-bit BGRA sRGB input check (`formatDescription.isUnsupportedForSRGBPath`
-in `Sources/Upscaling/UpscalingExportSession.swift`). This is a real constraint for the
-MetalFX path (we use `bgra8Perceptual`, which clips / shifts wide-gamut or HDR values),
-but it's an *artificial* constraint on the VT path — `VTSuperResolutionScalerConfiguration`
-exposes `frameSupportedPixelFormats`, `sourcePixelBufferAttributes`, and
-`destinationPixelBufferAttributes` that cover a wider set of formats (including 10-bit
-and some YUV layouts).
+`VTTemporalNoiseProcessor`, `VTMotionBlurProcessor`, and `VTFrameRateConverter` keep the
+BGRA-only declaration. Each needs its own `frameSupportedPixelFormats` audit against
+10-bit 420 YUV, then the opt-in is a one-liner on construction (the pool generalization
+in `VTStatefulBackendCore` is already in place).
 
-To lift it, the whole pipeline needs to become format-aware end-to-end:
+### Linear-light Lanczos for supersampled HDR downscale
 
-1. Reader output settings (`videoAssetReaderOutput`) — today hard-coded to BGRA.
-2. `CVPixelBufferPool` attributes — today use `PixelBufferAttributes.bgra(size:)`.
-3. Asset writer input + compression properties — color primaries / transfer function /
-   YCbCr matrix must round-trip correctly (HDR10, HLG, Rec. 2020).
-4. `VTFrameProcessorFrame` wrap — any buffer change must remain IOSurface-backed.
+`CILanczosDownsampler` runs in sRGB working + output space to stay perceptually aligned
+with `MTLFXSpatialScaler.bgra8Perceptual`. A separate linear-light path would be needed
+to let `--scale N --width M` (supersampled downscale) work on HDR sources without
+clipping.
 
-Suggested split: do this in its own commit / PR, gated by `--scaler super-resolution`
-so the MetalFX path keeps its current strict behavior. Verify HDR metadata round-trips
-with real PQ / HLG sources before relaxing the reject in `UpscalingExportSession.swift`.
+### Full Dolby Vision RPU pass-through
+
+The tool detects Dolby Vision sources and warns that RPU side-data is not preserved —
+output is HDR10 only. Full DV support needs RPU NAL extraction, re-muxing, and a
+different writer path that AVFoundation does not expose directly.
+
+### Per-sample HDR dynamic metadata
+
+Current pass-through covers static metadata (ST 2086 mastering-display + CTA-861.3
+content-light-level). Dynamic metadata (HDR10+, ST 2094) is attached per-sample rather
+than on the format description and requires its own extraction / reinjection path.
 
 ## CI/CD
 

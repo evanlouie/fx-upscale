@@ -12,32 +12,37 @@ extension CVPixelBuffer {
 /// Shared pixel-buffer attribute dictionaries used when creating pools or adaptor-backed
 /// pixel buffers that must be Metal-compatible and IOSurface-backed.
 enum PixelBufferAttributes {
-  /// 32BGRA, Metal-compatible, IOSurface-backed format attributes without dimensions. Use this
-  /// for reader-output settings where the source's natural size should be preserved.
-  static var bgra: [String: Any] {
+  /// Metal-compatible, IOSurface-backed attributes for the given pixel format, without
+  /// dimensions. Use this for reader-output settings where the source's natural size should
+  /// be preserved.
+  static func formatted(_ format: OSType) -> [String: Any] {
     [
-      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+      kCVPixelBufferPixelFormatTypeKey as String: format,
       kCVPixelBufferMetalCompatibilityKey as String: true,
       kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary,
     ]
   }
 
-  /// Same attributes as `bgra` but with fixed width/height for pools and adaptors that need to
-  /// allocate buffers at a specific output size.
-  static func bgra(size: CGSize) -> [String: Any] {
-    var attrs = bgra
+  /// Same attributes as `formatted(_:)` but with fixed width/height for pools and adaptors
+  /// that need to allocate buffers at a specific output size.
+  static func formatted(_ format: OSType, size: CGSize) -> [String: Any] {
+    var attrs = formatted(format)
     attrs[kCVPixelBufferWidthKey as String] = Int(size.width)
     attrs[kCVPixelBufferHeightKey as String] = Int(size.height)
     return attrs
   }
 }
 
-// MARK: - BGRAPixelBufferPool
+// MARK: - PixelBufferPool
 
-/// Creates an IOSurface-backed BGRA `CVPixelBufferPool` at a fixed size. The pool releases idle
-/// buffers after one second so long-running exports don't hold memory proportional to the
-/// worst-case in-flight burst.
-func makeBGRAPixelBufferPool(size: CGSize, minimumBufferCount: Int) -> CVPixelBufferPool? {
+/// Creates an IOSurface-backed `CVPixelBufferPool` at a fixed size and pixel format. The pool
+/// releases idle buffers after one second so long-running exports don't hold memory
+/// proportional to the worst-case in-flight burst.
+func makePixelBufferPool(
+  format: OSType,
+  size: CGSize,
+  minimumBufferCount: Int
+) -> CVPixelBufferPool? {
   let poolAttributes: [String: Any] = [
     kCVPixelBufferPoolMinimumBufferCountKey as String: minimumBufferCount,
     kCVPixelBufferPoolMaximumBufferAgeKey as String: 1.0 as CFNumber,
@@ -46,10 +51,17 @@ func makeBGRAPixelBufferPool(size: CGSize, minimumBufferCount: Int) -> CVPixelBu
   CVPixelBufferPoolCreate(
     nil,
     poolAttributes as CFDictionary,
-    PixelBufferAttributes.bgra(size: size) as CFDictionary,
+    PixelBufferAttributes.formatted(format, size: size) as CFDictionary,
     &pool
   )
   return pool
+}
+
+/// Thin BGRA call-through kept so existing call sites that don't care about non-sRGB formats
+/// keep reading naturally.
+func makeBGRAPixelBufferPool(size: CGSize, minimumBufferCount: Int) -> CVPixelBufferPool? {
+  makePixelBufferPool(
+    format: kCVPixelFormatType_32BGRA, size: size, minimumBufferCount: minimumBufferCount)
 }
 
 // MARK: - PixelBufferIOError
@@ -64,7 +76,7 @@ enum PixelBufferIOError: Swift.Error, LocalizedError {
   var errorDescription: String? {
     switch self {
     case .unsupportedPixelFormat:
-      "Unsupported pixel format. Only kCVPixelFormatType_32BGRA is supported."
+      "Unsupported pixel format for this processor stage."
     case .inputSizeMismatch:
       "Input pixel buffer dimensions do not match the processor's input size."
     case .outputSizeMismatch:
@@ -87,9 +99,10 @@ func resolveProcessorOutputBuffer(
   expectedOutputSize outputSize: CGSize,
   externalPool: CVPixelBufferPool?,
   internalPool: CVPixelBufferPool,
-  providedOutput: CVPixelBuffer?
+  providedOutput: CVPixelBuffer?,
+  expectedPixelFormat: OSType = kCVPixelFormatType_32BGRA
 ) throws -> CVPixelBuffer {
-  guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+  guard CVPixelBufferGetPixelFormatType(pixelBuffer) == expectedPixelFormat else {
     throw PixelBufferIOError.unsupportedPixelFormat
   }
   guard pixelBuffer.width == Int(inputSize.width),

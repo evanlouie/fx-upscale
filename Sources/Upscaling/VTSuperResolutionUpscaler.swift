@@ -27,9 +27,17 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
   /// May download a ~tens-of-MB ML model on first use; the download is surfaced through
   /// `VTSuperResolutionScalerConfiguration.downloadConfigurationModel(completionHandler:)` and
   /// reported as `Error.modelDownloadFailed` on failure.
-  public init(inputSize: CGSize, outputSize: CGSize) async throws {
+  ///
+  /// `pixelFormat` selects the buffer format used end-to-end through this stage. Pass
+  /// `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` for an HDR round-trip.
+  public init(
+    inputSize: CGSize,
+    outputSize: CGSize,
+    pixelFormat: OSType = kCVPixelFormatType_32BGRA
+  ) async throws {
     self.inputSize = inputSize
     self.outputSize = outputSize
+    self.pixelFormat = pixelFormat
 
     let configuration = try Self.makeConfiguration(
       inputSize: inputSize, outputSize: outputSize)
@@ -49,7 +57,8 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       configuration: configuration,
       poolSize: outputSize,
       minimumPoolBufferCount: Self.minimumPoolBufferCount,
-      backend: .superResolution)
+      backend: .superResolution,
+      pixelFormat: pixelFormat)
   }
 
   /// Cheap synchronous validation that only checks dimensions / scale factor / device support.
@@ -67,6 +76,13 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 
+  /// The buffer format this stage accepts and emits (VT super-resolution does not
+  /// transcode, so input and output format agree).
+  public nonisolated let pixelFormat: OSType
+
+  public nonisolated var supportedInputFormats: Set<OSType> { [pixelFormat] }
+  public nonisolated var producedOutputFormat: OSType { pixelFormat }
+
   public func process(
     _ pixelBuffer: sending CVPixelBuffer,
     presentationTimeStamp: CMTime,
@@ -78,7 +94,8 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       expectedOutputSize: outputSize,
       externalPool: externalPool,
       internalPool: core.pixelBufferPool,
-      providedOutput: nil
+      providedOutput: nil,
+      expectedPixelFormat: pixelFormat
     )
 
     let vtPts = core.nextPts(frameIndex: &frameIndex)
