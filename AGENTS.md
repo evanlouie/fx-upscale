@@ -45,7 +45,7 @@ swift test
 swift test list
 
 # Run a single test by name
-swift test --filter "Upscaler Tests/Upscaler sync API produces correct output size"
+swift test --filter "Upscaler Tests/Upscaler async API produces correct output size"
 
 # Run an entire test suite
 swift test --filter "Export Session Tests"

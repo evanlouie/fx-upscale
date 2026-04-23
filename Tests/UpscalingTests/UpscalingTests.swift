@@ -2005,3 +2005,315 @@ struct PipelineProcessAllTests {
     #expect(snapshot.framesEmitted == 1)
   }
 }
+
+// MARK: - Final Output Dimensions
+
+@Suite("Final Output Dimensions")
+struct FinalOutputDimensionsTests {
+  @Test("Both nil returns scalerOutputSize verbatim")
+  func bothNilReturnsScaler() throws {
+    let scaler = CGSize(width: 3840, height: 2160)
+    let out = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: scaler, requestedWidth: nil, requestedHeight: nil)
+    #expect(out == scaler)
+  }
+
+  @Test("Width-only derives height from scalerOutputSize's aspect")
+  func widthOnlyDerivesHeight() throws {
+    let scaler = CGSize(width: 3840, height: 2160)
+    let out = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: scaler, requestedWidth: 1920, requestedHeight: nil)
+    #expect(out == CGSize(width: 1920, height: 1080))
+  }
+
+  @Test("Height-only derives width from scalerOutputSize's aspect")
+  func heightOnlyDerivesWidth() throws {
+    let scaler = CGSize(width: 3840, height: 2160)
+    let out = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: scaler, requestedWidth: nil, requestedHeight: 1080)
+    #expect(out == CGSize(width: 1920, height: 1080))
+  }
+
+  @Test("Both given are honored verbatim after even-rounding")
+  func bothGivenHonored() throws {
+    let scaler = CGSize(width: 3840, height: 2160)
+    let out = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: scaler, requestedWidth: 1280, requestedHeight: 720)
+    #expect(out == CGSize(width: 1280, height: 720))
+  }
+
+  @Test("Non-positive requested width throws")
+  func nonPositiveWidthThrows() {
+    #expect(throws: DimensionCalculation.Error.self) {
+      _ = try DimensionCalculation.calculateFinalOutputDimensions(
+        scalerOutputSize: CGSize(width: 3840, height: 2160),
+        requestedWidth: 0, requestedHeight: nil)
+    }
+  }
+
+  @Test("Non-positive requested height throws")
+  func nonPositiveHeightThrows() {
+    #expect(throws: DimensionCalculation.Error.self) {
+      _ = try DimensionCalculation.calculateFinalOutputDimensions(
+        scalerOutputSize: CGSize(width: 3840, height: 2160),
+        requestedWidth: nil, requestedHeight: -1)
+    }
+  }
+
+  @Test("Non-positive scalerOutputSize throws")
+  func invalidScalerSizeThrows() {
+    #expect(throws: DimensionCalculation.Error.self) {
+      _ = try DimensionCalculation.calculateFinalOutputDimensions(
+        scalerOutputSize: CGSize(width: 0, height: 0),
+        requestedWidth: nil, requestedHeight: nil)
+    }
+  }
+
+  @Test("Odd scalerOutputSize with both-nil returns even dimensions")
+  func oddScalerBothNil() throws {
+    let scaler = CGSize(width: 3841, height: 2161)
+    let out = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: scaler, requestedWidth: nil, requestedHeight: nil)
+    #expect(out.width <= scaler.width)
+    #expect(out.height <= scaler.height)
+  }
+
+  @Test("Clamps result to scalerOutputSize on the width axis")
+  func clampsWidth() throws {
+    let scaler = CGSize(width: 1920, height: 1080)
+    let out = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: scaler, requestedWidth: 1920, requestedHeight: nil)
+    #expect(out.width == 1920)
+    #expect(out.width <= scaler.width)
+    #expect(out.height <= scaler.height)
+  }
+
+  @Test("Final dims smaller than scaler produce even, correct output")
+  func downsample() throws {
+    let out = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: CGSize(width: 3840, height: 2160),
+      requestedWidth: 1920, requestedHeight: 1080)
+    #expect(out == CGSize(width: 1920, height: 1080))
+  }
+}
+
+// MARK: - CILanczosDownsampler Tests
+
+private func makeSolidGrayBuffer(size: CGSize, gray: UInt8 = 128) throws -> CVPixelBuffer {
+  let buffer = try makeTestPixelBuffer(size: size)
+  CVPixelBufferLockBaseAddress(buffer, [])
+  defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+  guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+    throw TestSkipError("Failed to lock pixel buffer base address")
+  }
+  let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+  let height = CVPixelBufferGetHeight(buffer)
+  let width = CVPixelBufferGetWidth(buffer)
+  let ptr = base.assumingMemoryBound(to: UInt8.self)
+  for y in 0..<height {
+    for x in 0..<width {
+      let offset = y * bytesPerRow + x * 4
+      ptr[offset + 0] = gray  // B
+      ptr[offset + 1] = gray  // G
+      ptr[offset + 2] = gray  // R
+      ptr[offset + 3] = 255  // A
+    }
+  }
+  return buffer
+}
+
+@Suite("CI Lanczos Downsampler")
+struct CILanczosDownsamplerTests {
+  @Test("Init succeeds for valid downsample sizes")
+  func initSucceeds() throws {
+    _ = try CILanczosDownsampler(
+      inputSize: CGSize(width: 1920, height: 1080),
+      outputSize: CGSize(width: 1280, height: 720))
+  }
+
+  @Test("Init rejects outputSize larger than inputSize")
+  func initRejectsUpscale() {
+    #expect(throws: CILanczosDownsampler.Error.self) {
+      _ = try CILanczosDownsampler(
+        inputSize: CGSize(width: 1280, height: 720),
+        outputSize: CGSize(width: 1920, height: 1080))
+    }
+  }
+
+  @Test("Init rejects odd dimensions")
+  func initRejectsOddDimensions() {
+    #expect(throws: CILanczosDownsampler.Error.self) {
+      _ = try CILanczosDownsampler(
+        inputSize: CGSize(width: 1281, height: 720),
+        outputSize: CGSize(width: 640, height: 360))
+    }
+  }
+
+  @Test("Init rejects non-positive sizes")
+  func initRejectsInvalidSizes() {
+    #expect(throws: CILanczosDownsampler.Error.self) {
+      _ = try CILanczosDownsampler(
+        inputSize: CGSize(width: 0, height: 0),
+        outputSize: CGSize(width: 0, height: 0))
+    }
+  }
+
+  @Test("Preflight mirrors init-time validation")
+  func preflight() throws {
+    try CILanczosDownsampler.preflight(
+      inputSize: CGSize(width: 1920, height: 1080),
+      outputSize: CGSize(width: 640, height: 480))
+    #expect(throws: CILanczosDownsampler.Error.self) {
+      try CILanczosDownsampler.preflight(
+        inputSize: CGSize(width: 640, height: 480),
+        outputSize: CGSize(width: 1920, height: 1080))
+    }
+    #expect(throws: CILanczosDownsampler.Error.self) {
+      try CILanczosDownsampler.preflight(
+        inputSize: CGSize(width: 1921, height: 1080),
+        outputSize: CGSize(width: 640, height: 480))
+    }
+  }
+
+  @Test("Process returns one output at outputSize with source PTS")
+  func processReturnsOutputAtOutputSize() async throws {
+    let inputSize = CGSize(width: 640, height: 480)
+    let outputSize = CGSize(width: 320, height: 240)
+    let downsampler = try CILanczosDownsampler(
+      inputSize: inputSize, outputSize: outputSize)
+    let buffer = try makeTestPixelBuffer(size: inputSize)
+    nonisolated(unsafe) let captured = buffer
+    let pts = CMTime(value: 42, timescale: 30)
+
+    let outputs = try await downsampler.process(
+      captured, presentationTimeStamp: pts, outputPool: nil)
+
+    try #require(outputs.count == 1)
+    #expect(CVPixelBufferGetWidth(outputs[0].pixelBuffer) == Int(outputSize.width))
+    #expect(CVPixelBufferGetHeight(outputs[0].pixelBuffer) == Int(outputSize.height))
+    #expect(outputs[0].presentationTimeStamp == pts)
+  }
+
+  @Test("Process rejects input with wrong size")
+  func processRejectsWrongSize() async throws {
+    let downsampler = try CILanczosDownsampler(
+      inputSize: CGSize(width: 640, height: 480),
+      outputSize: CGSize(width: 320, height: 240))
+    let wrong = try makeTestPixelBuffer(size: CGSize(width: 320, height: 240))
+    nonisolated(unsafe) let captured = wrong
+    await #expect(throws: (any Error).self) {
+      _ = try await downsampler.process(
+        captured, presentationTimeStamp: .zero, outputPool: nil)
+    }
+  }
+
+  @Test("Gamma round-trip: uniform 50% gray stays ±1 LSB")
+  func gammaRoundTrip() async throws {
+    // Pins the sRGB color-space contract: a uniform perceptual gray must stay uniform after
+    // downsampling. If the filter were to convert to linear-light and back with a wrong
+    // inverse, a 128-gray input would shift.
+    let inputSize = CGSize(width: 256, height: 256)
+    let outputSize = CGSize(width: 128, height: 128)
+    let downsampler = try CILanczosDownsampler(
+      inputSize: inputSize, outputSize: outputSize)
+    let buffer = try makeSolidGrayBuffer(size: inputSize, gray: 128)
+    nonisolated(unsafe) let captured = buffer
+
+    let outputs = try await downsampler.process(
+      captured, presentationTimeStamp: .zero, outputPool: nil)
+    try #require(outputs.count == 1)
+
+    let outBuffer = outputs[0].pixelBuffer
+    CVPixelBufferLockBaseAddress(outBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(outBuffer, .readOnly) }
+    let base = CVPixelBufferGetBaseAddress(outBuffer)!
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(outBuffer)
+    let w = CVPixelBufferGetWidth(outBuffer)
+    let h = CVPixelBufferGetHeight(outBuffer)
+    let ptr = base.assumingMemoryBound(to: UInt8.self)
+
+    // Sample the center — edges can pick up kernel-extension artifacts on bounded input.
+    let cx = w / 2
+    let cy = h / 2
+    let offset = cy * bytesPerRow + cx * 4
+    let b = ptr[offset + 0]
+    let g = ptr[offset + 1]
+    let r = ptr[offset + 2]
+    #expect(abs(Int(b) - 128) <= 1, "blue channel drifted: \(b)")
+    #expect(abs(Int(g) - 128) <= 1, "green channel drifted: \(g)")
+    #expect(abs(Int(r) - 128) <= 1, "red channel drifted: \(r)")
+  }
+}
+
+// MARK: - Chain Integration with Lanczos
+
+@Suite("Chain with Lanczos")
+struct ChainWithLanczosTests {
+  @Test("Scaler + Lanczos produces final size from source")
+  func scalerThenLanczos() async throws {
+    let sourceSize = CGSize(width: 320, height: 240)
+    let scalerOutputSize = CGSize(width: 640, height: 480)
+    let finalSize = CGSize(width: 480, height: 360)
+
+    guard
+      let upscaler = Upscaler(inputSize: sourceSize, outputSize: scalerOutputSize)
+    else {
+      throw TestSkipError("Metal device not available")
+    }
+    let downsampler = try CILanczosDownsampler(
+      inputSize: scalerOutputSize, outputSize: finalSize)
+
+    let chain = try FrameProcessorChain(
+      inputSize: sourceSize, outputSize: finalSize,
+      stages: [upscaler, downsampler])
+
+    let input = try makeTestPixelBuffer(size: sourceSize)
+    nonisolated(unsafe) let captured = input
+    let pts = CMTime(value: 1, timescale: 30)
+    let outputs = try await chain.process(
+      captured, presentationTimeStamp: pts, outputPool: nil)
+
+    try #require(outputs.count == 1)
+    #expect(CVPixelBufferGetWidth(outputs[0].pixelBuffer) == Int(finalSize.width))
+    #expect(CVPixelBufferGetHeight(outputs[0].pixelBuffer) == Int(finalSize.height))
+    #expect(outputs[0].presentationTimeStamp == pts)
+  }
+
+  @Test("Lanczos inputSize must match upstream outputSize or chain init fails")
+  func chainRejectsSizeMismatch() async throws {
+    guard
+      let upscaler = Upscaler(
+        inputSize: CGSize(width: 320, height: 240),
+        outputSize: CGSize(width: 640, height: 480))
+    else {
+      throw TestSkipError("Metal device not available")
+    }
+    let downsampler = try CILanczosDownsampler(
+      inputSize: CGSize(width: 800, height: 600),
+      outputSize: CGSize(width: 400, height: 300))
+
+    #expect(throws: FrameProcessorChain.Error.self) {
+      _ = try FrameProcessorChain(
+        inputSize: CGSize(width: 320, height: 240),
+        outputSize: CGSize(width: 400, height: 300),
+        stages: [upscaler, downsampler])
+    }
+  }
+
+  @Test("--scale alone produces a chain with no Lanczos stage (regression guard)")
+  func scaleAloneNoLanczos() async throws {
+    let sourceSize = CGSize(width: 320, height: 240)
+    let scalerOutputSize = CGSize(width: 640, height: 480)
+    let finalSize = scalerOutputSize
+
+    guard
+      let upscaler = Upscaler(inputSize: sourceSize, outputSize: scalerOutputSize)
+    else {
+      throw TestSkipError("Metal device not available")
+    }
+    let chain = try FrameProcessorChain(
+      inputSize: sourceSize, outputSize: finalSize, stages: [upscaler])
+    #expect(chain.inputSize == sourceSize)
+    #expect(chain.outputSize == finalSize)
+  }
+}

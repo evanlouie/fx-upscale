@@ -15,17 +15,17 @@ ARGUMENTS:
   <url>                   The video file to upscale
 
 OPTIONS:
-  -w, --width <width>     Output width
-  -H, --height <height>   Output height
-  -x, --scale <scale>     Uniform integer scale factor (e.g. 2 for 2×).
-                          Mutually exclusive with --width / --height.
+  -w, --width <width>     Final encoded width
+  -H, --height <height>   Final encoded height
+  -x, --scale <scale>     Uniform integer scale factor for the scaler stage
+                          (e.g. 2 for 2×). Independent of --width / --height.
   -c, --codec <codec>     Output codec: h264 | hevc (default: h264)
   -q, --quality <quality> Encoder quality 1-100 (default: encoder default)
   -k, --keyframe-interval <s>
                           Max seconds between keyframes (default: 1.0)
   -f, --force             Overwrite the output file if it exists
   -s, --scaler <scaler>   Upscaling algorithm: spatial | super-resolution
-                          (default: spatial)
+                          (default: spatial; only meaningful with --scale)
   -d, --denoise <n>       Temporal noise-filter strength, 1-100
   -m, --motion-blur <n>   Motion-blur strength, 1-100 (50 ≈ 180° shutter)
   --fps <rate>            Target output frame rate (upsample only)
@@ -33,15 +33,46 @@ OPTIONS:
 
 ### Sizing
 
-- `--scale N` applies a uniform integer factor on both axes.
-- `--width` and/or `--height` give explicit dimensions; if only one is supplied,
-  the other is computed from the source aspect ratio.
-- `--scale` cannot be combined with `--width` or `--height`.
-- Output dimensions are rounded up to the nearest even integer (required by
-  H.264 / HEVC).
-- **Scaling is opt-in.** With no sizing flag, the source resolution is
-  preserved and only the requested effects (and codec) are applied — so
-  `fx-upscale in.mp4 --codec hevc` is a pure re-encode.
+`--scale` and `--width` / `--height` are independent:
+
+- `--scale N` controls the scaler stage (how much MetalFX / VT super-resolution
+  magnifies).
+- `--width` / `--height` control the final encoded resolution.
+
+Combine them for **supersampled downscaling**: the pipeline upscales with the
+chosen scaler, then Lanczos-downsamples to the final size. Detail retained at
+the final size exceeds what a direct encode of the source would preserve.
+
+```bash
+# Pure upscale (2× via MetalFX spatial).
+fx-upscale in.mp4 --scale 2
+
+# Pure downsample (Lanczos only, no scaler).
+fx-upscale in_1080p.mp4 --height 720
+
+# Supersampled downscale: upscale 2× to 2160p, then Lanczos to 1080p.
+fx-upscale in_1080p.mp4 --scale 2 --height 1080
+
+# Identity re-encode — codec / quality only.
+fx-upscale in.mp4 --codec hevc
+```
+
+Rules:
+
+- `--width` / `--height` larger than the source require `--scale` — they
+  cannot upscale on their own.
+- `--scaler X` requires `--scale` — it names a scaling algorithm but nothing
+  uses it without `--scale`.
+- If only one of `--width` / `--height` is supplied, the other is derived from
+  the scaler output's aspect ratio.
+- Dimensions are rounded up to the nearest even integer (required by H.264 /
+  HEVC).
+- With none of `--scale`, `--width`, `--height`: identity re-encode — the
+  source resolution is preserved and only the requested effects (and codec)
+  are applied.
+
+> **Behavior note:** `--width` / `--height` no longer imply upscaling on their
+> own — add `--scale N` to enable the scaler stage.
 
 ### Scalers
 

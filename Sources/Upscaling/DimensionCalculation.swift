@@ -49,28 +49,97 @@ public enum DimensionCalculation {
     guard inputSize.width > 0, inputSize.height > 0 else {
       throw Error.invalidInputSize(inputSize)
     }
-    if let requestedWidth, requestedWidth <= 0 {
-      throw Error.invalidRequestedDimension(name: "width", value: requestedWidth)
-    }
-    if let requestedHeight, requestedHeight <= 0 {
-      throw Error.invalidRequestedDimension(name: "height", value: requestedHeight)
-    }
+    try validateRequestedDimensions(width: requestedWidth, height: requestedHeight)
+    return deriveDimensions(
+      reference: inputSize,
+      requestedWidth: requestedWidth,
+      requestedHeight: requestedHeight,
+      defaultWidth: Int(inputSize.width) * 2,
+      clampToReference: false)
+  }
 
-    let aspect: Double = Double(inputSize.width) / Double(inputSize.height)
+  /// Calculates the *final encoded* output size from a scaler-stage output size and optional
+  /// requested dimensions.
+  ///
+  /// This is the downsample companion to ``calculateOutputDimensions(inputSize:requestedWidth:requestedHeight:)``:
+  ///
+  /// - ``calculateOutputDimensions`` computes the scaler-stage output from the source, doubling
+  ///   by default.
+  /// - ``calculateFinalOutputDimensions`` computes the *final* encoded size relative to the
+  ///   scaler output, defaulting to the scaler output itself (pass-through, no terminal
+  ///   downsample).
+  ///
+  /// The result is always ≤ `scalerOutputSize` on both axes, even after even-rounding. A
+  /// Lanczos stage appended when `result != scalerOutputSize` downsample-converts scaler
+  /// output to this size.
+  ///
+  /// - Parameters:
+  ///   - scalerOutputSize: Size produced by the upstream scaler (or the source size if no
+  ///     scaler stage is active). Must be positive on both axes.
+  ///   - requestedWidth: Optional user-requested final width. If `nil`, derived from
+  ///     `requestedHeight` preserving `scalerOutputSize`'s aspect, or defaults to
+  ///     `scalerOutputSize.width`.
+  ///   - requestedHeight: Optional user-requested final height. If `nil`, derived from the
+  ///     computed width preserving `scalerOutputSize`'s aspect.
+  /// - Returns: Even, positive final dimensions, clamped to `scalerOutputSize` on both axes.
+  /// - Throws: ``Error`` if `scalerOutputSize` is non-positive or a requested dimension is
+  ///   non-positive.
+  public static func calculateFinalOutputDimensions(
+    scalerOutputSize: CGSize,
+    requestedWidth: Int?,
+    requestedHeight: Int?
+  ) throws -> CGSize {
+    guard scalerOutputSize.width > 0, scalerOutputSize.height > 0 else {
+      throw Error.invalidInputSize(scalerOutputSize)
+    }
+    try validateRequestedDimensions(width: requestedWidth, height: requestedHeight)
+    return deriveDimensions(
+      reference: scalerOutputSize,
+      requestedWidth: requestedWidth,
+      requestedHeight: requestedHeight,
+      defaultWidth: Int(scalerOutputSize.width),
+      clampToReference: true)
+  }
 
-    let baseWidth: Int =
+  private static func validateRequestedDimensions(width: Int?, height: Int?) throws {
+    if let width, width <= 0 {
+      throw Error.invalidRequestedDimension(name: "width", value: width)
+    }
+    if let height, height <= 0 {
+      throw Error.invalidRequestedDimension(name: "height", value: height)
+    }
+  }
+
+  private static func deriveDimensions(
+    reference: CGSize,
+    requestedWidth: Int?,
+    requestedHeight: Int?,
+    defaultWidth: Int,
+    clampToReference: Bool
+  ) -> CGSize {
+    let aspect = Double(reference.width) / Double(reference.height)
+    let baseWidth =
       requestedWidth
       ?? requestedHeight.map { Int((Double($0) * aspect).rounded()) }
-      ?? Int(inputSize.width) * 2
-    let baseHeight: Int =
-      requestedHeight
-      ?? Int((Double(baseWidth) / aspect).rounded())
+      ?? defaultWidth
+    let baseHeight = requestedHeight ?? Int((Double(baseWidth) / aspect).rounded())
 
-    return CGSize(width: evenCeil(baseWidth), height: evenCeil(baseHeight))
+    let evenWidth = evenCeil(baseWidth)
+    let evenHeight = evenCeil(baseHeight)
+    if clampToReference {
+      return CGSize(
+        width: min(evenWidth, Int(reference.width)),
+        height: min(evenHeight, Int(reference.height)))
+    }
+    return CGSize(width: evenWidth, height: evenHeight)
   }
 }
 
-private func evenCeil(_ value: Int) -> Int {
+/// Rounds a positive integer up to the nearest even integer.
+///
+/// Public so the CLI (a separate target) can share this with `DimensionCalculation` when
+/// deriving scaler-stage sizes from `--scale`.
+public func evenCeil(_ value: Int) -> Int {
   precondition(value > 0, "evenCeil requires a positive input")
   return value + (value & 1)
 }

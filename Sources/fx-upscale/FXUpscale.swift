@@ -10,12 +10,23 @@ import Upscaling
     commandName: "fx-upscale",
     abstract: "Upscale a video file using Apple's Metal / VideoToolbox upscalers.",
     discussion: """
-      Scaling is opt-in: pass --scale for a uniform integer factor (e.g. --scale 4 for 4× on \
-      both axes), or --width and/or --height for explicit dimensions — --scale cannot be \
-      combined with --width or --height. When only one of --width / --height is supplied, the \
-      other is computed from the source aspect ratio. Output dimensions are rounded up to the \
-      nearest even integer (required by H.264 / HEVC). If no scaling flag is passed, the \
-      source resolution is preserved and only the requested effects (and codec) are applied.
+      --scale controls the scaler stage (how much MetalFX / VT super-resolution magnifies). \
+      --width / --height control the final encoded resolution. Pass together to supersample \
+      (upscale then Lanczos-downsample back down). Pass --width / --height alone to \
+      downsample only. Pass --scale alone for a pure upscale. Pass none for an identity \
+      re-encode.
+
+      Supersampled downscaling — --scale N with a smaller --width / --height — renders at \
+      the higher resolution first, then Lanczos-downsamples. Detail retained at the final \
+      size exceeds what a direct encode of the source would preserve.
+
+      Dimensions are rounded up to the nearest even integer (required by H.264 / HEVC). \
+      --width / --height larger than the source require --scale — they cannot upscale on \
+      their own.
+
+      Effects (--denoise, --fps, --motion-blur) run between the scaler and any terminal \
+      downsample, so their input caps (8192×4320 for --fps and --motion-blur) apply at the \
+      scaler output size, not the final encoded size.
 
       HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected because the 8-bit BGRA \
       path would silently clip or shift those values.
@@ -26,27 +37,46 @@ import Upscaling
                             recorded video, but requires an integer scale factor, caps input \
                             at 1920×1080 on macOS, and may download an ML model on first use.
       """,
-    version: "1.2.0"
+    version: "1.3.0"
   )
 
   // MARK: Arguments
 
   @Argument(help: "The video file to upscale", transform: URL.init(fileURLWithPath:)) var url: URL
 
-  @Option(name: .shortAndLong, help: "The output file width") var width: Int?
+  @Option(
+    name: .shortAndLong,
+    help: ArgumentHelp(
+      "Final encoded width.",
+      discussion:
+        "Sets the final encoded resolution, not the scaler output. Alone, can only "
+        + "downsample — use --scale to enable upscaling. Combined with --scale, enables "
+        + "supersampled downscaling."
+    )
+  )
+  var width: Int?
 
   // Use a custom short name to avoid colliding with ArgumentParser's built-in `-h` for `--help`.
   @Option(
     name: [.customShort("H"), .long],
-    help: "The output file height"
+    help: ArgumentHelp(
+      "Final encoded height.",
+      discussion:
+        "Sets the final encoded resolution, not the scaler output. Alone, can only "
+        + "downsample — use --scale to enable upscaling. Combined with --scale, enables "
+        + "supersampled downscaling."
+    )
   )
   var height: Int?
 
   @Option(
     name: [.customShort("x"), .long],
     help: ArgumentHelp(
-      "Uniform integer scale factor (e.g. 2 for 2×, 4 for 4×).",
-      discussion: "Mutually exclusive with --width and --height."
+      "Uniform integer scale factor applied by the scaler stage (e.g. 2 for 2×).",
+      discussion:
+        "Separate from --width / --height, which set the final encoded resolution. "
+        + "Combined use enables supersampled downscaling: --scale 2 --height 1080 on a "
+        + "1080p source renders at 2160p, then Lanczos-downsamples to 1080p."
     )
   )
   var scale: Int?
@@ -81,15 +111,15 @@ import Upscaling
   @Option(
     name: [.customShort("s"), .long],
     help: ArgumentHelp(
-      "Upscaling algorithm (\(UpscalerKind.helpList))",
+      "Upscaling algorithm (\(UpscalerKind.helpList), default: spatial)",
       discussion:
-        "'spatial' uses MTLFXSpatialScaler (fast, arbitrary ratios). "
-        + "'super-resolution' uses VTFrameProcessor's ML-based super resolution — "
-        + "higher quality on recorded video, but integer scale factor only, "
-        + "input capped at 1920×1080, and a one-time model download on first use."
+        "Only meaningful with --scale. 'spatial' uses MTLFXSpatialScaler (fast, arbitrary "
+        + "ratios). 'super-resolution' uses VTFrameProcessor's ML-based super resolution — "
+        + "higher quality on recorded video, but integer scale factor only, input capped "
+        + "at 1920×1080, and a one-time model download on first use."
     )
   )
-  var scaler: UpscalerKind = .spatial
+  var scaler: UpscalerKind?
 
   @Option(
     name: [.customShort("d"), .long],
@@ -108,9 +138,10 @@ import Upscaling
     help: ArgumentHelp(
       "Motion-blur strength, 1-100 (omit for no motion blur).",
       discussion:
-        "Runs VTFrameProcessor's ML-based motion-blur synthesis on the scaled output. "
+        "Runs VTFrameProcessor's ML-based motion-blur synthesis on the scaler output. "
         + "50 matches a standard 180° film shutter; 1 is subtle, 100 is pronounced. "
-        + "Input must be ≤ 8192×4320 after scaling."
+        + "Input must be ≤ 8192×4320 at the scaler output size (before any terminal "
+        + "downsample)."
     )
   )
   var motionBlur: Int?
@@ -120,10 +151,11 @@ import Upscaling
     help: ArgumentHelp(
       "Target output frame rate (omit to preserve source rate).",
       discussion:
-        "Runs VTFrameProcessor's ML-based frame-rate conversion on the scaled output. "
+        "Runs VTFrameProcessor's ML-based frame-rate conversion on the scaler output. "
         + "Must be greater than the source's frame rate — this flag only upsamples; "
         + "downsampling is not supported. Output duration stays the same; only the "
-        + "cadence changes. Input must be ≤ 8192×4320 after scaling."
+        + "cadence changes. Input must be ≤ 8192×4320 at the scaler output size (before "
+        + "any terminal downsample)."
     )
   )
   var fps: Double?
@@ -151,13 +183,13 @@ import Upscaling
     if let height, height <= 0 {
       throw ValidationError("--height must be a positive integer")
     }
-    if let scale {
-      if scale < 2 {
-        throw ValidationError("--scale must be an integer ≥ 2")
-      }
-      if width != nil || height != nil {
-        throw ValidationError("--scale cannot be combined with --width or --height")
-      }
+    if let scale, scale < 2 {
+      throw ValidationError("--scale must be an integer ≥ 2")
+    }
+    if scaler != nil, scale == nil {
+      throw ValidationError(
+        "--scaler \(scaler!.rawValue) selects a scaling algorithm, but no scaling was requested.\n"
+          + "Pass --scale N to enable the scaler, or drop --scaler to do a pure downsample.")
     }
     if let quality, !(1...100).contains(quality) {
       throw ValidationError("Quality must be between 1 and 100")
@@ -215,34 +247,88 @@ import Upscaling
       )
     }
 
-    let wantsScaling = scale != nil || width != nil || height != nil
-    let outputSize: CGSize
-    if wantsScaling {
-      do {
-        outputSize = try DimensionCalculation.calculateOutputDimensions(
-          inputSize: inputSize,
-          requestedWidth: scale.map { Int(inputSize.width) * $0 } ?? width,
-          requestedHeight: scale.map { Int(inputSize.height) * $0 } ?? height)
-      } catch {
-        throw ValidationError(error.localizedDescription)
+    let effectiveScaler: UpscalerKind = scaler ?? .spatial
+
+    let scalerOutputSize: CGSize =
+      if let scale {
+        CGSize(
+          width: evenCeil(Int(inputSize.width) * scale),
+          height: evenCeil(Int(inputSize.height) * scale))
+      } else {
+        inputSize
       }
-    } else {
-      outputSize = inputSize
+
+    // Reject requests that would silently clamp inside `calculateFinalOutputDimensions`:
+    // without `--scale`, a request > source is an implicit-upscale attempt; with `--scale`, a
+    // request > scaler output asks the downsample-only Lanczos stage to upscale.
+    if scale == nil {
+      let rejectImplicitUpscale = { (axis: String, requested: Int?, sourceDim: Int) throws in
+        guard let requested, requested > sourceDim else { return }
+        throw ValidationError(
+          "--\(axis) \(requested) exceeds the source "
+            + "(\(Int(inputSize.width))x\(Int(inputSize.height))), but no scaler was selected.\n"
+            + "Pass --scale N (e.g. --scale 2) to enable the scaler stage.\n"
+            + "--width/--height alone can only downsample.")
+      }
+      try rejectImplicitUpscale("width", width, Int(inputSize.width))
+      try rejectImplicitUpscale("height", height, Int(inputSize.height))
+    } else if let scale {
+      let widthExceeds = (width ?? 0) > Int(scalerOutputSize.width)
+      let heightExceeds = (height ?? 0) > Int(scalerOutputSize.height)
+      if widthExceeds || heightExceeds {
+        let axes: String =
+          switch (widthExceeds, heightExceeds) {
+          case (true, true): "both"
+          case (true, false): "width"
+          case (false, true): "height"
+          case (false, false): ""
+          }
+        let requestedWidth = width ?? Int(scalerOutputSize.width)
+        let requestedHeight = height ?? Int(scalerOutputSize.height)
+        let ratio = max(
+          Double(requestedWidth) / Double(inputSize.width),
+          Double(requestedHeight) / Double(inputSize.height))
+        let nextScale = Int(ratio.rounded(.up))
+        throw ValidationError(
+          "--width/--height (\(requestedWidth)x\(requestedHeight)) exceeds the scaler output "
+            + "(\(Int(scalerOutputSize.width))x\(Int(scalerOutputSize.height)) at --scale \(scale)).\n"
+            + "The Lanczos stage only downsamples.\n"
+            + "  • Axis(es) exceeded: \(axes)\n"
+            + "  • Tip: --scale \(nextScale) would produce the scaler output "
+            + "(\(nextScale * Int(inputSize.width))x\(nextScale * Int(inputSize.height))).\n"
+            + "Lower --width/--height to fit within the scaler output, or raise --scale.")
+      }
     }
 
-    guard outputSize.width > 0, outputSize.height > 0 else {
+    let finalOutputSize: CGSize
+    do {
+      finalOutputSize = try DimensionCalculation.calculateFinalOutputDimensions(
+        scalerOutputSize: scalerOutputSize,
+        requestedWidth: width,
+        requestedHeight: height)
+    } catch {
+      throw ValidationError(error.localizedDescription)
+    }
+
+    guard finalOutputSize.width > 0, finalOutputSize.height > 0,
+      scalerOutputSize.width > 0, scalerOutputSize.height > 0
+    else {
       throw ValidationError("Computed output dimensions are invalid.")
     }
 
-    guard Int(outputSize.width) <= UpscalingExportSession.maxOutputSize,
-      Int(outputSize.height) <= UpscalingExportSession.maxOutputSize
+    guard Int(scalerOutputSize.width) <= UpscalingExportSession.maxOutputSize,
+      Int(scalerOutputSize.height) <= UpscalingExportSession.maxOutputSize,
+      Int(finalOutputSize.width) <= UpscalingExportSession.maxOutputSize,
+      Int(finalOutputSize.height) <= UpscalingExportSession.maxOutputSize
     else {
       throw ValidationError(
         "Maximum supported width/height: \(UpscalingExportSession.maxOutputSize)")
     }
 
-    if wantsScaling {
-      try preflight { try scaler.preflight(inputSize: inputSize, outputSize: outputSize) }
+    if scale != nil {
+      try preflight {
+        try effectiveScaler.preflight(inputSize: inputSize, outputSize: scalerOutputSize)
+      }
     }
 
     if let denoise {
@@ -253,7 +339,7 @@ import Upscaling
 
     if let motionBlur {
       try preflight {
-        try VTMotionBlurProcessor.preflight(frameSize: outputSize, strength: motionBlur)
+        try VTMotionBlurProcessor.preflight(frameSize: scalerOutputSize, strength: motionBlur)
       }
     }
 
@@ -268,7 +354,15 @@ import Upscaling
         )
       }
       try preflight {
-        try VTFrameRateConverter.preflight(frameSize: outputSize, targetFrameRate: fps)
+        try VTFrameRateConverter.preflight(frameSize: scalerOutputSize, targetFrameRate: fps)
+      }
+    }
+
+    let needsDownsample = finalOutputSize != scalerOutputSize
+    if needsDownsample {
+      try preflight {
+        try CILanczosDownsampler.preflight(
+          inputSize: scalerOutputSize, outputSize: finalOutputSize)
       }
     }
 
@@ -286,26 +380,38 @@ import Upscaling
 
     let metricsCollector = PipelineMetricsCollector()
 
+    // Explicit capture list for release-WMO concurrency hygiene.
+    let wantsScaler = scale != nil
     let chainFactory: UpscalingExportSession.ChainFactory = {
-      [scaler, denoise, fps, motionBlur, wantsScaling] inputSize in
+      [
+        effectiveScaler, wantsScaler, denoise, fps, motionBlur,
+        scalerOutputSize, finalOutputSize, needsDownsample, metricsCollector
+      ] inputSize in
       var stages: [any FrameProcessorBackend] = []
       if let denoise {
         stages.append(
           try await VTTemporalNoiseProcessor(frameSize: inputSize, strength: denoise))
       }
-      if wantsScaling {
-        stages.append(try await scaler.makeBackend(inputSize: inputSize, outputSize: outputSize))
+      if wantsScaler {
+        stages.append(
+          try await effectiveScaler.makeBackend(
+            inputSize: inputSize, outputSize: scalerOutputSize))
       }
       if let fps {
         stages.append(
-          try await VTFrameRateConverter(frameSize: outputSize, targetFrameRate: fps))
+          try await VTFrameRateConverter(frameSize: scalerOutputSize, targetFrameRate: fps))
       }
       if let motionBlur {
         stages.append(
-          try await VTMotionBlurProcessor(frameSize: outputSize, strength: motionBlur))
+          try await VTMotionBlurProcessor(frameSize: scalerOutputSize, strength: motionBlur))
+      }
+      if needsDownsample {
+        stages.append(
+          try CILanczosDownsampler(
+            inputSize: scalerOutputSize, outputSize: finalOutputSize))
       }
       return try FrameProcessorChain(
-        inputSize: inputSize, outputSize: outputSize, stages: stages,
+        inputSize: inputSize, outputSize: finalOutputSize, stages: stages,
         metricsCollector: metricsCollector)
     }
 
@@ -313,7 +419,7 @@ import Upscaling
       asset: asset,
       outputCodec: outputCodec,
       preferredOutputURL: outputURL,
-      outputSize: outputSize,
+      outputSize: finalOutputSize,
       quality: normalizedQuality,
       keyFrameInterval: keyframeInterval > 0 ? keyframeInterval : nil,
       creator: "fx-upscale",
@@ -324,13 +430,26 @@ import Upscaling
     let denoiseInfo = denoise.map { ", denoise: \($0)" } ?? ""
     let fpsInfo = fps.map { ", fps: \(String(format: "%g", $0))" } ?? ""
     let motionBlurInfo = motionBlur.map { ", motion-blur: \($0)" } ?? ""
-    let summary: String =
-      wantsScaling
-      ? "Upscaling from \(Int(inputSize.width))x\(Int(inputSize.height)) "
-        + "to \(Int(outputSize.width))x\(Int(outputSize.height)) "
-        + "using \(scaler.displayName), codec: \(outputCodec.rawValue)\(qualityInfo)"
-      : "Processing at \(Int(inputSize.width))x\(Int(inputSize.height)), "
+    let source = "\(Int(inputSize.width))x\(Int(inputSize.height))"
+    let scalerOut = "\(Int(scalerOutputSize.width))x\(Int(scalerOutputSize.height))"
+    let final = "\(Int(finalOutputSize.width))x\(Int(finalOutputSize.height))"
+    let summary: String
+    switch (wantsScaler, needsDownsample) {
+    case (false, false):
+      summary =
+        "Processing at \(source), codec: \(outputCodec.rawValue)\(qualityInfo)"
+    case (true, false):
+      summary =
+        "Upscaling from \(source) to \(scalerOut) using \(effectiveScaler.displayName), "
         + "codec: \(outputCodec.rawValue)\(qualityInfo)"
+    case (false, true):
+      summary =
+        "Downsampling from \(source) to \(final), codec: \(outputCodec.rawValue)\(qualityInfo)"
+    case (true, true):
+      summary =
+        "Upscaling from \(source) to \(scalerOut) using \(effectiveScaler.displayName), "
+        + "then downsampling to \(final), codec: \(outputCodec.rawValue)\(qualityInfo)"
+    }
     Terminal.info(summary + denoiseInfo + fpsInfo + motionBlurInfo)
 
     // Install SIGINT/SIGTERM handlers unconditionally so Ctrl-C during pipe/CI runs still
