@@ -23,15 +23,27 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
   /// Creates a motion-blur processor for frames at the given size.
   ///
   /// Motion blur preserves dimensions, so `inputSize == outputSize == frameSize`.
-  public init(frameSize: CGSize, strength: Int) async throws {
+  public init(
+    frameSize: CGSize,
+    strength: Int,
+    pixelFormat: OSType = kCVPixelFormatType_32BGRA
+  ) async throws {
     self.frameSize = frameSize
     self.strength = try Self.validateStrength(strength)
+    self.pixelFormat = pixelFormat
 
+    let configuration = try Self.makeConfiguration(frameSize: frameSize)
+    guard frameSupportedPixelFormats(of: configuration).contains(pixelFormat)
+    else {
+      throw Error.unsupportedPixelFormat(
+        pixelFormat, supported: frameSupportedPixelFormats(of: configuration))
+    }
     self.core = try VTStatefulBackendCore(
-      configuration: try Self.makeConfiguration(frameSize: frameSize),
+      configuration: configuration,
       poolSize: frameSize,
       minimumPoolBufferCount: Self.minimumPoolBufferCount,
-      backend: .motionBlur)
+      backend: .motionBlur,
+      pixelFormat: pixelFormat)
   }
 
   /// Cheap synchronous validation that only checks strength bounds and whether the
@@ -41,12 +53,29 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     _ = try makeConfiguration(frameSize: frameSize)
   }
 
+  public static func preflight(frameSize: CGSize, strength: Int, pixelFormat: OSType) throws {
+    _ = try validateStrength(strength)
+    let configuration = try makeConfiguration(frameSize: frameSize)
+    guard frameSupportedPixelFormats(of: configuration).contains(pixelFormat)
+    else {
+      throw Error.unsupportedPixelFormat(
+        pixelFormat, supported: frameSupportedPixelFormats(of: configuration))
+    }
+  }
+
+  public static func supportedPixelFormats(frameSize: CGSize) throws -> Set<OSType> {
+    let configuration = try makeConfiguration(frameSize: frameSize)
+    return frameSupportedPixelFormats(of: configuration)
+  }
+
   // MARK: Public
 
   public nonisolated var inputSize: CGSize { frameSize }
   public nonisolated var outputSize: CGSize { frameSize }
   public static let displayName = "Motion blur"
   public nonisolated var displayName: String { Self.displayName }
+  public nonisolated var supportedInputFormats: Set<OSType> { [pixelFormat] }
+  public nonisolated var producedOutputFormat: OSType { pixelFormat }
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 
@@ -58,7 +87,8 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     guard await processingGate.acquire() else { throw CancellationError() }
     do {
       try Task.checkCancellation()
-      try validateProcessorInput(pixelBuffer, expectedInputSize: frameSize)
+      try validateProcessorInput(
+        pixelBuffer, expectedInputSize: frameSize, expectedPixelFormat: pixelFormat)
 
       let vtPts = core.nextPts(frameIndex: &frameIndex)
       let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
@@ -82,7 +112,8 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
         expectedOutputSize: frameSize,
         externalPool: externalPool,
         internalPool: core.pixelBufferPool,
-        providedOutput: nil
+        providedOutput: nil,
+        expectedPixelFormat: pixelFormat
       )
 
       let destinationFrame = try core.makeFrame(output, pts: vtPts)
@@ -143,6 +174,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
 
   private let frameSize: CGSize
   private let strength: Int
+  private let pixelFormat: OSType
   private let core: VTStatefulBackendCore
   private let processingGate = NonReentrantAsyncGate()
 
@@ -192,6 +224,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
 extension VTMotionBlurProcessor {
   public enum Error: Swift.Error, LocalizedError {
     case strengthOutOfRange(requested: Int, minimum: Int, maximum: Int)
+    case unsupportedPixelFormat(OSType, supported: Set<OSType>)
     case configurationInitFailed(frameWidth: Int, frameHeight: Int)
 
     public var errorDescription: String? {
@@ -199,6 +232,13 @@ extension VTMotionBlurProcessor {
       case .strengthOutOfRange(let requested, let minimum, let maximum):
         "Motion-blur strength \(requested) is out of range. "
           + "Valid range is \(minimum)–\(maximum) (50 matches a 180° film shutter)."
+      case .unsupportedPixelFormat(let requested, let supported):
+        "Motion blur doesn't support pixel format \(describePixelFormat(requested)). "
+          + "Supported formats: "
+          + (supported.isEmpty
+            ? "none"
+            : supported.map(describePixelFormat).sorted().joined(separator: ", "))
+          + "."
       case .configurationInitFailed(let frameWidth, let frameHeight):
         "Motion blur rejected the input configuration (\(frameWidth)×\(frameHeight)). "
           + "On macOS, inputs must be ≤ 8192×4320."

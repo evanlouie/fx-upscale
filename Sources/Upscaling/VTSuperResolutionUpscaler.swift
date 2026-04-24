@@ -41,6 +41,11 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
 
     let configuration = try Self.makeConfiguration(
       inputSize: inputSize, outputSize: outputSize)
+    guard frameSupportedPixelFormats(of: configuration).contains(pixelFormat)
+    else {
+      throw Error.unsupportedPixelFormat(
+        pixelFormat, supported: frameSupportedPixelFormats(of: configuration))
+    }
 
     // The model ships separately from the OS and may need to be fetched on first use. Drive the
     // download synchronously so the first frame doesn't race against an unready processor.
@@ -68,11 +73,20 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     _ = try makeConfiguration(inputSize: inputSize, outputSize: outputSize)
   }
 
+  public static func supportedPixelFormats(
+    inputSize: CGSize,
+    outputSize: CGSize
+  ) throws -> Set<OSType> {
+    let configuration = try makeConfiguration(inputSize: inputSize, outputSize: outputSize)
+    return frameSupportedPixelFormats(of: configuration)
+  }
+
   // MARK: Public
 
   public nonisolated let inputSize: CGSize
   public nonisolated let outputSize: CGSize
-  public nonisolated let displayName = "Super resolution"
+  public static let displayName = "Super resolution"
+  public nonisolated var displayName: String { Self.displayName }
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 
@@ -256,6 +270,7 @@ extension VTSuperResolutionUpscaler {
     case anisotropicScalingNotSupported(widthRatio: Double, heightRatio: Double)
     case nonIntegerScaleFactor(ratio: Double)
     case unsupportedScaleFactor(requested: Int, supported: [Int])
+    case unsupportedPixelFormat(OSType, supported: Set<OSType>)
     case configurationInitFailed(inputWidth: Int, inputHeight: Int, scaleFactor: Int)
     case modelDownloadFailed(Swift.Error)
 
@@ -275,6 +290,13 @@ extension VTSuperResolutionUpscaler {
         "Super resolution doesn't support \(requested)× scaling on this device. "
           + "Supported scale factors: "
           + (supported.isEmpty ? "none" : supported.map { "\($0)×" }.joined(separator: ", "))
+          + "."
+      case .unsupportedPixelFormat(let requested, let supported):
+        "Super resolution doesn't support pixel format \(describePixelFormat(requested)). "
+          + "Supported formats: "
+          + (supported.isEmpty
+            ? "none"
+            : supported.map(describePixelFormat).sorted().joined(separator: ", "))
           + "."
       case .configurationInitFailed(let inputWidth, let inputHeight, let scaleFactor):
         "Super resolution rejected the input configuration "

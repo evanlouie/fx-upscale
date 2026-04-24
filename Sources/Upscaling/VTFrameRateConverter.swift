@@ -51,9 +51,14 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   /// Creates a frame-rate converter for frames at the given size and target rate.
   ///
   /// Frame-rate conversion preserves dimensions, so `inputSize == outputSize == frameSize`.
-  public init(frameSize: CGSize, targetFrameRate: Double) async throws {
+  public init(
+    frameSize: CGSize,
+    targetFrameRate: Double,
+    pixelFormat: OSType = kCVPixelFormatType_32BGRA
+  ) async throws {
     self.frameSize = frameSize
     self.targetFrameRate = try Self.validateTargetFrameRate(targetFrameRate)
+    self.pixelFormat = pixelFormat
     // For integer target rates, use the rate itself as the timescale so that
     // `CMTime(value: k, timescale: rate)` represents exactly `k/rate` with no rounding
     // drift. For non-integer rates, fall back to a very high timescale — drift per period
@@ -67,14 +72,21 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     }
 
     let configuration = try Self.makeConfiguration(frameSize: frameSize)
+    guard frameSupportedPixelFormats(of: configuration).contains(pixelFormat)
+    else {
+      throw Error.unsupportedPixelFormat(
+        pixelFormat, supported: frameSupportedPixelFormats(of: configuration))
+    }
 
     let processor = VTFrameProcessor()
     try processor.startSession(configuration: configuration)
     self.processor = processor
 
     guard
-      let pixelBufferPool = makeBGRAPixelBufferPool(
-        size: frameSize, minimumBufferCount: Self.minimumPoolBufferCount)
+      let pixelBufferPool = makePixelBufferPool(
+        format: pixelFormat,
+        size: frameSize,
+        minimumBufferCount: Self.minimumPoolBufferCount)
     else { throw VTBackendError.pixelBufferPoolCreationFailed(backend: .frameRateConversion) }
     self.pixelBufferPool = pixelBufferPool
   }
@@ -92,12 +104,33 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     _ = try makeConfiguration(frameSize: frameSize)
   }
 
+  public static func preflight(
+    frameSize: CGSize,
+    targetFrameRate: Double,
+    pixelFormat: OSType
+  ) throws {
+    _ = try validateTargetFrameRate(targetFrameRate)
+    let configuration = try makeConfiguration(frameSize: frameSize)
+    guard frameSupportedPixelFormats(of: configuration).contains(pixelFormat)
+    else {
+      throw Error.unsupportedPixelFormat(
+        pixelFormat, supported: frameSupportedPixelFormats(of: configuration))
+    }
+  }
+
+  public static func supportedPixelFormats(frameSize: CGSize) throws -> Set<OSType> {
+    let configuration = try makeConfiguration(frameSize: frameSize)
+    return frameSupportedPixelFormats(of: configuration)
+  }
+
   // MARK: Public
 
   public nonisolated var inputSize: CGSize { frameSize }
   public nonisolated var outputSize: CGSize { frameSize }
   public static let displayName = "Frame rate conversion"
   public nonisolated var displayName: String { Self.displayName }
+  public nonisolated var supportedInputFormats: Set<OSType> { [pixelFormat] }
+  public nonisolated var producedOutputFormat: OSType { pixelFormat }
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 
@@ -184,7 +217,8 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   ) async throws {
     // Validate and wrap the incoming frame. Each source frame is wrapped exactly once; the
     // same wrapper serves as `nextFrame` on this submission and `sourceFrame` on the next.
-    try validateProcessorInput(pixelBuffer, expectedInputSize: frameSize)
+    try validateProcessorInput(
+      pixelBuffer, expectedInputSize: frameSize, expectedPixelFormat: pixelFormat)
 
     let vtPts = CMTime(value: Int64(frameIndex), timescale: vtSyntheticTimescale)
     frameIndex += 1
@@ -302,7 +336,8 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
         expectedOutputSize: frameSize,
         externalPool: externalPool,
         internalPool: pixelBufferPool,
-        providedOutput: nil
+        providedOutput: nil,
+        expectedPixelFormat: pixelFormat
       )
       guard
         let wrapper = VTFrameProcessorFrame(
@@ -361,6 +396,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
 
   private let frameSize: CGSize
   private let targetFrameRate: Double
+  private let pixelFormat: OSType
   /// Period between consecutive target-output PTSs. For integer rates we use
   /// `timescale == rate, value == 1` so `period.value * k` is exact; for non-integer rates
   /// we use a 1 GHz fallback timescale, which bounds per-period rounding to under half a
@@ -423,6 +459,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
 extension VTFrameRateConverter {
   public enum Error: Swift.Error, LocalizedError {
     case targetFrameRateOutOfRange(requested: Double, maximum: Double)
+    case unsupportedPixelFormat(OSType, supported: Set<OSType>)
     case configurationInitFailed(frameWidth: Int, frameHeight: Int)
 
     public var errorDescription: String? {
@@ -430,6 +467,13 @@ extension VTFrameRateConverter {
       case .targetFrameRateOutOfRange(let requested, let maximum):
         "Target frame rate \(requested) is out of range. "
           + "Must be finite, positive, and ≤ \(Int(maximum)) fps."
+      case .unsupportedPixelFormat(let requested, let supported):
+        "Frame rate conversion doesn't support pixel format \(describePixelFormat(requested)). "
+          + "Supported formats: "
+          + (supported.isEmpty
+            ? "none"
+            : supported.map(describePixelFormat).sorted().joined(separator: ", "))
+          + "."
       case .configurationInitFailed(let frameWidth, let frameHeight):
         "Frame-rate conversion rejected the input configuration "
           + "(\(frameWidth)×\(frameHeight)). On macOS, inputs must be ≤ 8192×4320."

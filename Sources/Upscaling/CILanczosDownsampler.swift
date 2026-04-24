@@ -10,18 +10,25 @@ import Metal
 /// Performs a terminal `CILanczosScaleTransform` downsample on `CVPixelBuffer`s.
 ///
 /// Only valid as a downsample: `outputSize` must be ≤ `inputSize` on both axes. The filter is
-/// evaluated in sRGB on both ends so it stays in the same perceptual space as
-/// `MTLFXSpatialScaler.bgra8Perceptual` — mixing linear-light resampling after a perceptual
-/// upscale would shift highlights and shadows.
+/// evaluated in the source color space on both ends. That keeps P3 / Rec. 709 SDR tagged
+/// sources in their intended transfer function instead of forcing every downsample through
+/// an sRGB interpretation.
 ///
 /// `requiresInstancePerStream` is `true` so stereo pairs don't contend on one output pool.
 public actor CILanczosDownsampler: FrameProcessorBackend {
   // MARK: Lifecycle
 
-  public init(inputSize: CGSize, outputSize: CGSize) throws {
+  public init(
+    inputSize: CGSize,
+    outputSize: CGSize,
+    pixelFormat: OSType = kCVPixelFormatType_32BGRA,
+    colorMetadata: VideoColorMetadata = .rec709
+  ) throws {
     try Self.validate(inputSize: inputSize, outputSize: outputSize)
     self.inputSize = inputSize
     self.outputSize = outputSize
+    self.pixelFormat = pixelFormat
+    self.colorSpace = colorMetadata.cgColorSpace
 
     let verticalScale = Double(outputSize.height) / Double(inputSize.height)
     self.filterScale = Float(verticalScale)
@@ -30,7 +37,8 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
     self.outputRect = CGRect(origin: .zero, size: outputSize)
 
     guard
-      let pool = makeBGRAPixelBufferPool(
+      let pool = makePixelBufferPool(
+        format: pixelFormat,
         size: outputSize, minimumBufferCount: Self.minimumPoolBufferCount)
     else {
       throw Error.poolAllocationFailed
@@ -40,20 +48,29 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
     guard let device = MTLCreateSystemDefaultDevice() else {
       throw Error.metalDeviceUnavailable
     }
-    // sRGB working + output space skips CoreImage's default linearize/relinearize around the
-    // kernel — same perceptual-space invariant enforced per-frame by the render's `colorSpace:`
-    // argument, moved into context options so CI can optimize the graph.
     self.context = CIContext(
       mtlDevice: device,
       options: [
-        .workingColorSpace: Self.sRGB,
-        .outputColorSpace: Self.sRGB,
+        .workingColorSpace: colorSpace,
+        .outputColorSpace: colorSpace,
         .cacheIntermediates: false,
       ])
   }
 
   public static func preflight(inputSize: CGSize, outputSize: CGSize) throws {
     try validate(inputSize: inputSize, outputSize: outputSize)
+  }
+
+  public static func supportedPixelFormats(
+    inputSize: CGSize,
+    outputSize: CGSize,
+    colorMetadata: VideoColorMetadata
+  ) throws -> Set<OSType> {
+    try validate(inputSize: inputSize, outputSize: outputSize)
+    let colorSpace = colorMetadata.cgColorSpace
+    return Set(
+      FrameFormat.preferredPixelFormats(for: colorMetadata)
+        .filter { canRender(pixelFormat: $0, colorSpace: colorSpace) })
   }
 
   // MARK: Public
@@ -64,6 +81,8 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
   public nonisolated var displayName: String { Self.displayName }
   public nonisolated var requiresInstancePerStream: Bool { true }
   public nonisolated var maxConcurrentFrames: Int { 2 }
+  public nonisolated var supportedInputFormats: Set<OSType> { [pixelFormat] }
+  public nonisolated var producedOutputFormat: OSType { pixelFormat }
 
   public func process(
     _ pixelBuffer: sending CVPixelBuffer,
@@ -76,14 +95,13 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
       expectedOutputSize: outputSize,
       externalPool: externalPool,
       internalPool: pixelBufferPool,
-      providedOutput: nil
+      providedOutput: nil,
+      expectedPixelFormat: pixelFormat
     )
 
-    // Pin sRGB on the input: scaler-output CVPixelBuffers carry no attached CGColorSpace and
-    // CoreImage's default inference has shifted across OS versions.
     let input = CIImage(
       cvPixelBuffer: pixelBuffer,
-      options: [.colorSpace: Self.sRGB]
+      options: [.colorSpace: colorSpace]
     )
     let filter = CIFilter.lanczosScaleTransform()
     filter.inputImage = input
@@ -96,6 +114,7 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
     let capturedContext = context
     let capturedImage = scaled
     let capturedBounds = outputRect
+    let capturedColorSpace = colorSpace
     nonisolated(unsafe) let capturedOutput = output
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
       DispatchQueue.global(qos: .userInitiated).async {
@@ -103,7 +122,7 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
           capturedImage,
           to: capturedOutput,
           bounds: capturedBounds,
-          colorSpace: Self.sRGB
+          colorSpace: capturedColorSpace
         )
         continuation.resume()
       }
@@ -124,14 +143,39 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
   /// plus headroom for the 2-capacity output channel downstream.
   private static let minimumPoolBufferCount = 5
 
-  private static let sRGB: CGColorSpace =
-    CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-
   private let context: CIContext
   private let pixelBufferPool: CVPixelBufferPool
+  private let pixelFormat: OSType
+  private let colorSpace: CGColorSpace
   private let filterScale: Float
   private let filterAspectRatio: Float
   private let outputRect: CGRect
+
+  private static func canRender(pixelFormat: OSType, colorSpace: CGColorSpace) -> Bool {
+    guard let device = MTLCreateSystemDefaultDevice() else { return false }
+    let probeSize = CGSize(width: 16, height: 16)
+    guard
+      let pool = makePixelBufferPool(
+        format: pixelFormat, size: probeSize, minimumBufferCount: 1)
+    else { return false }
+
+    var buffer: CVPixelBuffer?
+    guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess,
+      let buffer
+    else { return false }
+
+    let context = CIContext(
+      mtlDevice: device,
+      options: [.workingColorSpace: colorSpace, .outputColorSpace: colorSpace])
+    let image = CIImage(color: .black).cropped(
+      to: CGRect(origin: .zero, size: probeSize))
+    context.render(
+      image,
+      to: buffer,
+      bounds: CGRect(origin: .zero, size: probeSize),
+      colorSpace: colorSpace)
+    return true
+  }
 
   private static func validate(inputSize: CGSize, outputSize: CGSize) throws {
     guard inputSize.width > 0, inputSize.height > 0 else {

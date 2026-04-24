@@ -24,22 +24,47 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
   /// Creates a temporal-noise processor for frames at the given size.
   ///
   /// Denoise preserves dimensions, so `inputSize == outputSize == frameSize`.
-  public init(frameSize: CGSize, strength: Int) async throws {
+  public init(
+    frameSize: CGSize,
+    strength: Int,
+    pixelFormat: OSType = kCVPixelFormatType_32BGRA
+  ) async throws {
     self.frameSize = frameSize
     self.filterStrength = Float(try Self.validateStrength(strength)) / Float(Self.maxStrength)
+    self.pixelFormat = pixelFormat
 
     self.core = try VTStatefulBackendCore(
-      configuration: try Self.makeConfiguration(frameSize: frameSize),
+      configuration: try Self.makeConfiguration(frameSize: frameSize, pixelFormat: pixelFormat),
       poolSize: frameSize,
       minimumPoolBufferCount: Self.minimumPoolBufferCount,
-      backend: .temporalNoise)
+      backend: .temporalNoise,
+      pixelFormat: pixelFormat)
   }
 
   /// Cheap synchronous validation that only checks strength bounds and whether the
   /// configuration can be constructed at the requested dimensions. Does not start a session.
   public static func preflight(frameSize: CGSize, strength: Int) throws {
     _ = try validateStrength(strength)
-    _ = try makeConfiguration(frameSize: frameSize)
+    _ = try makeConfiguration(frameSize: frameSize, pixelFormat: kCVPixelFormatType_32BGRA)
+  }
+
+  public static func preflight(frameSize: CGSize, strength: Int, pixelFormat: OSType) throws {
+    _ = try validateStrength(strength)
+    _ = try makeConfiguration(frameSize: frameSize, pixelFormat: pixelFormat)
+  }
+
+  public static func supportedPixelFormats(frameSize: CGSize) throws -> Set<OSType> {
+    guard VTTemporalNoiseFilterConfiguration.isSupported else {
+      throw VTBackendError.notSupportedOnDevice(backend: .temporalNoise)
+    }
+    let (frameWidth, frameHeight) = frameSize.intDimensions
+    let candidates = pixelFormatSet(from: VTTemporalNoiseFilterConfiguration.supportedSourcePixelFormats)
+    return Set(candidates.filter { format in
+      VTTemporalNoiseFilterConfiguration(
+        frameWidth: frameWidth,
+        frameHeight: frameHeight,
+        sourcePixelFormat: format) != nil
+    })
   }
 
   // MARK: Public
@@ -48,6 +73,8 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
   public nonisolated var outputSize: CGSize { frameSize }
   public static let displayName = "Denoise"
   public nonisolated var displayName: String { Self.displayName }
+  public nonisolated var supportedInputFormats: Set<OSType> { [pixelFormat] }
+  public nonisolated var producedOutputFormat: OSType { pixelFormat }
 
   public nonisolated var requiresInstancePerStream: Bool { true }
 
@@ -59,7 +86,8 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
     guard await processingGate.acquire() else { throw CancellationError() }
     do {
       try Task.checkCancellation()
-      try validateProcessorInput(pixelBuffer, expectedInputSize: frameSize)
+      try validateProcessorInput(
+        pixelBuffer, expectedInputSize: frameSize, expectedPixelFormat: pixelFormat)
 
       let vtPts = core.nextPts(frameIndex: &frameIndex)
       let sourceFrame = try core.makeFrame(pixelBuffer, pts: vtPts)
@@ -83,7 +111,8 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
         expectedOutputSize: frameSize,
         externalPool: externalPool,
         internalPool: core.pixelBufferPool,
-        providedOutput: nil
+        providedOutput: nil,
+        expectedPixelFormat: pixelFormat
       )
 
       let destinationFrame = try core.makeFrame(output, pts: vtPts)
@@ -140,11 +169,9 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
   private static let minStrength = 1
   private static let maxStrength = 100
 
-  /// Source pixel format the rest of the pipeline uses end-to-end.
-  private static let sourcePixelFormat: OSType = kCVPixelFormatType_32BGRA
-
   private let frameSize: CGSize
   private let filterStrength: Float
+  private let pixelFormat: OSType
   private let core: VTStatefulBackendCore
   private let processingGate = NonReentrantAsyncGate()
 
@@ -166,7 +193,8 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
   /// dimension / device-support / pixel-format rules. Construction is cheap — it does not
   /// start a session.
   private static func makeConfiguration(
-    frameSize: CGSize
+    frameSize: CGSize,
+    pixelFormat: OSType
   ) throws -> VTTemporalNoiseFilterConfiguration {
     guard VTTemporalNoiseFilterConfiguration.isSupported else {
       throw VTBackendError.notSupportedOnDevice(backend: .temporalNoise)
@@ -178,7 +206,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
       let configuration = VTTemporalNoiseFilterConfiguration(
         frameWidth: frameWidth,
         frameHeight: frameHeight,
-        sourcePixelFormat: sourcePixelFormat
+        sourcePixelFormat: pixelFormat
       )
     else {
       throw Error.configurationInitFailed(frameWidth: frameWidth, frameHeight: frameHeight)

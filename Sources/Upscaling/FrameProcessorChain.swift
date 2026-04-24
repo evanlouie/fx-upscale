@@ -631,11 +631,15 @@ extension FrameProcessorChain {
 
 /// Human-readable label for a `CVPixelFormatType` four-cc. Used in chain-validation
 /// error messages so users see "32BGRA" rather than a raw integer.
-private func describePixelFormat(_ format: OSType) -> String {
+public func describePixelFormat(_ format: OSType) -> String {
   switch format {
   case kCVPixelFormatType_32BGRA: return "32BGRA"
+  case kCVPixelFormatType_64RGBAHalf: return "64RGBAHalf"
   case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return "420YpCbCr8BiPlanarVideoRange"
+  case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return "420YpCbCr8BiPlanarFullRange"
   case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return "420YpCbCr10BiPlanarVideoRange"
+  case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+    return "420YpCbCr10BiPlanarFullRange"
   default:
     // Render the four-cc as ASCII when all four bytes are printable; otherwise fall back to
     // the raw hex.

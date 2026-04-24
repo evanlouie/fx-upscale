@@ -28,10 +28,10 @@ import Upscaling
       downsample, so their input caps (8192×4320 for --fps and --motion-blur) apply at the \
       scaler output size, not the final encoded size.
 
-      HDR / Rec. 2020 inputs require `--scaler super-resolution` (without `--width` / \
-      `--height`) so the chain can round-trip 10-bit 420 YUV end-to-end. The spatial path \
-      remains 8-bit sRGB-only; other chains that mix sRGB-only stages (Lanczos, denoise, \
-      motion blur, frame-rate conversion) also reject HDR for now.
+      Color handling is negotiated from the source tags and the selected stages. Identity \
+      re-encodes and VideoToolbox-backed stages prefer native YUV / high-precision formats \
+      when the OS reports support; MetalFX spatial remains BGRA-only. Full-range SDR sources \
+      continue through RGB/video-range-only chains with a warning.
 
       Two upscaling algorithms are available via --scaler:
         spatial (default)   MTLFXSpatialScaler — fast, arbitrary ratios.
@@ -340,51 +340,13 @@ import Upscaling
         "Maximum supported width/height: \(UpscalingExportSession.maxOutputSize)")
     }
 
-    if scale != nil {
-      try preflight {
-        try effectiveScaler.preflight(inputSize: inputSize, outputSize: scalerOutputSize)
-      }
-    }
-
-    if let denoise {
-      try preflight {
-        try VTTemporalNoiseProcessor.preflight(frameSize: inputSize, strength: denoise)
-      }
-    }
-
-    if let motionBlur {
-      try preflight {
-        try VTMotionBlurProcessor.preflight(frameSize: scalerOutputSize, strength: motionBlur)
-      }
-    }
-
-    if let fps {
-      // `nominalFrameRate` is a Float; promote for the comparison so rounding doesn't pass
-      // a marginally-higher target like 29.9999 as "greater than" a 30.0 source.
-      let sourceFrameRate = try await Double(videoTrack.load(.nominalFrameRate))
-      if sourceFrameRate > 0, fps <= sourceFrameRate {
-        throw ValidationError(
-          "--fps must be greater than the source frame rate "
-            + "(source: \(String(format: "%.3f", sourceFrameRate)))."
-        )
-      }
-      try preflight {
-        try VTFrameRateConverter.preflight(frameSize: scalerOutputSize, targetFrameRate: fps)
-      }
-    }
-
     let needsDownsample = finalOutputSize != scalerOutputSize
-    if needsDownsample {
-      try preflight {
-        try CILanczosDownsampler.preflight(
-          inputSize: scalerOutputSize, outputSize: finalOutputSize)
-      }
-    }
 
     let outputCodec: AVVideoCodecType? = codec?.avCodec
     let normalizedQuality: Double? = quality.map { Double($0) / 100.0 }
+    let colorMetadata = formatDescription?.colorMetadata ?? .rec709
 
-    if formatDescription?.isHDR == true {
+    if colorMetadata.isHDR {
       let effectiveOutputCodec = outputCodec ?? formatDescription?.videoCodecType ?? .hevc
       guard effectiveOutputCodec != .h264 else {
         throw ValidationError(
@@ -412,37 +374,166 @@ import Upscaling
 
     let wantsScaler = scale != nil
 
-    // First sRGB-only stage in the pipeline, if any. Derived from the CLI flags rather than
-    // by inspecting a constructed chain so the session can consult it before any ML model
-    // downloads. A non-nil value means the chain can't accept HDR / 10-bit input.
-    let srgbRejectingStageName: String? = {
-      if denoise != nil { return VTTemporalNoiseProcessor.displayName }
-      if wantsScaler, effectiveScaler == .spatial { return Upscaler.displayName }
-      if fps != nil { return VTFrameRateConverter.displayName }
-      if motionBlur != nil { return VTMotionBlurProcessor.displayName }
-      if needsDownsample { return CILanczosDownsampler.displayName }
-      return nil
-    }()
-    let sourcePrefers10Bit =
-      formatDescription?.isHDR == true
-      || (formatDescription?.bitsPerComponent ?? 8) >= 10
-    let canUseHDRSuperResolution =
-      wantsScaler && effectiveScaler == .superResolution && srgbRejectingStageName == nil
-    let pipelinePixelFormat: OSType =
-      canUseHDRSuperResolution && sourcePrefers10Bit
-        ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-        : kCVPixelFormatType_32BGRA
+    var negotiatedFormats = Set(FrameFormat.preferredPixelFormats(for: colorMetadata))
+    var srgbRejectingStageName: String?
+
+    func restrictNegotiatedFormats(to supported: Set<OSType>, stageName: String) throws {
+      let before = negotiatedFormats
+      negotiatedFormats.formIntersection(supported)
+      if negotiatedFormats.isEmpty {
+        let beforeDescription = before.map(describePixelFormat).sorted().joined(separator: ", ")
+        let supportedDescription = supported.map(describePixelFormat).sorted().joined(separator: ", ")
+        throw ValidationError(
+          "\(stageName) has no pixel format in common with the current pipeline.\n"
+            + "  • Pipeline before this stage: \(beforeDescription)\n"
+            + "  • \(stageName) supports: \(supportedDescription)")
+      }
+      if negotiatedFormats == [kCVPixelFormatType_32BGRA],
+        before != [kCVPixelFormatType_32BGRA],
+        srgbRejectingStageName == nil
+      {
+        srgbRejectingStageName = stageName
+      }
+    }
+
+    if let denoise {
+      let supported = try preflightValue {
+        try VTTemporalNoiseProcessor.supportedPixelFormats(frameSize: inputSize)
+      }
+      try restrictNegotiatedFormats(to: supported, stageName: VTTemporalNoiseProcessor.displayName)
+      try preflight {
+        try VTTemporalNoiseProcessor.preflight(
+          frameSize: inputSize, strength: denoise,
+          pixelFormat: FrameFormat.resolvePreferredPixelFormat(
+            for: colorMetadata, accepted: negotiatedFormats))
+      }
+    }
+
+    if wantsScaler {
+      switch effectiveScaler {
+      case .spatial:
+        try restrictNegotiatedFormats(to: [kCVPixelFormatType_32BGRA], stageName: Upscaler.displayName)
+        try preflight {
+          try effectiveScaler.preflight(inputSize: inputSize, outputSize: scalerOutputSize)
+        }
+      case .superResolution:
+        let supported = try preflightValue {
+          try VTSuperResolutionUpscaler.supportedPixelFormats(
+            inputSize: inputSize, outputSize: scalerOutputSize)
+        }
+        try restrictNegotiatedFormats(
+          to: supported, stageName: VTSuperResolutionUpscaler.displayName)
+        try preflight {
+          try effectiveScaler.preflight(inputSize: inputSize, outputSize: scalerOutputSize)
+        }
+      }
+    }
+
+    if let fps {
+      // `nominalFrameRate` is a Float; promote for the comparison so rounding doesn't pass
+      // a marginally-higher target like 29.9999 as "greater than" a 30.0 source.
+      let sourceFrameRate = try await Double(videoTrack.load(.nominalFrameRate))
+      if sourceFrameRate > 0, fps <= sourceFrameRate {
+        throw ValidationError(
+          "--fps must be greater than the source frame rate "
+            + "(source: \(String(format: "%.3f", sourceFrameRate)))."
+        )
+      }
+      let supported = try preflightValue {
+        try VTFrameRateConverter.supportedPixelFormats(frameSize: scalerOutputSize)
+      }
+      try restrictNegotiatedFormats(to: supported, stageName: VTFrameRateConverter.displayName)
+      try preflight {
+        try VTFrameRateConverter.preflight(
+          frameSize: scalerOutputSize, targetFrameRate: fps,
+          pixelFormat: FrameFormat.resolvePreferredPixelFormat(
+            for: colorMetadata, accepted: negotiatedFormats))
+      }
+    }
+
+    if let motionBlur {
+      let supported = try preflightValue {
+        try VTMotionBlurProcessor.supportedPixelFormats(frameSize: scalerOutputSize)
+      }
+      try restrictNegotiatedFormats(to: supported, stageName: VTMotionBlurProcessor.displayName)
+      try preflight {
+        try VTMotionBlurProcessor.preflight(
+          frameSize: scalerOutputSize, strength: motionBlur,
+          pixelFormat: FrameFormat.resolvePreferredPixelFormat(
+            for: colorMetadata, accepted: negotiatedFormats))
+      }
+    }
+
+    if needsDownsample {
+      let supported = try preflightValue {
+        try CILanczosDownsampler.supportedPixelFormats(
+          inputSize: scalerOutputSize,
+          outputSize: finalOutputSize,
+          colorMetadata: colorMetadata)
+      }
+      try restrictNegotiatedFormats(to: supported, stageName: CILanczosDownsampler.displayName)
+      try preflight {
+        try CILanczosDownsampler.preflight(
+          inputSize: scalerOutputSize, outputSize: finalOutputSize)
+      }
+    }
+
+    let pipelinePixelFormat = FrameFormat.resolvePreferredPixelFormat(
+      for: colorMetadata, accepted: negotiatedFormats)
+    if let denoise {
+      try preflight {
+        try VTTemporalNoiseProcessor.preflight(
+          frameSize: inputSize, strength: denoise, pixelFormat: pipelinePixelFormat)
+      }
+    }
+    if wantsScaler {
+      try preflight {
+        if effectiveScaler == .superResolution {
+          let supported = try VTSuperResolutionUpscaler.supportedPixelFormats(
+            inputSize: inputSize, outputSize: scalerOutputSize)
+          guard supported.contains(pipelinePixelFormat) else {
+            throw VTSuperResolutionUpscaler.Error.unsupportedPixelFormat(
+              pipelinePixelFormat, supported: supported)
+          }
+        } else {
+          try effectiveScaler.preflight(inputSize: inputSize, outputSize: scalerOutputSize)
+        }
+      }
+    }
+    if let fps {
+      try preflight {
+        try VTFrameRateConverter.preflight(
+          frameSize: scalerOutputSize, targetFrameRate: fps,
+          pixelFormat: pipelinePixelFormat)
+      }
+    }
+    if let motionBlur {
+      try preflight {
+        try VTMotionBlurProcessor.preflight(
+          frameSize: scalerOutputSize, strength: motionBlur,
+          pixelFormat: pipelinePixelFormat)
+      }
+    }
+    if colorMetadata.isFullRange, !colorMetadata.isHDR,
+      !FrameFormat.isFullRange(pipelinePixelFormat)
+    {
+      Terminal.warning(
+        "Source is full-range SDR, but this chain normalizes output through "
+          + "\(describePixelFormat(pipelinePixelFormat)). Display color tags will be preserved, "
+          + "but luma/chroma range may not be signal-identical.")
+    }
 
     let chainFactory: UpscalingExportSession.ChainFactory = {
       [
         effectiveScaler, wantsScaler, denoise, fps, motionBlur,
         scalerOutputSize, finalOutputSize, needsDownsample, pipelinePixelFormat,
-        metricsCollector
+        colorMetadata, metricsCollector
       ] inputSize in
       var stages: [any FrameProcessorBackend] = []
       if let denoise {
         stages.append(
-          try await VTTemporalNoiseProcessor(frameSize: inputSize, strength: denoise))
+          try await VTTemporalNoiseProcessor(
+            frameSize: inputSize, strength: denoise, pixelFormat: pipelinePixelFormat))
       }
       if wantsScaler {
         if effectiveScaler == .superResolution {
@@ -458,33 +549,35 @@ import Upscaling
       }
       if let fps {
         stages.append(
-          try await VTFrameRateConverter(frameSize: scalerOutputSize, targetFrameRate: fps))
+          try await VTFrameRateConverter(
+            frameSize: scalerOutputSize, targetFrameRate: fps,
+            pixelFormat: pipelinePixelFormat))
       }
       if let motionBlur {
         stages.append(
-          try await VTMotionBlurProcessor(frameSize: scalerOutputSize, strength: motionBlur))
+          try await VTMotionBlurProcessor(
+            frameSize: scalerOutputSize, strength: motionBlur,
+            pixelFormat: pipelinePixelFormat))
       }
       if needsDownsample {
         // Keep the spatial→Lanczos GPU-fusion idea as a benchmarked follow-up: this pass keeps
         // the backend contract simple while fixing bounded memory and in-flight scheduling first.
         stages.append(
           try CILanczosDownsampler(
-            inputSize: scalerOutputSize, outputSize: finalOutputSize))
+            inputSize: scalerOutputSize, outputSize: finalOutputSize,
+            pixelFormat: pipelinePixelFormat,
+            colorMetadata: colorMetadata))
       }
       return try FrameProcessorChain(
         inputSize: inputSize, outputSize: finalOutputSize, stages: stages,
         metricsCollector: metricsCollector)
     }
 
-    let chainCapabilities: UpscalingExportSession.ChainCapabilities =
-      canUseHDRSuperResolution
-        ? UpscalingExportSession.ChainCapabilities(
-            supportedSourceInputFormats: [pipelinePixelFormat],
-            producedOutputFormat: pipelinePixelFormat)
-        : UpscalingExportSession.ChainCapabilities(
-            supportedSourceInputFormats: [kCVPixelFormatType_32BGRA],
-            producedOutputFormat: kCVPixelFormatType_32BGRA,
-            srgbRejectingStageName: srgbRejectingStageName)
+    let chainCapabilities = UpscalingExportSession.ChainCapabilities(
+      supportedSourceInputFormats: [pipelinePixelFormat],
+      producedOutputFormat: pipelinePixelFormat,
+      srgbRejectingStageName: pipelinePixelFormat == kCVPixelFormatType_32BGRA
+        ? srgbRejectingStageName : nil)
 
     let exportSession = UpscalingExportSession(
       asset: asset,
@@ -564,6 +657,13 @@ import Upscaling
   /// command usage alongside the message).
   private func preflight(_ check: () throws -> Void) throws {
     do { try check() } catch {
+      Terminal.error(error.localizedDescription)
+      throw ExitCode(rawValue: 3)
+    }
+  }
+
+  private func preflightValue<Value>(_ check: () throws -> Value) throws -> Value {
+    do { return try check() } catch {
       Terminal.error(error.localizedDescription)
       throw ExitCode(rawValue: 3)
     }

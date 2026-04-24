@@ -28,9 +28,9 @@ public struct FrameProcessorOutput: @unchecked Sendable {
 
 /// Backend-agnostic contract for a stateful per-(inputSize, outputSize) frame processor.
 ///
-/// Conforming types are actors. Input buffers must be `kCVPixelFormatType_32BGRA` in the
-/// Rec. 709 / sRGB range; HDR / wide-gamut inputs are rejected upstream in
-/// `UpscalingExportSession`.
+/// Conforming types are actors. Each backend declares the pixel formats it accepts and the
+/// single format it emits so `FrameProcessorChain` can catch incompatible color/precision
+/// boundaries before any buffers are processed.
 ///
 /// The contract is uniform across 1:1 and 1:N stages so that a `FrameProcessorChain` can
 /// compose them in any order without special-casing. 1:1 backends return a single-element
@@ -70,7 +70,7 @@ public protocol FrameProcessorBackend: Sendable {
   /// Processes a single input frame, returning one or more output frames.
   ///
   /// - Parameters:
-  ///   - pixelBuffer: Input buffer at `inputSize` in `kCVPixelFormatType_32BGRA`.
+  ///   - pixelBuffer: Input buffer at `inputSize` in one of `supportedInputFormats`.
   ///   - presentationTimeStamp: The source frame's PTS. 1:1 stages pass this through on
   ///     their single output; 1:N stages derive interpolated timestamps from it. Stages
   ///     that talk to `VTFrameProcessor` still synthesise their own monotonic PTS
