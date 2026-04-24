@@ -446,6 +446,30 @@ private func makeTestPixelBuffer(size: CGSize) throws -> CVPixelBuffer {
   return buffer
 }
 
+private enum TimeoutError: Error {
+  case timedOut
+}
+
+private func withTimeout<T: Sendable>(
+  _ duration: Duration,
+  operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+  try await withThrowingTaskGroup(of: T.self) { group in
+    group.addTask {
+      try await operation()
+    }
+    group.addTask {
+      try await Task.sleep(for: duration)
+      throw TimeoutError.timedOut
+    }
+    guard let result = try await group.next() else {
+      throw TimeoutError.timedOut
+    }
+    group.cancelAll()
+    return result
+  }
+}
+
 // MARK: - Frame Processor Chain Tests
 
 @Suite("Frame Processor Chain Tests")
@@ -2327,6 +2351,35 @@ struct PipelineProcessAllTests {
     #expect(countBox.withLock { $0 } == 1)
   }
 
+  @Test("processAllBatches identity chain emits marker-only completion")
+  func identityChainBatchCompletionIsMarkerOnly() async throws {
+    let size = CGSize(width: 320, height: 240)
+    let chain = try FrameProcessorChain(
+      inputSize: size, outputSize: size, stages: [])
+
+    let buffer = try makeTestPixelBuffer(size: size)
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 1)
+    nonisolated(unsafe) let captured = buffer
+    await inputChannel.send(
+      FrameProcessorOutput(
+        pixelBuffer: captured, presentationTimeStamp: CMTime(value: 1, timescale: 30)))
+    inputChannel.finish()
+
+    let batches = OSAllocatedUnfairLock(initialState: [FrameProcessorBatch]())
+    try await chain.processAllBatches(from: inputChannel, outputPool: nil) { batch in
+      batches.withLock { $0.append(batch) }
+    }
+
+    let snapshot = batches.withLock { $0 }
+    #expect(snapshot.count == 2)
+    #expect(snapshot[0].sourceSequence == 0)
+    #expect(snapshot[0].outputs.count == 1)
+    #expect(snapshot[0].completesSource == false)
+    #expect(snapshot[1].sourceSequence == 0)
+    #expect(snapshot[1].outputs.isEmpty)
+    #expect(snapshot[1].completesSource == true)
+  }
+
   @Test("processAll records metrics")
   func metricsRecording() async throws {
     let size = CGSize(width: 320, height: 240)
@@ -2355,6 +2408,208 @@ struct PipelineProcessAllTests {
     #expect(snapshot.framesProcessed == 1)
     #expect(snapshot.framesEmitted == 1)
   }
+
+  @Test("processAll cancels upstream stages when a downstream stage throws")
+  func cancelsSiblingsOnFirstFailure() async throws {
+    let size = CGSize(width: 64, height: 64)
+    let chain = try FrameProcessorChain(
+      inputSize: size,
+      outputSize: size,
+      stages: [
+        StreamingBurstBackend(size: size, burstCount: 100),
+        ThrowingBackend(size: size),
+      ])
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 1)
+    let buffer = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let captured = buffer
+    await inputChannel.send(
+      FrameProcessorOutput(pixelBuffer: captured, presentationTimeStamp: .zero))
+    inputChannel.finish()
+
+    do {
+      try await withTimeout(.seconds(2)) {
+        try await chain.processAll(from: inputChannel, outputPool: nil) { _ in }
+      }
+      #expect(Bool(false), "processAll should throw the downstream failure")
+    } catch TestPipelineError.boom {
+      // Expected: the downstream error surfaced instead of the upstream stage hanging in send().
+    } catch {
+      throw error
+    }
+  }
+
+  @Test("processAll applies backpressure between streamed outputs")
+  func streamsBurstOutputsIncrementally() async throws {
+    let size = CGSize(width: 64, height: 64)
+    let burstCount = 25
+    let chain = try FrameProcessorChain(
+      inputSize: size,
+      outputSize: size,
+      stages: [StreamingBurstBackend(size: size, burstCount: burstCount)])
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 1)
+    let buffer = try makeTestPixelBuffer(size: size)
+    nonisolated(unsafe) let captured = buffer
+    await inputChannel.send(
+      FrameProcessorOutput(pixelBuffer: captured, presentationTimeStamp: .zero))
+    inputChannel.finish()
+
+    let stats = OSAllocatedUnfairLock(initialState: (total: 0, maxBatch: 0))
+    try await chain.processAll(from: inputChannel, outputPool: nil) { batch in
+      stats.withLock { state in
+        state.total += batch.count
+        state.maxBatch = max(state.maxBatch, batch.count)
+      }
+    }
+
+    let snapshot = stats.withLock { $0 }
+    #expect(snapshot.total == burstCount)
+    #expect(snapshot.maxBatch == 1)
+  }
+
+  @Test("processAll runs stateless stages concurrently while preserving order")
+  func statelessStageConcurrencyPreservesOrder() async throws {
+    let size = CGSize(width: 64, height: 64)
+    let backend = ConcurrentProbeBackend(size: size, maxConcurrentFrames: 3)
+    let chain = try FrameProcessorChain(
+      inputSize: size,
+      outputSize: size,
+      stages: [backend])
+    let inputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
+    let frameCount = 6
+
+    async let feeder: Void = {
+      for index in 0..<frameCount {
+        let buffer = try! makeTestPixelBuffer(size: size)
+        nonisolated(unsafe) let captured = buffer
+        await inputChannel.send(
+          FrameProcessorOutput(
+            pixelBuffer: captured,
+            presentationTimeStamp: CMTime(value: CMTimeValue(index), timescale: 30)))
+      }
+      inputChannel.finish()
+    }()
+
+    let observedPTS = OSAllocatedUnfairLock(initialState: [CMTime]())
+    try await chain.processAll(from: inputChannel, outputPool: nil) { batch in
+      observedPTS.withLock { values in
+        values.append(contentsOf: batch.map(\.presentationTimeStamp))
+      }
+    }
+    await feeder
+
+    let values = observedPTS.withLock { $0 }
+    #expect(values == (0..<frameCount).map { CMTime(value: CMTimeValue($0), timescale: 30) })
+    #expect(await backend.observedMaxInFlight() > 1)
+  }
+}
+
+private enum TestPipelineError: Error {
+  case boom
+}
+
+private struct StreamingBurstBackend: FrameProcessorBackend {
+  let inputSize: CGSize
+  let outputSize: CGSize
+  let burstCount: Int
+  let displayName = "Streaming burst"
+
+  init(size: CGSize, burstCount: Int) {
+    inputSize = size
+    outputSize = size
+    self.burstCount = burstCount
+  }
+
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    let collector = OSAllocatedUnfairLock(initialState: [FrameProcessorOutput]())
+    try await process(
+      pixelBuffer,
+      presentationTimeStamp: presentationTimeStamp,
+      outputPool: outputPool
+    ) { output in
+      collector.withLock { $0.append(output) }
+    }
+    return collector.withLock { $0 }
+  }
+
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool _: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws {
+    nonisolated(unsafe) let outputBuffer = pixelBuffer
+    for index in 0..<burstCount {
+      try Task.checkCancellation()
+      try await emit(
+        FrameProcessorOutput(
+          pixelBuffer: outputBuffer,
+          presentationTimeStamp: presentationTimeStamp
+            + CMTime(value: CMTimeValue(index), timescale: 1_000)))
+    }
+  }
+}
+
+private struct ThrowingBackend: FrameProcessorBackend {
+  let inputSize: CGSize
+  let outputSize: CGSize
+  let displayName = "Throwing backend"
+
+  init(size: CGSize) {
+    inputSize = size
+    outputSize = size
+  }
+
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    throw TestPipelineError.boom
+  }
+}
+
+private actor ConcurrentProbeBackend: FrameProcessorBackend {
+  init(size: CGSize, maxConcurrentFrames: Int) {
+    self.inputSize = size
+    self.outputSize = size
+    self.configuredMaxConcurrentFrames = maxConcurrentFrames
+  }
+
+  nonisolated let inputSize: CGSize
+  nonisolated let outputSize: CGSize
+  nonisolated let displayName = "Concurrent probe"
+  nonisolated var maxConcurrentFrames: Int { configuredMaxConcurrentFrames }
+
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?
+  ) async throws -> [FrameProcessorOutput] {
+    inFlight += 1
+    maxObservedInFlight = max(maxObservedInFlight, inFlight)
+    defer { inFlight -= 1 }
+
+    let delay = max(0, 80 - Int(presentationTimeStamp.value) * 10)
+    try await Task.sleep(for: .milliseconds(delay))
+    nonisolated(unsafe) let outputBuffer = pixelBuffer
+    return [
+      FrameProcessorOutput(
+        pixelBuffer: outputBuffer,
+        presentationTimeStamp: presentationTimeStamp)
+    ]
+  }
+
+  func observedMaxInFlight() -> Int {
+    maxObservedInFlight
+  }
+
+  private nonisolated let configuredMaxConcurrentFrames: Int
+  private var inFlight = 0
+  private var maxObservedInFlight = 0
 }
 
 // MARK: - Final Output Dimensions

@@ -226,6 +226,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
       case .audio:
         let assetReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        assetReaderOutput.alwaysCopiesSampleData = false
         let assetWriterInput = AVAssetWriterInput(
           mediaType: .audio, outputSettings: nil, sourceFormatHint: formatDescription)
         assetWriterInput.expectsMediaDataInRealTime = false
@@ -243,6 +244,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
       default:
         // Preserve timecode, subtitle, closed caption, metadata tracks via passthrough.
         let assetReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        assetReaderOutput.alwaysCopiesSampleData = false
         let assetWriterInput = AVAssetWriterInput(
           mediaType: mediaType, outputSettings: nil, sourceFormatHint: formatDescription)
         assetWriterInput.expectsMediaDataInRealTime = false
@@ -317,7 +319,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
           }
         }
         do {
-          try await group.waitForAll()
+          try await group.waitForAllCancellingOnFirstError()
         } catch {
           group.cancelAll()
           assetReader.cancelReading()
@@ -669,7 +671,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
         }
       }
 
-      try await group.waitForAll()
+      try await group.waitForAllCancellingOnFirstError()
     }
   }
 
@@ -701,18 +703,14 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
     defer { assetWriterInput.markAsFinished() }
 
-    // Per-eye source-frame channels feed each chain's `processAll`. Per-eye output channels
-    // collect the handler-batches (one batch per source frame, plus propagated flush
-    // batches). A third channel forwards per-source-frame layer tags so the assembly task
-    // can re-tag each output group. Both eyes run deterministic, identical chains on
-    // identical input cadence, so their handler-batch sequences align one-to-one — zipping
-    // by pulling one batch from each per iteration preserves PTS ordering and lets the
-    // existing per-sample frame-count mismatch guard catch any divergence.
+    // Per-eye source-frame channels feed each chain's batch-aware `processAll` variant.
+    // The chains may stream multiple output batches for one source frame (FRC chunking), so
+    // layer tags are keyed by source sequence instead of consumed one-batch-per-source.
     let leftInputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
     let rightInputChannel = PipelineChannel<FrameProcessorOutput>(capacity: 2)
-    let leftOutputChannel = PipelineChannel<[FrameProcessorOutput]>(capacity: 2)
-    let rightOutputChannel = PipelineChannel<[FrameProcessorOutput]>(capacity: 2)
-    let tagsChannel = PipelineChannel<(left: CMTag?, right: CMTag?)>(capacity: 2)
+    let leftOutputChannel = PipelineChannel<FrameProcessorBatch>(capacity: 2)
+    let rightOutputChannel = PipelineChannel<FrameProcessorBatch>(capacity: 2)
+    let tagCache = PerSourceTagCache()
 
     nonisolated(unsafe) let capturedReceiver = receiver
     nonisolated(unsafe) let capturedWriterInput = assetWriterInput
@@ -722,8 +720,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
         defer {
           leftInputChannel.finish()
           rightInputChannel.finish()
-          tagsChannel.finish()
         }
+        var sourceSequence: Int64 = 0
         for await envelope in sampleBuffers {
           defer { envelope.release() }
           try Task.checkCancellation()
@@ -768,23 +766,27 @@ public final class UpscalingExportSession: @unchecked Sendable {
 
           nonisolated(unsafe) let leftBuf = left.buffer
           nonisolated(unsafe) let rightBuf = right.buffer
+          tagCache.store(
+            sourceSequence: sourceSequence,
+            left: left.layerTag,
+            right: right.layerTag)
           await leftInputChannel.send(
             FrameProcessorOutput(pixelBuffer: leftBuf, presentationTimeStamp: pts))
           await rightInputChannel.send(
             FrameProcessorOutput(pixelBuffer: rightBuf, presentationTimeStamp: pts))
-          await tagsChannel.send((left.layerTag, right.layerTag))
+          sourceSequence += 1
         }
       }
 
       // Left-eye pipeline.
       group.addTask {
         defer { leftOutputChannel.finish() }
-        try await leftChain.processAll(
+        try await leftChain.processAllBatches(
           from: leftInputChannel,
           outputPool: nil
         ) { batch in
           if let leftAttachmentCache {
-            for output in batch {
+            for output in batch.outputs {
               if let attachments = leftAttachmentCache.popMatching(
                 pts: output.presentationTimeStamp)
               {
@@ -799,12 +801,12 @@ public final class UpscalingExportSession: @unchecked Sendable {
       // Right-eye pipeline.
       group.addTask {
         defer { rightOutputChannel.finish() }
-        try await rightChain.processAll(
+        try await rightChain.processAllBatches(
           from: rightInputChannel,
           outputPool: nil
         ) { batch in
           if let rightAttachmentCache {
-            for output in batch {
+            for output in batch.outputs {
               if let attachments = rightAttachmentCache.popMatching(
                 pts: output.presentationTimeStamp)
               {
@@ -820,7 +822,6 @@ public final class UpscalingExportSession: @unchecked Sendable {
       group.addTask {
         var leftIter = leftOutputChannel.makeAsyncIterator()
         var rightIter = rightOutputChannel.makeAsyncIterator()
-        var tagsIter = tagsChannel.makeAsyncIterator()
         while true {
           try Task.checkCancellation()
           let leftBatch = await leftIter.next()
@@ -829,31 +830,43 @@ public final class UpscalingExportSession: @unchecked Sendable {
           case (nil, nil):
             return
           case (.some(let l), nil):
-            throw Error.spatialFrameCountMismatch(left: l.count, right: 0)
+            throw Error.spatialFrameCountMismatch(left: l.outputs.count, right: 0)
           case (nil, .some(let r)):
-            throw Error.spatialFrameCountMismatch(left: 0, right: r.count)
+            throw Error.spatialFrameCountMismatch(left: 0, right: r.outputs.count)
           case (.some(let leftOutputs), .some(let rightOutputs)):
+            guard leftOutputs.sourceSequence == rightOutputs.sourceSequence,
+              leftOutputs.completesSource == rightOutputs.completesSource
+            else {
+              throw Error.spatialFrameCountMismatch(
+                left: leftOutputs.outputs.count,
+                right: rightOutputs.outputs.count)
+            }
+            if leftOutputs.completesSource {
+              if let sourceSequence = leftOutputs.sourceSequence {
+                tagCache.remove(sourceSequence: sourceSequence)
+              }
+              continue
+            }
             // Both eyes must emit the same number of frames on the same PTS schedule.
             // 1:1 stages always produce a single output; FRC stages emit M interpolated
             // frames but — because both eyes run the same chain with the same input
             // PTS — the emitted counts and timestamps must agree.
-            guard leftOutputs.count == rightOutputs.count else {
+            guard leftOutputs.outputs.count == rightOutputs.outputs.count else {
               throw Error.spatialFrameCountMismatch(
-                left: leftOutputs.count, right: rightOutputs.count)
+                left: leftOutputs.outputs.count, right: rightOutputs.outputs.count)
             }
-            // `tagsIter` yields one pair per source frame, then returns nil for any
-            // subsequent flush-emitted batches — those fall back to the
-            // `.videoLayerID(0/1)` defaults inside `appendStereo`.
-            let tags = await tagsIter.next()
+            let tags = leftOutputs.sourceSequence.flatMap {
+              tagCache.tags(sourceSequence: $0)
+            }
             try await appendStereo(
-              leftOutputs: leftOutputs, rightOutputs: rightOutputs,
+              leftOutputs: leftOutputs.outputs, rightOutputs: rightOutputs.outputs,
               leftLayerTag: tags?.left, rightLayerTag: tags?.right,
               receiver: capturedReceiver, input: capturedWriterInput)
           }
         }
       }
 
-      try await group.waitForAll()
+      try await group.waitForAllCancellingOnFirstError()
     }
   }
 
@@ -977,6 +990,32 @@ final class PerPTSAttachmentCache: @unchecked Sendable {
     let value = storage[bestKey]
     storage = storage.filter { $0.key > bestKey }
     return value
+  }
+}
+
+// MARK: - PerSourceTagCache
+
+final class PerSourceTagCache: @unchecked Sendable {
+  typealias Tags = (left: CMTag?, right: CMTag?)
+
+  private let lock = OSAllocatedUnfairLock(initialState: [Int64: Tags]())
+
+  func store(sourceSequence: Int64, left: CMTag?, right: CMTag?) {
+    lock.withLock { storage in
+      storage[sourceSequence] = (left, right)
+    }
+  }
+
+  func tags(sourceSequence: Int64) -> Tags? {
+    lock.withLock { storage in
+      storage[sourceSequence]
+    }
+  }
+
+  func remove(sourceSequence: Int64) {
+    _ = lock.withLock { storage in
+      storage.removeValue(forKey: sourceSequence)
+    }
   }
 }
 

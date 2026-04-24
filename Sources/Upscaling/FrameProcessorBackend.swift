@@ -54,6 +54,13 @@ public protocol FrameProcessorBackend: Sendable {
   /// exports don't pay double the pool memory.
   var requiresInstancePerStream: Bool { get }
 
+  /// Maximum number of source batches this stage can process concurrently inside a
+  /// `FrameProcessorChain` while still producing deterministic, order-preserved output.
+  ///
+  /// Stateful / temporal stages must keep the default of `1`. Stateless GPU stages may raise
+  /// this to keep a small in-flight window without changing observable output order.
+  var maxConcurrentFrames: Int { get }
+
   /// The pixel formats this stage accepts as input. Defaults to `[32BGRA]`.
   var supportedInputFormats: Set<OSType> { get }
 
@@ -77,6 +84,16 @@ public protocol FrameProcessorBackend: Sendable {
     outputPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput]
 
+  /// Streaming variant of `process(...)` used by `FrameProcessorChain` to apply downstream
+  /// backpressure between outputs from a 1:N stage. The default implementation preserves
+  /// source compatibility by calling the array-returning API and emitting each result.
+  func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws
+
   /// Emits any frames the backend was holding back waiting for more input.
   ///
   /// Call this exactly once after the input stream ends. Most backends (1:1, no look-ahead)
@@ -89,6 +106,12 @@ public protocol FrameProcessorBackend: Sendable {
   func finish(
     outputPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput]
+
+  /// Streaming variant of `finish(outputPool:)`; see streaming `process(...)`.
+  func finish(
+    outputPool: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws
 }
 
 extension FrameProcessorBackend {
@@ -96,13 +119,39 @@ extension FrameProcessorBackend {
 
   public var requiresInstancePerStream: Bool { false }
 
+  public var maxConcurrentFrames: Int { 1 }
+
   public var supportedInputFormats: Set<OSType> { [kCVPixelFormatType_32BGRA] }
 
   public var producedOutputFormat: OSType { kCVPixelFormatType_32BGRA }
 
+  public func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws {
+    for output in try await process(
+      pixelBuffer,
+      presentationTimeStamp: presentationTimeStamp,
+      outputPool: outputPool)
+    {
+      try await emit(output)
+    }
+  }
+
   public func finish(
     outputPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] { [] }
+
+  public func finish(
+    outputPool: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws {
+    for output in try await finish(outputPool: outputPool) {
+      try await emit(output)
+    }
+  }
 
   /// 1:1 convenience wrapper for single-frame callers. Returns the first (and only, for
   /// 1:1 backends) output buffer. Throws unless the backend produced exactly one output.

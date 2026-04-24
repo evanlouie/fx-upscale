@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import os
 
 // MARK: - FrameProcessorChain
 
@@ -220,23 +221,45 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     outputPool: CVPixelBufferPool?,
     handler: @escaping @Sendable ([FrameProcessorOutput]) async throws -> Void
   ) async throws where Input.Element == FrameProcessorOutput {
+    try await processAllBatches(from: input, outputPool: outputPool) { batch in
+      guard !batch.outputs.isEmpty else { return }
+      try await handler(batch.outputs)
+    }
+  }
+
+  /// Internal batch-aware variant used by export paths that need source-frame metadata while
+  /// still applying backpressure between streamed 1:N outputs.
+  func processAllBatches<Input: AsyncSequence & Sendable>(
+    from input: Input,
+    outputPool: CVPixelBufferPool?,
+    handler: @escaping @Sendable (FrameProcessorBatch) async throws -> Void
+  ) async throws where Input.Element == FrameProcessorOutput {
     if stages.isEmpty {
+      var sourceSequence: Int64 = 0
       for try await frame in input {
+        try await handler(
+          FrameProcessorBatch(
+            sourceSequence: sourceSequence,
+            outputs: [frame],
+            completesSource: false))
+        // Completion batches are marker-only; spatial assembly skips them after tag cleanup.
         metricsCollector?.recordChainCompletion(outputCount: 1)
-        try await handler([frame])
+        try await handler(
+          FrameProcessorBatch(
+            sourceSequence: sourceSequence,
+            outputs: [],
+            completesSource: true))
+        sourceSequence += 1
       }
       return
     }
 
     // N stages ⟹ N+1 channels (feeder→stage[0], stage[k]→stage[k+1], stage[N-1]→consumer).
-    // Capacity 2 lets adjacent stages overlap: one frame buffered in the channel plus one
-    // in-flight in the downstream stage, so a stage need not wait for the next to drain
-    // before producing its next output. This roughly doubles steady-state throughput for
-    // multi-stage chains while still bounding extra memory (≤ one additional 4K frame per
-    // channel, ~24 MiB — comparable to the existing `sampleBufferBufferDepth = 4` reader
-    // buffer) and keeping ordering strict within each stage.
+    // Channels carry one output frame at a time for streaming 1:N stages, plus lightweight
+    // source-completion markers for metrics/stereo bookkeeping. This keeps memory bounded by
+    // channel capacity instead of by a whole FRC interval.
     let channels = (0...stages.count).map { _ in
-      PipelineChannel<[FrameProcessorOutput]>(capacity: Self.interStageChannelCapacity)
+      PipelineChannel<PipelineBatch>(capacity: Self.interStageChannelCapacity)
     }
 
     nonisolated(unsafe) let terminalPool = outputPool
@@ -244,8 +267,24 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
         defer { channels[0].finish() }
+        var order: Int64 = 0
+        var sourceSequence: Int64 = 0
         for try await frame in input {
-          await channels[0].send([frame])
+          await channels[0].send(
+            PipelineBatch(
+              order: order,
+              sourceSequence: sourceSequence,
+              frames: [frame],
+              completesSource: false))
+          order += 1
+          await channels[0].send(
+            PipelineBatch(
+              order: order,
+              sourceSequence: sourceSequence,
+              frames: [],
+              completesSource: true))
+          order += 1
+          sourceSequence += 1
         }
       }
 
@@ -259,75 +298,240 @@ public actor FrameProcessorChain: FrameProcessorBackend {
 
         group.addTask { [metricsCollector = self.metricsCollector] in
           defer { outputChannel.finish() }
-
-          for await batch in inputChannel {
-            try Task.checkCancellation()
-            let stageStart = ContinuousClock.now
-
-            let outputs: [FrameProcessorOutput]
-            if batch.count == 1 {
-              let frame = batch[0]
-              nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
-              outputs = try await stage.process(
-                inputBuffer,
-                presentationTimeStamp: frame.presentationTimeStamp,
-                outputPool: poolForStage)
-            } else {
-              var accumulator: [FrameProcessorOutput] = []
-              accumulator.reserveCapacity(batch.count)
-              for frame in batch {
-                nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
-                accumulator.append(contentsOf: try await stage.process(
-                  inputBuffer,
-                  presentationTimeStamp: frame.presentationTimeStamp,
-                  outputPool: poolForStage))
-              }
-              outputs = accumulator
-            }
-
-            if let metricsCollector, let idx = metricsIndex {
-              metricsCollector.record(
-                stageIndex: idx, duration: ContinuousClock.now - stageStart)
-            }
-
-            // Send even empty batches so the consumer's per-source-frame accounting stays
-            // aligned with the input cadence (FRC returns [] for its first input).
-            await outputChannel.send(outputs)
-          }
-
-          try Task.checkCancellation()
-          let flushStart = ContinuousClock.now
-          let flushed = try await stage.finish(outputPool: poolForStage)
-          // NOTE: flush emission must be symmetric across identical chains run on
-          // identical input cadences. `UpscalingExportSession`'s stereo path pairs
-          // left/right batches positionally (including this terminal flush batch) and
-          // relies on both eyes producing the same number of batches in the same order.
-          // If a future stage's flush becomes content-dependent (e.g. motion-adaptive
-          // lookahead that emits on one eye but not the other), the stereo assembly
-          // will desync — revisit that pairing before introducing such a stage.
-          if !flushed.isEmpty {
-            if let metricsCollector, let idx = metricsIndex {
-              metricsCollector.record(
-                stageIndex: idx, duration: ContinuousClock.now - flushStart)
-            }
-            await outputChannel.send(flushed)
+          if stage.maxConcurrentFrames > 1 {
+            try await Self.runConcurrentStage(
+              stage,
+              inputChannel: inputChannel,
+              outputChannel: outputChannel,
+              outputPool: poolForStage,
+              metricsCollector: metricsCollector,
+              metricsIndex: metricsIndex)
+          } else {
+            try await Self.runSequentialStage(
+              stage,
+              inputChannel: inputChannel,
+              outputChannel: outputChannel,
+              outputPool: poolForStage,
+              metricsCollector: metricsCollector,
+              metricsIndex: metricsIndex)
           }
         }
       }
 
       group.addTask { [metricsCollector = self.metricsCollector] in
-        for await outputs in channels[lastStageIndex + 1] {
+        var emittedBySource: [Int64: Int] = [:]
+        for await batch in channels[lastStageIndex + 1] {
           try Task.checkCancellation()
-          metricsCollector?.recordChainCompletion(outputCount: outputs.count)
-          try await handler(outputs)
+          if batch.completesSource {
+            if let sourceSequence = batch.sourceSequence {
+              metricsCollector?.recordChainCompletion(
+                outputCount: emittedBySource.removeValue(forKey: sourceSequence) ?? 0)
+              try await handler(
+                FrameProcessorBatch(
+                  sourceSequence: sourceSequence,
+                  outputs: [],
+                  completesSource: true))
+            }
+            continue
+          }
+
+          if !batch.frames.isEmpty {
+            if let sourceSequence = batch.sourceSequence {
+              emittedBySource[sourceSequence, default: 0] += batch.frames.count
+            } else {
+              metricsCollector?.recordChainCompletion(outputCount: batch.frames.count)
+            }
+            try await handler(
+              FrameProcessorBatch(
+                sourceSequence: batch.sourceSequence,
+                outputs: batch.frames,
+                completesSource: false))
+          }
         }
       }
 
-      try await group.waitForAll()
+      do {
+        while try await group.next() != nil {}
+      } catch {
+        group.cancelAll()
+        throw error
+      }
     }
   }
 
   private static let interStageChannelCapacity = 2
+
+  private static func runSequentialStage(
+    _ stage: any FrameProcessorBackend,
+    inputChannel: PipelineChannel<PipelineBatch>,
+    outputChannel: PipelineChannel<PipelineBatch>,
+    outputPool: CVPixelBufferPool?,
+    metricsCollector: PipelineMetricsCollector?,
+    metricsIndex: Int?
+  ) async throws {
+    let emitter = PipelineBatchEmitter(outputChannel: outputChannel)
+    nonisolated(unsafe) let stageOutputPool = outputPool
+
+    for await batch in inputChannel {
+      try Task.checkCancellation()
+      if batch.completesSource {
+        await emitter.complete(sourceSequence: batch.sourceSequence)
+        continue
+      }
+
+      guard !batch.frames.isEmpty else { continue }
+
+      let stageStart = ContinuousClock.now
+      for frame in batch.frames {
+        nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
+        try await stage.process(
+          inputBuffer,
+          presentationTimeStamp: frame.presentationTimeStamp,
+          outputPool: stageOutputPool
+        ) { output in
+          await emitter.emit(output, sourceSequence: batch.sourceSequence)
+        }
+      }
+
+      if let metricsCollector, let idx = metricsIndex {
+        metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - stageStart)
+      }
+    }
+
+    try Task.checkCancellation()
+    let flushStart = ContinuousClock.now
+    let flushedOutputCount = OSAllocatedUnfairLock(initialState: 0)
+    try await stage.finish(outputPool: stageOutputPool) { output in
+      flushedOutputCount.withLock { $0 += 1 }
+      await emitter.emit(output, sourceSequence: nil)
+    }
+    if flushedOutputCount.withLock({ $0 }) > 0, let metricsCollector, let idx = metricsIndex {
+      metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - flushStart)
+    }
+  }
+
+  private static func runConcurrentStage(
+    _ stage: any FrameProcessorBackend,
+    inputChannel: PipelineChannel<PipelineBatch>,
+    outputChannel: PipelineChannel<PipelineBatch>,
+    outputPool: CVPixelBufferPool?,
+    metricsCollector: PipelineMetricsCollector?,
+    metricsIndex: Int?
+  ) async throws {
+    let maxInFlight = max(1, stage.maxConcurrentFrames)
+    nonisolated(unsafe) let stageOutputPool = outputPool
+    var iterator = inputChannel.makeAsyncIterator()
+    var inputEnded = false
+    var inFlight = 0
+    var pending: [Int64: ProcessedPipelineBatch] = [:]
+    var nextInputOrder: Int64 = 0
+    var nextOutputOrder: Int64 = 0
+
+    func emitReady() async {
+      while let result = pending.removeValue(forKey: nextInputOrder) {
+        if !result.frames.isEmpty {
+          await outputChannel.send(
+            PipelineBatch(
+              order: nextOutputOrder,
+              sourceSequence: result.sourceSequence,
+              frames: result.frames,
+              completesSource: false))
+          nextOutputOrder += 1
+        }
+        if result.completesSource {
+          await outputChannel.send(
+            PipelineBatch(
+              order: nextOutputOrder,
+              sourceSequence: result.sourceSequence,
+              frames: [],
+              completesSource: true))
+          nextOutputOrder += 1
+        }
+        nextInputOrder += 1
+      }
+    }
+
+    try await withThrowingTaskGroup(of: ProcessedPipelineBatch.self) { group in
+      while true {
+        while inFlight < maxInFlight, !inputEnded {
+          guard let batch = await iterator.next() else {
+            inputEnded = true
+            break
+          }
+
+          if batch.completesSource {
+            pending[batch.order] = ProcessedPipelineBatch(
+              inputOrder: batch.order,
+              sourceSequence: batch.sourceSequence,
+              frames: [],
+              completesSource: true)
+            await emitReady()
+            continue
+          }
+
+          group.addTask {
+            try Task.checkCancellation()
+            let stageStart = ContinuousClock.now
+            let collector = FrameProcessorOutputAccumulator()
+            for frame in batch.frames {
+              nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
+              try await stage.process(
+                inputBuffer,
+                presentationTimeStamp: frame.presentationTimeStamp,
+                outputPool: stageOutputPool
+              ) { output in
+                collector.append(output)
+              }
+            }
+            if let metricsCollector, let idx = metricsIndex {
+              metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - stageStart)
+            }
+            return ProcessedPipelineBatch(
+              inputOrder: batch.order,
+              sourceSequence: batch.sourceSequence,
+              frames: collector.values(),
+              completesSource: false)
+          }
+          inFlight += 1
+        }
+
+        if inFlight == 0 { break }
+
+        do {
+          if let result = try await group.next() {
+            inFlight -= 1
+            pending[result.inputOrder] = result
+            await emitReady()
+          } else {
+            inFlight = 0
+            break
+          }
+        } catch {
+          group.cancelAll()
+          throw error
+        }
+      }
+    }
+
+    try Task.checkCancellation()
+    let flushStart = ContinuousClock.now
+    let collector = FrameProcessorOutputAccumulator()
+    try await stage.finish(outputPool: stageOutputPool) { output in
+      collector.append(output)
+    }
+    let flushed = collector.values()
+    if !flushed.isEmpty {
+      if let metricsCollector, let idx = metricsIndex {
+        metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - flushStart)
+      }
+      await outputChannel.send(
+        PipelineBatch(
+          order: nextOutputOrder,
+          sourceSequence: nil,
+          frames: flushed,
+          completesSource: false))
+    }
+  }
 
   // MARK: Private
 
@@ -336,6 +540,71 @@ public actor FrameProcessorChain: FrameProcessorBackend {
   /// Maps each stage's position in `stages` to its registered index in `metricsCollector`.
   /// `nil` when no collector is attached.
   private nonisolated let stageMetricsIndices: [Int]?
+}
+
+// MARK: - FrameProcessorBatch
+
+struct FrameProcessorBatch: Sendable {
+  let sourceSequence: Int64?
+  let outputs: [FrameProcessorOutput]
+  let completesSource: Bool
+}
+
+// MARK: - PipelineBatch
+
+private struct PipelineBatch: Sendable {
+  let order: Int64
+  let sourceSequence: Int64?
+  let frames: [FrameProcessorOutput]
+  let completesSource: Bool
+}
+
+private struct ProcessedPipelineBatch: Sendable {
+  let inputOrder: Int64
+  let sourceSequence: Int64?
+  let frames: [FrameProcessorOutput]
+  let completesSource: Bool
+}
+
+private actor PipelineBatchEmitter {
+  init(outputChannel: PipelineChannel<PipelineBatch>) {
+    self.outputChannel = outputChannel
+  }
+
+  func emit(_ output: FrameProcessorOutput, sourceSequence: Int64?) async {
+    await outputChannel.send(
+      PipelineBatch(
+        order: nextOrder,
+        sourceSequence: sourceSequence,
+        frames: [output],
+        completesSource: false))
+    nextOrder += 1
+  }
+
+  func complete(sourceSequence: Int64?) async {
+    await outputChannel.send(
+      PipelineBatch(
+        order: nextOrder,
+        sourceSequence: sourceSequence,
+        frames: [],
+        completesSource: true))
+    nextOrder += 1
+  }
+
+  private let outputChannel: PipelineChannel<PipelineBatch>
+  private var nextOrder: Int64 = 0
+}
+
+private final class FrameProcessorOutputAccumulator: @unchecked Sendable {
+  private let lock = OSAllocatedUnfairLock(initialState: [FrameProcessorOutput]())
+
+  func append(_ output: FrameProcessorOutput) {
+    lock.withLock { $0.append(output) }
+  }
+
+  func values() -> [FrameProcessorOutput] {
+    lock.withLock { $0 }
+  }
 }
 
 // MARK: FrameProcessorChain.Error

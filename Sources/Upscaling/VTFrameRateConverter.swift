@@ -2,6 +2,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import VideoToolbox
+import os
 
 // MARK: - computeTargetPTS
 
@@ -105,13 +106,32 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
+    let collector = OSAllocatedUnfairLock(initialState: [FrameProcessorOutput]())
+    try await process(
+      pixelBuffer,
+      presentationTimeStamp: presentationTimeStamp,
+      outputPool: externalPool
+    ) { output in
+      collector.withLock { $0.append(output) }
+    }
+    return collector.withLock { $0 }
+  }
+
+  public func process(
+    _ pixelBuffer: sending CVPixelBuffer,
+    presentationTimeStamp: CMTime,
+    outputPool externalPool: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws {
     guard await processingGate.acquire() else { throw CancellationError() }
     do {
       try Task.checkCancellation()
-      let result = try await processPermitted(
-        pixelBuffer, presentationTimeStamp: presentationTimeStamp, outputPool: externalPool)
+      try await processPermitted(
+        pixelBuffer,
+        presentationTimeStamp: presentationTimeStamp,
+        outputPool: externalPool,
+        emit: emit)
       await processingGate.release()
-      return result
     } catch {
       await processingGate.release()
       throw error
@@ -121,6 +141,17 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   public func finish(
     outputPool _: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
+    let collector = OSAllocatedUnfairLock(initialState: [FrameProcessorOutput]())
+    try await finish(outputPool: nil) { output in
+      collector.withLock { $0.append(output) }
+    }
+    return collector.withLock { $0 }
+  }
+
+  public func finish(
+    outputPool _: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws {
     guard await processingGate.acquire() else { throw CancellationError() }
     do {
       try Task.checkCancellation()
@@ -129,15 +160,14 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
       // interpolate against, and synthesising pixels past the input would distort duration.
       guard let buffered = bufferedFrame else {
         await processingGate.release()
-        return []
+        return
       }
       bufferedFrame = nil
       nonisolated(unsafe) let passthroughBuffer = buffered.buffer
-      let result = [
+      try await emit(
         FrameProcessorOutput(pixelBuffer: passthroughBuffer, presentationTimeStamp: buffered.pts)
-      ]
+      )
       await processingGate.release()
-      return result
     } catch {
       await processingGate.release()
       throw error
@@ -149,8 +179,9 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   private func processPermitted(
     _ pixelBuffer: sending CVPixelBuffer,
     presentationTimeStamp: CMTime,
-    outputPool externalPool: sending CVPixelBufferPool?
-  ) async throws -> [FrameProcessorOutput] {
+    outputPool externalPool: sending CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws {
     // Validate and wrap the incoming frame. Each source frame is wrapped exactly once; the
     // same wrapper serves as `nextFrame` on this submission and `sourceFrame` on the next.
     try validateProcessorInput(pixelBuffer, expectedInputSize: frameSize)
@@ -173,7 +204,7 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
         wrapper: newFrameWrapper, buffer: capturedBuffer, pts: presentationTimeStamp)
       anchorPTS = presentationTimeStamp
       targetOutputIndex = 0
-      return []
+      return
     }
 
     // Plan the target PTS that fall within `[prev.pts, next.pts)`. `phase == 0` exactly
@@ -187,94 +218,123 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
       // continues on the next call.
       bufferedFrame = BufferedFrame(
         wrapper: newFrameWrapper, buffer: capturedBuffer, pts: nextPTS)
-      return []
+      return
     }
 
     // `targetOutputIndex` is monotonic, so `phase` grows through `[0, 1)`. Any `phase <= 0`
     // entries therefore land at the start, before all interpolated PTSs — we can append in
     // order instead of sorting at the end.
     //
-    // Upper bound on emitted frames from this pair: one target period per slot plus one for
-    // rounding. `nextPTS - prevPTS` is at most one source period at steady rates, so this is
-    // `ceil(target/source) + 1` in the common case.
-    let emittedUpperBound = max(1, Int((intervalSeconds * targetFrameRate).rounded(.up)) + 1)
-    var outputs: [FrameProcessorOutput] = []
-    outputs.reserveCapacity(emittedUpperBound)
     var interpolationPhases: [Float] = []
-    interpolationPhases.reserveCapacity(emittedUpperBound)
+    interpolationPhases.reserveCapacity(Self.interpolationChunkSize)
     var interpolatedOutputPTSs: [CMTime] = []
-    interpolatedOutputPTSs.reserveCapacity(emittedUpperBound)
+    interpolatedOutputPTSs.reserveCapacity(Self.interpolationChunkSize)
+
     while true {
       let candidatePTS = targetPTS(forIndex: targetOutputIndex)
       if candidatePTS >= nextPTS { break }
       let phase = (candidatePTS.seconds - prevPTS.seconds) / intervalSeconds
       if phase <= 0 {
         nonisolated(unsafe) let passthroughBuffer = buffered.buffer
-        outputs.append(
+        try await emit(
           FrameProcessorOutput(
             pixelBuffer: passthroughBuffer, presentationTimeStamp: candidatePTS))
       } else {
         interpolationPhases.append(Float(phase))
         interpolatedOutputPTSs.append(candidatePTS)
+        if interpolationPhases.count == Self.interpolationChunkSize {
+          try await submitInterpolationChunk(
+            inputBuffer: pixelBuffer,
+            sourceFrame: buffered.wrapper,
+            nextFrame: newFrameWrapper,
+            vtPts: vtPts,
+            interpolationPhases: interpolationPhases,
+            outputPTSs: interpolatedOutputPTSs,
+            externalPool: externalPool,
+            emit: emit)
+          interpolationPhases.removeAll(keepingCapacity: true)
+          interpolatedOutputPTSs.removeAll(keepingCapacity: true)
+        }
       }
       targetOutputIndex += 1
     }
 
     if !interpolationPhases.isEmpty {
-      // Allocate one destination buffer per interpolated frame and wrap each. VT needs the
-      // same count in `interpolationPhase` and `destinationFrames`.
-      var destinationBuffers: [CVPixelBuffer] = []
-      destinationBuffers.reserveCapacity(interpolationPhases.count)
-      var destinationFrames: [VTFrameProcessorFrame] = []
-      destinationFrames.reserveCapacity(interpolationPhases.count)
-      for _ in interpolationPhases {
-        let dest = try resolveProcessorOutputBuffer(
-          input: pixelBuffer,
-          expectedInputSize: frameSize,
-          expectedOutputSize: frameSize,
-          externalPool: externalPool,
-          internalPool: pixelBufferPool,
-          providedOutput: nil
-        )
-        guard
-          let wrapper = VTFrameProcessorFrame(
-            buffer: dest, presentationTimeStamp: vtPts)
-        else {
-          throw VTBackendError.vtFrameConstructionFailed(backend: .frameRateConversion)
-        }
-        destinationBuffers.append(dest)
-        destinationFrames.append(wrapper)
-      }
-
-      guard
-        let parameters = VTFrameRateConversionParameters(
-          sourceFrame: buffered.wrapper,
-          nextFrame: newFrameWrapper,
-          opticalFlow: nil,
-          interpolationPhase: interpolationPhases,
-          submissionMode: .sequential,
-          destinationFrames: destinationFrames
-        )
-      else {
-        throw VTBackendError.vtFrameConstructionFailed(backend: .frameRateConversion)
-      }
-
-      try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
-
-      outputs.reserveCapacity(outputs.count + destinationBuffers.count)
-      for (buffer, outputPTS) in zip(destinationBuffers, interpolatedOutputPTSs) {
-        nonisolated(unsafe) let interpolatedBuffer = buffer
-        outputs.append(
-          FrameProcessorOutput(
-            pixelBuffer: interpolatedBuffer, presentationTimeStamp: outputPTS))
-      }
+      try await submitInterpolationChunk(
+        inputBuffer: pixelBuffer,
+        sourceFrame: buffered.wrapper,
+        nextFrame: newFrameWrapper,
+        vtPts: vtPts,
+        interpolationPhases: interpolationPhases,
+        outputPTSs: interpolatedOutputPTSs,
+        externalPool: externalPool,
+        emit: emit)
     }
 
     // Slide: the just-received frame becomes the new buffered "prev" for the next call.
     bufferedFrame = BufferedFrame(
       wrapper: newFrameWrapper, buffer: capturedBuffer, pts: nextPTS)
+  }
 
-    return outputs
+  /// Maximum number of interpolated destination frames materialized for one VT submission.
+  /// `processAll` awaits downstream emission after each completed chunk, so memory stays
+  /// bounded even across long VFR gaps.
+  private static let interpolationChunkSize = 8
+
+  private func submitInterpolationChunk(
+    inputBuffer: CVPixelBuffer,
+    sourceFrame: VTFrameProcessorFrame,
+    nextFrame: VTFrameProcessorFrame,
+    vtPts: CMTime,
+    interpolationPhases: [Float],
+    outputPTSs: [CMTime],
+    externalPool: CVPixelBufferPool?,
+    emit: @Sendable (FrameProcessorOutput) async throws -> Void
+  ) async throws {
+    var destinationBuffers: [CVPixelBuffer] = []
+    destinationBuffers.reserveCapacity(interpolationPhases.count)
+    var destinationFrames: [VTFrameProcessorFrame] = []
+    destinationFrames.reserveCapacity(interpolationPhases.count)
+    for _ in interpolationPhases {
+      let dest = try resolveProcessorOutputBuffer(
+        input: inputBuffer,
+        expectedInputSize: frameSize,
+        expectedOutputSize: frameSize,
+        externalPool: externalPool,
+        internalPool: pixelBufferPool,
+        providedOutput: nil
+      )
+      guard
+        let wrapper = VTFrameProcessorFrame(
+          buffer: dest, presentationTimeStamp: vtPts)
+      else {
+        throw VTBackendError.vtFrameConstructionFailed(backend: .frameRateConversion)
+      }
+      destinationBuffers.append(dest)
+      destinationFrames.append(wrapper)
+    }
+
+    guard
+      let parameters = VTFrameRateConversionParameters(
+        sourceFrame: sourceFrame,
+        nextFrame: nextFrame,
+        opticalFlow: nil,
+        interpolationPhase: interpolationPhases,
+        submissionMode: .sequential,
+        destinationFrames: destinationFrames
+      )
+    else {
+      throw VTBackendError.vtFrameConstructionFailed(backend: .frameRateConversion)
+    }
+
+    try await runVT(on: SendableBox(processor), parameters: SendableBox(parameters))
+
+    for (buffer, outputPTS) in zip(destinationBuffers, outputPTSs) {
+      nonisolated(unsafe) let interpolatedBuffer = buffer
+      try await emit(
+        FrameProcessorOutput(
+          pixelBuffer: interpolatedBuffer, presentationTimeStamp: outputPTS))
+    }
   }
 
   /// `kCVPixelBufferPoolMinimumBufferCountKey` value. Each source pair emits up to

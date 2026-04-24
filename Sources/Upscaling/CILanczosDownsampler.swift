@@ -63,6 +63,7 @@ public actor CILanczosDownsampler: FrameProcessorBackend {
   public static let displayName = "Lanczos downsample"
   public nonisolated var displayName: String { Self.displayName }
   public nonisolated var requiresInstancePerStream: Bool { true }
+  public nonisolated var maxConcurrentFrames: Int { 2 }
 
   public func process(
     _ pixelBuffer: sending CVPixelBuffer,

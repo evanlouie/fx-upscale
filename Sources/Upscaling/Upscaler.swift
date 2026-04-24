@@ -65,6 +65,7 @@ public actor Upscaler: FrameProcessorBackend {
   public nonisolated let outputSize: CGSize
   public static let displayName = "MetalFX spatial"
   public nonisolated var displayName: String { Self.displayName }
+  public nonisolated var maxConcurrentFrames: Int { 3 }
 
   /// Upscales a pixel buffer asynchronously.
   ///

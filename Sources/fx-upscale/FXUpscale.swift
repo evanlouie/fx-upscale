@@ -465,6 +465,8 @@ import Upscaling
           try await VTMotionBlurProcessor(frameSize: scalerOutputSize, strength: motionBlur))
       }
       if needsDownsample {
+        // Keep the spatial→Lanczos GPU-fusion idea as a benchmarked follow-up: this pass keeps
+        // the backend contract simple while fixing bounded memory and in-flight scheduling first.
         stages.append(
           try CILanczosDownsampler(
             inputSize: scalerOutputSize, outputSize: finalOutputSize))
