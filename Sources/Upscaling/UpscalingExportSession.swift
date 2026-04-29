@@ -111,6 +111,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   private let chainCapabilities: ChainCapabilities
 
   public let progress: Progress
+  public private(set) var skippedPassthroughMediaTypes: [AVMediaType] = []
 
   public func export() async throws {
     #if os(macOS)
@@ -147,6 +148,8 @@ public final class UpscalingExportSession: @unchecked Sendable {
       cancelWriter.cancelWriting()
     }
 
+    skippedPassthroughMediaTypes.removeAll()
+
     var mediaTracks: [MediaTrack] = []
     var minStartTime: CMTime = .positiveInfinity
     let tracks = try await asset.load(.tracks)
@@ -167,16 +170,15 @@ public final class UpscalingExportSession: @unchecked Sendable {
         let encodedInputSize = CMVideoFormatDescriptionGetDimensions(formatDescription).cgSize
         let colorMetadata = formatDescription.colorMetadata
 
-        let chainRequiresSRGB =
-          chainCapabilities.supportedSourceInputFormats == [kCVPixelFormatType_32BGRA]
-        if colorMetadata.isUnsupportedForBGRAPath, chainRequiresSRGB {
-          throw Error.unsupportedColorSpace(
-            stageName: chainCapabilities.srgbRejectingStageName)
-        }
-
         let pipelinePixelFormat = Self.resolvePipelinePixelFormat(
           colorMetadata: colorMetadata,
           accepted: chainCapabilities.supportedSourceInputFormats)
+        if colorMetadata.isUnsupportedForBGRAPath,
+          pipelinePixelFormat == kCVPixelFormatType_32BGRA
+        {
+          throw Error.unsupportedColorSpace(
+            stageName: chainCapabilities.srgbRejectingStageName)
+        }
 
         guard
           let assetReaderOutput = Self.videoAssetReaderOutput(
@@ -252,7 +254,9 @@ public final class UpscalingExportSession: @unchecked Sendable {
           mediaType: mediaType, outputSettings: nil, sourceFormatHint: formatDescription)
         assetWriterInput.expectsMediaDataInRealTime = false
         guard assetReader.canAdd(assetReaderOutput), assetWriter.canAdd(assetWriterInput) else {
-          // Non-critical track — skip if not addable.
+          // Non-critical track — skip if not addable, but make the data loss visible to
+          // callers after export completes.
+          skippedPassthroughMediaTypes.append(mediaType)
           continue
         }
         assetReader.add(assetReaderOutput)

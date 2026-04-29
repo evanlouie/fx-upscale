@@ -98,8 +98,11 @@ Each effect is applied only when its flag is passed:
 - `--keyframe-interval 0` lets the encoder decide. HEVC can emit a single
   keyframe in that case, which breaks arrow-key seeking in some players
   (e.g. IINA). The default of 1.0s is a safe middle ground.
-- HDR (PQ / HLG) and Rec. 2020 wide-gamut inputs are rejected — the 8-bit
-  BGRA path would silently clip or shift those values.
+- HDR (PQ / HLG) and 10-bit inputs are preserved for identity re-encodes and
+  single-stage `super-resolution` runs when the OS reports native YUV support.
+  sRGB-only stages such as spatial scaling, denoise, motion blur, frame-rate
+  conversion, or terminal Lanczos downsampling reject HDR/10-bit sources instead
+  of silently clipping. HDR output requires HEVC; `--codec h264` is rejected.
 
 ## Installation
 

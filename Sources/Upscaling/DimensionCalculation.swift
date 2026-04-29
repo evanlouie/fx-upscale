@@ -75,21 +75,22 @@ public enum DimensionCalculation {
   ///
   /// - Parameters:
   ///   - scalerOutputSize: Size produced by the upstream scaler (or the source size if no
-  ///     scaler stage is active). Must be positive on both axes.
+  ///     scaler stage is active). Must be at least 2 pixels on both axes so an even final
+  ///     size can remain clamped to it.
   ///   - requestedWidth: Optional user-requested final width. If `nil`, derived from
   ///     `requestedHeight` preserving `scalerOutputSize`'s aspect, or defaults to
   ///     `scalerOutputSize.width`.
   ///   - requestedHeight: Optional user-requested final height. If `nil`, derived from the
   ///     computed width preserving `scalerOutputSize`'s aspect.
   /// - Returns: Even, positive final dimensions, clamped to `scalerOutputSize` on both axes.
-  /// - Throws: ``Error`` if `scalerOutputSize` is non-positive or a requested dimension is
-  ///   non-positive.
+  /// - Throws: ``Error`` if `scalerOutputSize` is smaller than 2 pixels on either axis or a
+  ///   requested dimension is non-positive.
   public static func calculateFinalOutputDimensions(
     scalerOutputSize: CGSize,
     requestedWidth: Int?,
     requestedHeight: Int?
   ) throws -> CGSize {
-    guard scalerOutputSize.width > 0, scalerOutputSize.height > 0 else {
+    guard scalerOutputSize.width >= 2, scalerOutputSize.height >= 2 else {
       throw Error.invalidInputSize(scalerOutputSize)
     }
     try validateRequestedDimensions(width: requestedWidth, height: requestedHeight)
@@ -127,9 +128,11 @@ public enum DimensionCalculation {
     let evenWidth = evenCeil(baseWidth)
     let evenHeight = evenCeil(baseHeight)
     if clampToReference {
+      let maxWidth = evenFloor(Int(reference.width))
+      let maxHeight = evenFloor(Int(reference.height))
       return CGSize(
-        width: min(evenWidth, Int(reference.width)),
-        height: min(evenHeight, Int(reference.height)))
+        width: min(evenWidth, maxWidth),
+        height: min(evenHeight, maxHeight))
     }
     return CGSize(width: evenWidth, height: evenHeight)
   }
@@ -142,4 +145,10 @@ public enum DimensionCalculation {
 public func evenCeil(_ value: Int) -> Int {
   precondition(value > 0, "evenCeil requires a positive input")
   return value + (value & 1)
+}
+
+/// Rounds a positive integer down to the nearest even integer.
+private func evenFloor(_ value: Int) -> Int {
+  precondition(value > 1, "evenFloor requires an input greater than 1")
+  return value - (value & 1)
 }

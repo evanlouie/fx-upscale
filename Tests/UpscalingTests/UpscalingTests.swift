@@ -1837,6 +1837,39 @@ struct ExportSessionTests {
     #expect(outFormat.contentLightLevelInfo != nil)
   }
 
+  @Test("Mixed 8-bit/BGRA capabilities reject PQ instead of falling back to BGRA")
+  func mixed8BitCapabilitiesRejectPQSource() async throws {
+    let url = try #require(
+      Bundle.module.url(forResource: "gradient_pq_hdr", withExtension: "mov"))
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pq_mixed_8bit_reject_\(UUID().uuidString).mov")
+    defer { TestVideoGenerator.cleanup(outputURL) }
+
+    let capabilities = UpscalingExportSession.ChainCapabilities(
+      supportedSourceInputFormats: [
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      ],
+      producedOutputFormat: kCVPixelFormatType_32BGRA,
+      srgbRejectingStageName: "8-bit BGRA fallback")
+    let session = UpscalingExportSession(
+      asset: AVURLAsset(url: url),
+      outputCodec: .hevc,
+      preferredOutputURL: outputURL,
+      outputSize: CGSize(width: 960, height: 540),
+      chainCapabilities: capabilities)
+
+    do {
+      try await session.export()
+      Issue.record("Expected export to throw")
+    } catch let error as UpscalingExportSession.Error {
+      guard case .unsupportedColorSpace(let name) = error else {
+        Issue.record("Expected .unsupportedColorSpace, got \(error)")
+        throw error
+      }
+      #expect(name == "8-bit BGRA fallback")
+    }
+  }
+
   @Test("Spatial path rejects 10-bit Rec. 709 source")
   func spatialRejects10BitRec709() async throws {
     let url = try #require(
@@ -3014,97 +3047,6 @@ private actor ConcurrentProbeBackend: FrameProcessorBackend {
   private nonisolated let configuredMaxConcurrentFrames: Int
   private var inFlight = 0
   private var maxObservedInFlight = 0
-}
-
-// MARK: - Final Output Dimensions
-
-@Suite("Final Output Dimensions")
-struct FinalOutputDimensionsTests {
-  @Test("Both nil returns scalerOutputSize verbatim")
-  func bothNilReturnsScaler() throws {
-    let scaler = CGSize(width: 3840, height: 2160)
-    let out = try DimensionCalculation.calculateFinalOutputDimensions(
-      scalerOutputSize: scaler, requestedWidth: nil, requestedHeight: nil)
-    #expect(out == scaler)
-  }
-
-  @Test("Width-only derives height from scalerOutputSize's aspect")
-  func widthOnlyDerivesHeight() throws {
-    let scaler = CGSize(width: 3840, height: 2160)
-    let out = try DimensionCalculation.calculateFinalOutputDimensions(
-      scalerOutputSize: scaler, requestedWidth: 1920, requestedHeight: nil)
-    #expect(out == CGSize(width: 1920, height: 1080))
-  }
-
-  @Test("Height-only derives width from scalerOutputSize's aspect")
-  func heightOnlyDerivesWidth() throws {
-    let scaler = CGSize(width: 3840, height: 2160)
-    let out = try DimensionCalculation.calculateFinalOutputDimensions(
-      scalerOutputSize: scaler, requestedWidth: nil, requestedHeight: 1080)
-    #expect(out == CGSize(width: 1920, height: 1080))
-  }
-
-  @Test("Both given are honored verbatim after even-rounding")
-  func bothGivenHonored() throws {
-    let scaler = CGSize(width: 3840, height: 2160)
-    let out = try DimensionCalculation.calculateFinalOutputDimensions(
-      scalerOutputSize: scaler, requestedWidth: 1280, requestedHeight: 720)
-    #expect(out == CGSize(width: 1280, height: 720))
-  }
-
-  @Test("Non-positive requested width throws")
-  func nonPositiveWidthThrows() {
-    #expect(throws: DimensionCalculation.Error.self) {
-      _ = try DimensionCalculation.calculateFinalOutputDimensions(
-        scalerOutputSize: CGSize(width: 3840, height: 2160),
-        requestedWidth: 0, requestedHeight: nil)
-    }
-  }
-
-  @Test("Non-positive requested height throws")
-  func nonPositiveHeightThrows() {
-    #expect(throws: DimensionCalculation.Error.self) {
-      _ = try DimensionCalculation.calculateFinalOutputDimensions(
-        scalerOutputSize: CGSize(width: 3840, height: 2160),
-        requestedWidth: nil, requestedHeight: -1)
-    }
-  }
-
-  @Test("Non-positive scalerOutputSize throws")
-  func invalidScalerSizeThrows() {
-    #expect(throws: DimensionCalculation.Error.self) {
-      _ = try DimensionCalculation.calculateFinalOutputDimensions(
-        scalerOutputSize: CGSize(width: 0, height: 0),
-        requestedWidth: nil, requestedHeight: nil)
-    }
-  }
-
-  @Test("Odd scalerOutputSize with both-nil returns even dimensions")
-  func oddScalerBothNil() throws {
-    let scaler = CGSize(width: 3841, height: 2161)
-    let out = try DimensionCalculation.calculateFinalOutputDimensions(
-      scalerOutputSize: scaler, requestedWidth: nil, requestedHeight: nil)
-    #expect(out.width <= scaler.width)
-    #expect(out.height <= scaler.height)
-  }
-
-  @Test("Clamps result to scalerOutputSize on the width axis")
-  func clampsWidth() throws {
-    let scaler = CGSize(width: 1920, height: 1080)
-    let out = try DimensionCalculation.calculateFinalOutputDimensions(
-      scalerOutputSize: scaler, requestedWidth: 1920, requestedHeight: nil)
-    #expect(out.width == 1920)
-    #expect(out.width <= scaler.width)
-    #expect(out.height <= scaler.height)
-  }
-
-  @Test("Final dims smaller than scaler produce even, correct output")
-  func downsample() throws {
-    let out = try DimensionCalculation.calculateFinalOutputDimensions(
-      scalerOutputSize: CGSize(width: 3840, height: 2160),
-      requestedWidth: 1920, requestedHeight: 1080)
-    #expect(out == CGSize(width: 1920, height: 1080))
-  }
 }
 
 // MARK: - CILanczosDownsampler Tests

@@ -231,7 +231,8 @@ import Upscaling
   ///   routed through the `preflight(_:)` helper below.
   func run() async throws {
     let asset = AVURLAsset(url: url)
-    guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+    let videoTracks = try await asset.loadTracks(withMediaType: .video)
+    guard let videoTrack = videoTracks.first else {
       throw ValidationError("Failed to get video track from input file")
     }
 
@@ -248,6 +249,8 @@ import Upscaling
           + "The video file may be corrupted."
       )
     }
+
+    try await validateVideoTrackDimensions(videoTracks, expectedSize: inputSize)
 
     let effectiveScaler: UpscalerKind = scaler ?? .spatial
 
@@ -362,12 +365,10 @@ import Upscaling
     }
 
     // `validate()` already rejected a pre-existing output unless --force was given.
-    // In the --force case, remove the stale file now that we're committed to running.
-    // `try?` both swallows a benign "file not found" (avoiding the TOCTOU existence check)
-    // and any other removal failure — the asset writer will surface a clear error shortly
-    // if the path is actually unusable.
+    // In the --force case, remove the stale file now that we're committed to running, but
+    // never recursively delete a directory at the derived output path.
     if force {
-      try? FileManager.default.removeItem(at: outputURL)
+      try removeExistingOutputForForce()
     }
 
     let metricsCollector = PipelineMetricsCollector()
@@ -433,7 +434,12 @@ import Upscaling
       // `nominalFrameRate` is a Float; promote for the comparison so rounding doesn't pass
       // a marginally-higher target like 29.9999 as "greater than" a 30.0 source.
       let sourceFrameRate = try await Double(videoTrack.load(.nominalFrameRate))
-      if sourceFrameRate > 0, fps <= sourceFrameRate {
+      guard sourceFrameRate > 0 else {
+        throw ValidationError(
+          "--fps requires a source with a known nominal frame rate. "
+            + "Variable-rate or unknown-rate sources cannot be safely upsampled.")
+      }
+      if fps <= sourceFrameRate {
         throw ValidationError(
           "--fps must be greater than the source frame rate "
             + "(source: \(String(format: "%.3f", sourceFrameRate)))."
@@ -632,6 +638,11 @@ import Upscaling
 
     do {
       try await exportSession.export()
+      for mediaType in exportSession.skippedPassthroughMediaTypes {
+        Terminal.warning(
+          "Skipped non-critical \(mediaType.rawValue) track because AVFoundation could not "
+            + "pass it through to the output container.")
+      }
       // Disarm the cleanup closure BEFORE we acknowledge success (or let the deferred
       // `ProgressBar.stop()` run). A `defer` here would fire after `Terminal.success`,
       // leaving a window in which a SIGINT would delete the very file we just announced
@@ -648,6 +659,47 @@ import Upscaling
     }
     Terminal.success("Wrote \(outputURL.path(percentEncoded: false))")
     Terminal.metricsSummary(metricsCollector.snapshot())
+  }
+
+  private func validateVideoTrackDimensions(
+    _ videoTracks: [AVAssetTrack],
+    expectedSize: CGSize
+  ) async throws {
+    for (index, track) in videoTracks.enumerated().dropFirst() {
+      let formatDescription = try await track.load(.formatDescriptions).first
+      let dimensions = formatDescription.map {
+        CMVideoFormatDescriptionGetDimensions($0).cgSize
+      }
+      let naturalSize = try await track.load(.naturalSize)
+      let trackSize = dimensions ?? naturalSize
+      guard trackSize == expectedSize else {
+        throw ValidationError(
+          "All video tracks must have the same encoded dimensions. "
+            + "Track 1 is \(Int(expectedSize.width))x\(Int(expectedSize.height)); "
+            + "track \(index + 1) is \(Int(trackSize.width))x\(Int(trackSize.height)).")
+      }
+    }
+  }
+
+  private func removeExistingOutputForForce() throws {
+    var isDirectory = ObjCBool(false)
+    guard FileManager.default.fileExists(
+      atPath: outputURL.path(percentEncoded: false), isDirectory: &isDirectory)
+    else { return }
+
+    if isDirectory.boolValue {
+      throw ValidationError(
+        "Output path is a directory at \(outputURL.path(percentEncoded: false)). "
+          + "Choose a different output path or remove the directory manually.")
+    }
+
+    do {
+      try FileManager.default.removeItem(at: outputURL)
+    } catch {
+      throw ValidationError(
+        "Failed to remove existing output at \(outputURL.path(percentEncoded: false)): "
+          + error.localizedDescription)
+    }
   }
 
   /// Runs a preflight check and, on failure, prints the error and exits with code 3 so
