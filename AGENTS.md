@@ -86,7 +86,7 @@ struct MyTests {
 
 - Use `@Suite` with descriptive names and optional traits (`.serialized`)
 - Use `#expect()` for assertions, `#require()` for unwrapping
-- Use `throw TestSkipError("reason")` to skip tests conditionally
+- Use swift-testing conditional traits such as `.enabled(if:condition, "reason")` or `.disabled("reason")` for environment-dependent tests; do not throw a custom error to skip, because thrown errors are test failures
 - Test helper structs for setup (e.g., `TestVideoGenerator`)
 - Clean up with `defer { cleanup() }` pattern
 - Disable tests with `.disabled("reason")` trait

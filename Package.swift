@@ -29,7 +29,8 @@ let package = Package(
       resources: [.process("Resources")]
     ),
     .testTarget(
-      name: "FXUpscaleCLITests"
+      name: "FXUpscaleCLITests",
+      dependencies: ["fx-upscale"]
     ),
   ]
 )

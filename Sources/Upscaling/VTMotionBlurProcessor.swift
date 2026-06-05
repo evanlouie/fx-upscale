@@ -84,8 +84,7 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       try validateProcessorInput(
         pixelBuffer, expectedInputSize: frameSize, expectedPixelFormat: pixelFormat)
@@ -99,11 +98,9 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
       guard let previousSourceFrame else {
         self.previousSourceFrame = sourceFrame
         nonisolated(unsafe) let passthrough = pixelBuffer
-        let result = [
+        return [
           FrameProcessorOutput(pixelBuffer: passthrough, presentationTimeStamp: presentationTimeStamp)
         ]
-        await processingGate.release()
-        return result
       }
 
       let output = try resolveProcessorOutputBuffer(
@@ -136,29 +133,19 @@ public actor VTMotionBlurProcessor: FrameProcessorBackend {
 
       self.previousSourceFrame = sourceFrame
 
-      let result = [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
-      await processingGate.release()
-      return result
-    } catch {
-      await processingGate.release()
-      throw error
+      return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
     }
   }
 
   public func finish(
     outputPool _: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       // Release the retained previous source wrapper so its buffer isn't kept alive past the
       // end of the stream. This backend doesn't look ahead, so nothing is flushed.
       previousSourceFrame = nil
-      await processingGate.release()
       return []
-    } catch {
-      await processingGate.release()
-      throw error
     }
   }
 

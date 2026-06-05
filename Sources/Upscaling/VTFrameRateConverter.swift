@@ -64,7 +64,10 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     // drift. For non-integer rates, fall back to a very high timescale — drift per period
     // is bounded by `0.5 / fallbackTimescale` seconds, well below any meaningful threshold.
     let rounded = targetFrameRate.rounded()
-    if abs(rounded - targetFrameRate) < 1e-9, rounded >= 1, rounded <= Double(Int32.max) {
+    if abs(rounded - targetFrameRate) < Self.integerRateEpsilon,
+      rounded >= 1,
+      rounded <= Double(Int32.max)
+    {
       self.targetPeriod = CMTime(value: 1, timescale: Int32(rounded))
     } else {
       self.targetPeriod = CMTime(
@@ -156,18 +159,13 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     outputPool externalPool: sending CVPixelBufferPool?,
     emit: @Sendable (FrameProcessorOutput) async throws -> Void
   ) async throws {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       try await processPermitted(
         pixelBuffer,
         presentationTimeStamp: presentationTimeStamp,
         outputPool: externalPool,
         emit: emit)
-      await processingGate.release()
-    } catch {
-      await processingGate.release()
-      throw error
     }
   }
 
@@ -185,25 +183,17 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
     outputPool _: sending CVPixelBufferPool?,
     emit: @Sendable (FrameProcessorOutput) async throws -> Void
   ) async throws {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       // Emit the final buffered source frame at its original PTS. Any target PTS that fall
       // strictly beyond the last source frame are dropped — we have no "next" frame to
       // interpolate against, and synthesising pixels past the input would distort duration.
-      guard let buffered = bufferedFrame else {
-        await processingGate.release()
-        return
-      }
+      guard let buffered = bufferedFrame else { return }
       bufferedFrame = nil
       nonisolated(unsafe) let passthroughBuffer = buffered.buffer
       try await emit(
         FrameProcessorOutput(pixelBuffer: passthroughBuffer, presentationTimeStamp: buffered.pts)
       )
-      await processingGate.release()
-    } catch {
-      await processingGate.release()
-      throw error
     }
   }
 
@@ -378,6 +368,9 @@ public actor VTFrameRateConverter: FrameProcessorBackend {
   /// 13 covers every realistic ratio (≤ ~10×) without fall-back to
   /// `CVPixelBufferPoolCreatePixelBuffer`.
   private static let minimumPoolBufferCount = 13
+
+  /// Tolerance for treating a floating-point target frame rate as an exact integer rate.
+  private static let integerRateEpsilon = 1e-9
 
   /// Fallback `CMTime` timescale used for the target period when `targetFrameRate` isn't a
   /// clean integer. Chosen large enough that per-period rounding stays well under one frame

@@ -137,9 +137,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
     let assetReader = try AVAssetReader(asset: asset)
 
     let duration = try await asset.load(.duration)
-    let durationUnits: Int64 =
-      duration.isNumeric
-      ? max(1, Int64(duration.seconds * Double(Self.progressUnitsPerSecond))) : 1
+    let durationUnits = max(1, Self.progressUnits(for: duration))
 
     nonisolated(unsafe) let cancelReader = assetReader
     nonisolated(unsafe) let cancelWriter = assetWriter
@@ -455,7 +453,7 @@ public final class UpscalingExportSession: @unchecked Sendable {
   /// the reported percentage above 100.
   private static func updateProgress(_ progress: Progress, pts: CMTime) {
     guard pts.isNumeric else { return }
-    let raw = Int64(pts.seconds * Double(progressUnitsPerSecond))
+    let raw = progressUnits(for: pts)
     let newUnits = min(raw, progress.totalUnitCount)
     let last = progress.completedUnitCount
     if newUnits - last >= progressUpdateThresholdUnits
@@ -463,6 +461,15 @@ public final class UpscalingExportSession: @unchecked Sendable {
     {
       progress.completedUnitCount = newUnits
     }
+  }
+
+  private static func progressUnits(for time: CMTime) -> Int64 {
+    guard time.isNumeric else { return 0 }
+    let units = time.seconds * Double(progressUnitsPerSecond)
+    guard units.isFinite else { return 0 }
+    if units <= 0 { return 0 }
+    if units >= Double(Int64.max) { return Int64.max }
+    return Int64(units)
   }
 
   private static func videoAssetReaderOutput(
@@ -921,13 +928,17 @@ public final class UpscalingExportSession: @unchecked Sendable {
       nonisolated(unsafe) let unsafeOutput = output
       queue.async {
         while true {
-          semaphore.wait()
-          guard let buffer = unsafeOutput.copyNextSampleBuffer() else {
-            continuation.finish()
-            return
+          let shouldContinue = autoreleasepool { () -> Bool in
+            semaphore.wait()
+            guard let buffer = unsafeOutput.copyNextSampleBuffer() else {
+              continuation.finish()
+              return false
+            }
+            let envelope = SampleBufferEnvelope(buffer: buffer) { semaphore.signal() }
+            if case .terminated = continuation.yield(envelope) { return false }
+            return true
           }
-          let envelope = SampleBufferEnvelope(buffer: buffer) { semaphore.signal() }
-          if case .terminated = continuation.yield(envelope) { return }
+          if !shouldContinue { return }
         }
       }
     }
@@ -982,6 +993,9 @@ final class AttachmentTimeline: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     guard !storage.isEmpty else { return nil }
+    if let exact = storage.values.first(where: { $0.pts == pts }) {
+      return exact.attachments
+    }
     var best: Entry?
     for entry in storage.values where entry.pts <= pts {
       if let current = best {
@@ -996,7 +1010,9 @@ final class AttachmentTimeline: @unchecked Sendable {
   func complete(sourceSequence: Int64) {
     lock.lock()
     defer { lock.unlock() }
-    storage = storage.filter { sequence, _ in sequence >= sourceSequence }
+    for sequence in Array(storage.keys) where sequence < sourceSequence {
+      storage.removeValue(forKey: sequence)
+    }
   }
 }
 

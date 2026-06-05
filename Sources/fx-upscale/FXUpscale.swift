@@ -188,9 +188,9 @@ import Upscaling
     if let scale, scale < 2 {
       throw ValidationError("--scale must be an integer ≥ 2")
     }
-    if scaler != nil, scale == nil {
+    if let scaler, scale == nil {
       throw ValidationError(
-        "--scaler \(scaler!.rawValue) selects a scaling algorithm, but no scaling was requested.\n"
+        "--scaler \(scaler.rawValue) selects a scaling algorithm, but no scaling was requested.\n"
           + "Pass --scale N to enable the scaler, or drop --scaler to do a pure downsample.")
     }
     if let quality, !(1...100).contains(quality) {
@@ -205,8 +205,11 @@ import Upscaling
     if let motionBlur, !(1...100).contains(motionBlur) {
       throw ValidationError("--motion-blur must be between 1 and 100")
     }
-    // `--fps` finiteness / range is validated by `VTFrameRateConverter.preflight` in
-    // `run()`, alongside the source-vs-target check once the source track is loaded.
+    if let fps, !fps.isFinite || fps <= 0 {
+      throw ValidationError("--fps must be a positive, finite number")
+    }
+    // `--fps` source-vs-target validation is performed in `run()`, once the source track is
+    // loaded and its nominal frame rate is available.
 
     // Fail fast on a pre-existing output file — the output path is a pure transform of
     // the input URL and CLI flags, so we can compute it here without loading the asset.
@@ -657,6 +660,10 @@ import Upscaling
       Terminal.error(error.localizedDescription)
       throw ExitCode.failure
     }
+    // Mirror the error path: tear down the progress block before printing final output so the
+    // cursor is not parked inside the progress area and the deferred idempotent stop cannot
+    // clear the just-printed success line or metrics table.
+    ProgressBar.stop()
     Terminal.success("Wrote \(outputURL.path(percentEncoded: false))")
     Terminal.metricsSummary(metricsCollector.snapshot())
   }

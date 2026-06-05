@@ -287,12 +287,11 @@ enum ProgressBar {
   /// CLI invokes from its single `async run()` flow.
   private nonisolated(unsafe) static var task: Task<Void, Never>?
 
-  private static func render(
-    progress: Progress,
-    metricsCollector: PipelineMetricsCollector?
-  ) {
-    let snapshot = metricsCollector?.snapshot()
-
+  static func renderLines(
+    terminalWidth: Int,
+    fraction rawFraction: Double,
+    snapshot: PipelineMetrics?
+  ) -> [String] {
     // ── Line 1: progress bar with overall fps ──────────────────────────
 
     let overallFpsText: String
@@ -305,8 +304,7 @@ enum ProgressBar {
       overallFpsText = ""
     }
 
-    let terminalWidth = Terminal.columns ?? defaultColumns
-    let fraction = max(0, min(1, progress.fractionCompleted))
+    let fraction = max(0, min(1, rawFraction))
     // Locale-fixed formatting: `.formatted(.percent...)` emits `"50,00 %"` in de_DE / fr_FR,
     // breaking the fixed-width assumption below. `%6.2f%%` always produces a 7-char field
     // ("  0.00%", " 50.00%", "100.00%") regardless of locale.
@@ -329,13 +327,13 @@ enum ProgressBar {
 
       var bar = openBracket
       bar += String(repeating: "█", count: completed)
-      if barCols - completed - 1 > 0 {
+      if completed < barCols {
         let frameIndex = min(
           partialFrames.count - 1,
           Int(partial * Double(partialFrames.count))
         )
         bar += partialFrames[frameIndex]
-        bar += String(repeating: " ", count: barCols - completed - 1)
+        bar += String(repeating: " ", count: max(0, barCols - completed - 1))
       }
       bar += closeBracket
       bar += ANSI.style(" " + percent, ANSI.gray)
@@ -358,6 +356,18 @@ enum ProgressBar {
         }
       }
     }
+
+    return lines
+  }
+
+  private static func render(
+    progress: Progress,
+    metricsCollector: PipelineMetricsCollector?
+  ) {
+    let lines = renderLines(
+      terminalWidth: Terminal.columns ?? defaultColumns,
+      fraction: progress.fractionCompleted,
+      snapshot: metricsCollector?.snapshot())
 
     // ── Emit with cursor management ────────────────────────────────────
 

@@ -50,3 +50,18 @@ actor NonReentrantAsyncGate {
     }
   }
 }
+
+func withNonReentrantGate<T>(
+  _ gate: NonReentrantAsyncGate,
+  @_inheritActorContext operation: @Sendable () async throws -> T
+) async throws -> T {
+  guard await gate.acquire() else { throw CancellationError() }
+  do {
+    let result = try await operation()
+    await gate.release()
+    return result
+  } catch {
+    await gate.release()
+    throw error
+  }
+}

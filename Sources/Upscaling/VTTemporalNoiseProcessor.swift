@@ -33,8 +33,14 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
     self.filterStrength = Float(try Self.validateStrength(strength)) / Float(Self.maxStrength)
     self.pixelFormat = pixelFormat
 
+    let configuration = try Self.makeConfiguration(frameSize: frameSize, pixelFormat: pixelFormat)
+    guard frameSupportedPixelFormats(of: configuration).contains(pixelFormat)
+    else {
+      throw Error.unsupportedPixelFormat(
+        pixelFormat, supported: frameSupportedPixelFormats(of: configuration))
+    }
     self.core = try VTStatefulBackendCore(
-      configuration: try Self.makeConfiguration(frameSize: frameSize, pixelFormat: pixelFormat),
+      configuration: configuration,
       poolSize: frameSize,
       minimumPoolBufferCount: Self.minimumPoolBufferCount,
       backend: .temporalNoise,
@@ -50,7 +56,12 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
 
   public static func preflight(frameSize: CGSize, strength: Int, pixelFormat: OSType) throws {
     _ = try validateStrength(strength)
-    _ = try makeConfiguration(frameSize: frameSize, pixelFormat: pixelFormat)
+    let configuration = try makeConfiguration(frameSize: frameSize, pixelFormat: pixelFormat)
+    guard frameSupportedPixelFormats(of: configuration).contains(pixelFormat)
+    else {
+      throw Error.unsupportedPixelFormat(
+        pixelFormat, supported: frameSupportedPixelFormats(of: configuration))
+    }
   }
 
   public static func supportedPixelFormats(frameSize: CGSize) throws -> Set<OSType> {
@@ -83,8 +94,7 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       try validateProcessorInput(
         pixelBuffer, expectedInputSize: frameSize, expectedPixelFormat: pixelFormat)
@@ -98,11 +108,9 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
       guard let previousSourceFrame else {
         self.previousSourceFrame = sourceFrame
         nonisolated(unsafe) let passthrough = pixelBuffer
-        let result = [
+        return [
           FrameProcessorOutput(pixelBuffer: passthrough, presentationTimeStamp: presentationTimeStamp)
         ]
-        await processingGate.release()
-        return result
       }
 
       let output = try resolveProcessorOutputBuffer(
@@ -133,29 +141,19 @@ public actor VTTemporalNoiseProcessor: FrameProcessorBackend {
 
       self.previousSourceFrame = sourceFrame
 
-      let result = [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
-      await processingGate.release()
-      return result
-    } catch {
-      await processingGate.release()
-      throw error
+      return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
     }
   }
 
   public func finish(
     outputPool _: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       // Release the retained previous source wrapper so its buffer isn't kept alive past the
       // end of the stream. This backend doesn't look ahead, so nothing is flushed.
       previousSourceFrame = nil
-      await processingGate.release()
       return []
-    } catch {
-      await processingGate.release()
-      throw error
     }
   }
 
@@ -222,6 +220,7 @@ extension VTTemporalNoiseProcessor {
   public enum Error: Swift.Error, LocalizedError {
     case strengthOutOfRange(requested: Int, minimum: Int, maximum: Int)
     case configurationInitFailed(frameWidth: Int, frameHeight: Int)
+    case unsupportedPixelFormat(OSType, supported: Set<OSType>)
 
     public var errorDescription: String? {
       switch self {
@@ -231,7 +230,12 @@ extension VTTemporalNoiseProcessor {
       case .configurationInitFailed(let frameWidth, let frameHeight):
         "Temporal noise filter rejected the input configuration "
           + "(\(frameWidth)×\(frameHeight)). The dimensions may exceed the processor's "
-          + "supported range, or the source pixel format may be unsupported."
+          + "supported range."
+      case .unsupportedPixelFormat(let requested, let supported):
+        "Temporal noise filter does not support pixel format \(describePixelFormat(requested)) "
+          + "for this frame size. Supported formats: "
+          + supported.map(describePixelFormat).sorted().joined(separator: ", ")
+          + "."
       }
     }
   }

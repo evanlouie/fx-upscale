@@ -238,14 +238,12 @@ extension Upscaler {
   public enum Error: Swift.Error, LocalizedError {
     case couldNotCreateMetalTexture
     case couldNotMakeCommandBuffer
-    case couldNotMakeBlitCommandEncoder
     case metalFXUnavailable
 
     public var errorDescription: String? {
       switch self {
       case .couldNotCreateMetalTexture: "Failed to create Metal texture for upscaling."
       case .couldNotMakeCommandBuffer: "Failed to create Metal command buffer."
-      case .couldNotMakeBlitCommandEncoder: "Failed to create Metal blit command encoder."
       case .metalFXUnavailable: "MetalFX is not available on this platform."
       }
     }

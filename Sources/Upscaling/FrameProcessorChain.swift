@@ -128,7 +128,8 @@ public actor FrameProcessorChain: FrameProcessorBackend {
       var nextFrames: [FrameProcessorOutput] = []
       nextFrames.reserveCapacity(currentFrames.count)
 
-      let stageStart = ContinuousClock.now
+      let stageStart: ContinuousClock.Instant? =
+        (metricsCollector != nil && stageMetricsIndices != nil) ? ContinuousClock.now : nil
 
       for frame in currentFrames {
         nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
@@ -140,7 +141,7 @@ public actor FrameProcessorChain: FrameProcessorBackend {
         nextFrames.append(contentsOf: outputs)
       }
 
-      if let metricsCollector, let indices = stageMetricsIndices {
+      if let metricsCollector, let indices = stageMetricsIndices, let stageStart {
         let elapsed = ContinuousClock.now - stageStart
         metricsCollector.record(stageIndex: indices[stageIndex], duration: elapsed)
       }
@@ -172,7 +173,8 @@ public actor FrameProcessorChain: FrameProcessorBackend {
       nonisolated(unsafe) let poolForStage: CVPixelBufferPool? =
         (stageIndex == lastIndex) ? terminalPool : nil
 
-      let stageStart = ContinuousClock.now
+      let stageStart: ContinuousClock.Instant? =
+        (metricsCollector != nil && stageMetricsIndices != nil) ? ContinuousClock.now : nil
 
       var nextFrames: [FrameProcessorOutput] = []
       for frame in running {
@@ -187,7 +189,7 @@ public actor FrameProcessorChain: FrameProcessorBackend {
       let flushed = try await stage.finish(outputPool: poolForStage)
       nextFrames.append(contentsOf: flushed)
 
-      if let metricsCollector, let indices = stageMetricsIndices {
+      if let metricsCollector, let indices = stageMetricsIndices, let stageStart {
         let elapsed = ContinuousClock.now - stageStart
         metricsCollector.record(stageIndex: indices[stageIndex], duration: elapsed)
       }
@@ -381,7 +383,8 @@ public actor FrameProcessorChain: FrameProcessorBackend {
 
       guard !batch.frames.isEmpty else { continue }
 
-      let stageStart = ContinuousClock.now
+      let stageStart: ContinuousClock.Instant? =
+        (metricsCollector != nil && metricsIndex != nil) ? ContinuousClock.now : nil
       for frame in batch.frames {
         nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
         try await stage.process(
@@ -393,19 +396,24 @@ public actor FrameProcessorChain: FrameProcessorBackend {
         }
       }
 
-      if let metricsCollector, let idx = metricsIndex {
+      if let metricsCollector, let idx = metricsIndex, let stageStart {
         metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - stageStart)
       }
     }
 
     try Task.checkCancellation()
-    let flushStart = ContinuousClock.now
+    let flushStart: ContinuousClock.Instant? =
+      (metricsCollector != nil && metricsIndex != nil) ? ContinuousClock.now : nil
     let flushedOutputCount = OSAllocatedUnfairLock(initialState: 0)
     try await stage.finish(outputPool: stageOutputPool) { output in
       flushedOutputCount.withLock { $0 += 1 }
       await emitter.emit(output, sourceSequence: nil)
     }
-    if flushedOutputCount.withLock({ $0 }) > 0, let metricsCollector, let idx = metricsIndex {
+    if flushedOutputCount.withLock({ $0 }) > 0,
+      let metricsCollector,
+      let idx = metricsIndex,
+      let flushStart
+    {
       metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - flushStart)
     }
   }
@@ -471,7 +479,8 @@ public actor FrameProcessorChain: FrameProcessorBackend {
 
           group.addTask {
             try Task.checkCancellation()
-            let stageStart = ContinuousClock.now
+            let stageStart: ContinuousClock.Instant? =
+              (metricsCollector != nil && metricsIndex != nil) ? ContinuousClock.now : nil
             let collector = FrameProcessorOutputAccumulator()
             for frame in batch.frames {
               nonisolated(unsafe) let inputBuffer = frame.pixelBuffer
@@ -483,7 +492,7 @@ public actor FrameProcessorChain: FrameProcessorBackend {
                 collector.append(output)
               }
             }
-            if let metricsCollector, let idx = metricsIndex {
+            if let metricsCollector, let idx = metricsIndex, let stageStart {
               metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - stageStart)
             }
             return ProcessedPipelineBatch(
@@ -514,14 +523,15 @@ public actor FrameProcessorChain: FrameProcessorBackend {
     }
 
     try Task.checkCancellation()
-    let flushStart = ContinuousClock.now
+    let flushStart: ContinuousClock.Instant? =
+      (metricsCollector != nil && metricsIndex != nil) ? ContinuousClock.now : nil
     let collector = FrameProcessorOutputAccumulator()
     try await stage.finish(outputPool: stageOutputPool) { output in
       collector.append(output)
     }
     let flushed = collector.values()
     if !flushed.isEmpty {
-      if let metricsCollector, let idx = metricsIndex {
+      if let metricsCollector, let idx = metricsIndex, let flushStart {
         metricsCollector.record(stageIndex: idx, duration: ContinuousClock.now - flushStart)
       }
       await outputChannel.send(

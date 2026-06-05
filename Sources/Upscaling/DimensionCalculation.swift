@@ -12,12 +12,11 @@ public enum DimensionCalculation {
 
     public var errorDescription: String? {
       switch self {
-      case let .invalidInputSize(size):
-        return
-          "Invalid input video dimensions: \(Int(size.width))x\(Int(size.height)). "
+      case .invalidInputSize(let size):
+        "Invalid input video dimensions: \(Int(size.width))×\(Int(size.height)). "
           + "Width and height must both be positive."
-      case let .invalidRequestedDimension(name, value):
-        return "--\(name) must be a positive integer (got \(value))."
+      case .invalidRequestedDimension(let name, let value):
+        "--\(name) must be a positive integer (got \(value))."
       }
     }
   }
@@ -121,9 +120,9 @@ public enum DimensionCalculation {
     let aspect = Double(reference.width) / Double(reference.height)
     let baseWidth =
       requestedWidth
-      ?? requestedHeight.map { Int((Double($0) * aspect).rounded()) }
+      ?? requestedHeight.map { max(1, Int((Double($0) * aspect).rounded())) }
       ?? defaultWidth
-    let baseHeight = requestedHeight ?? Int((Double(baseWidth) / aspect).rounded())
+    let baseHeight = requestedHeight ?? max(1, Int((Double(baseWidth) / aspect).rounded()))
 
     let evenWidth = evenCeil(baseWidth)
     let evenHeight = evenCeil(baseHeight)

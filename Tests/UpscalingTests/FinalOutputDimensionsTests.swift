@@ -30,6 +30,19 @@ struct FinalOutputDimensionsTests {
     #expect(out == CGSize(width: 1920, height: 1080))
   }
 
+  @Test("Derived zero axes are clamped before even-rounding")
+  func derivedZeroAxesAreClamped() throws {
+    let wide = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: CGSize(width: 3840, height: 1606),
+      requestedWidth: 1, requestedHeight: nil)
+    #expect(wide == CGSize(width: 2, height: 2))
+
+    let tall = try DimensionCalculation.calculateFinalOutputDimensions(
+      scalerOutputSize: CGSize(width: 1080, height: 2400),
+      requestedWidth: nil, requestedHeight: 1)
+    #expect(tall == CGSize(width: 2, height: 2))
+  }
+
   @Test("Both given are honored verbatim after even-rounding")
   func bothGivenHonored() throws {
     let scaler = CGSize(width: 3840, height: 2160)

@@ -102,8 +102,7 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
     presentationTimeStamp: CMTime,
     outputPool externalPool: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       let output = try resolveProcessorOutputBuffer(
         input: pixelBuffer,
@@ -143,30 +142,20 @@ public actor VTSuperResolutionUpscaler: FrameProcessorBackend {
       previousSourceFrame = sourceFrame
       previousOutputFrame = destinationFrame
 
-      let result = [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
-      await processingGate.release()
-      return result
-    } catch {
-      await processingGate.release()
-      throw error
+      return [FrameProcessorOutput(pixelBuffer: output, presentationTimeStamp: presentationTimeStamp)]
     }
   }
 
   public func finish(
     outputPool _: sending CVPixelBufferPool?
   ) async throws -> [FrameProcessorOutput] {
-    guard await processingGate.acquire() else { throw CancellationError() }
-    do {
+    try await withNonReentrantGate(processingGate) {
       try Task.checkCancellation()
       // Release retained temporal references so output buffers aren't kept alive past the
       // end of the stream. This backend doesn't look ahead, so nothing is flushed.
       previousSourceFrame = nil
       previousOutputFrame = nil
-      await processingGate.release()
       return []
-    } catch {
-      await processingGate.release()
-      throw error
     }
   }
 
