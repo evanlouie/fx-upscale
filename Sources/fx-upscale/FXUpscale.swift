@@ -228,8 +228,8 @@ import Upscaling
   /// - `0` on success.
   /// - `1` (`ExitCode.failure`) on runtime export errors — see the `catch` around
   ///   `exportSession.export()`.
-  /// - `2` (`ExitCode.validationFailure`) on `ValidationError`s from `validate()` or the
-  ///   `--fps` source-rate check. ArgumentParser applies this exit code automatically.
+  /// - `64` (`EX_USAGE`, `ExitCode.validationFailure`) on `ValidationError`s from `validate()`
+  ///   or the `--fps` source-rate check. ArgumentParser applies this exit code automatically.
   /// - `3` on preflight failures (device/config incompatibility surfaced before any I/O),
   ///   routed through the `preflight(_:)` helper below.
   func run() async throws {
@@ -710,7 +710,7 @@ import Upscaling
   }
 
   /// Runs a preflight check and, on failure, prints the error and exits with code 3 so
-  /// preflight failures are distinguishable from both validation errors (exit 2) and
+  /// preflight failures are distinguishable from both validation errors (exit 64) and
   /// mid-export runtime failures (exit 1). Preflight errors are not usage errors, so we
   /// don't wrap them as `ValidationError` (which would trigger ArgumentParser to print
   /// command usage alongside the message).

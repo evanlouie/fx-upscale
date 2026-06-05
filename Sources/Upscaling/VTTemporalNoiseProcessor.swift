@@ -232,9 +232,11 @@ extension VTTemporalNoiseProcessor {
           + "(\(frameWidth)×\(frameHeight)). The dimensions may exceed the processor's "
           + "supported range."
       case .unsupportedPixelFormat(let requested, let supported):
-        "Temporal noise filter does not support pixel format \(describePixelFormat(requested)) "
-          + "for this frame size. Supported formats: "
-          + supported.map(describePixelFormat).sorted().joined(separator: ", ")
+        "Temporal noise filter doesn't support pixel format \(describePixelFormat(requested)). "
+          + "Supported formats: "
+          + (supported.isEmpty
+            ? "none"
+            : supported.map(describePixelFormat).sorted().joined(separator: ", "))
           + "."
       }
     }

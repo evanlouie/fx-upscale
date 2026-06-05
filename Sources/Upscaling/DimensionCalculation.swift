@@ -120,9 +120,9 @@ public enum DimensionCalculation {
     let aspect = Double(reference.width) / Double(reference.height)
     let baseWidth =
       requestedWidth
-      ?? requestedHeight.map { max(1, Int((Double($0) * aspect).rounded())) }
+      ?? requestedHeight.map { clampedDimension(Double($0) * aspect) }
       ?? defaultWidth
-    let baseHeight = requestedHeight ?? max(1, Int((Double(baseWidth) / aspect).rounded()))
+    let baseHeight = requestedHeight ?? clampedDimension(Double(baseWidth) / aspect)
 
     let evenWidth = evenCeil(baseWidth)
     let evenHeight = evenCeil(baseHeight)
@@ -134,6 +134,21 @@ public enum DimensionCalculation {
         height: min(evenHeight, maxHeight))
     }
     return CGSize(width: evenWidth, height: evenHeight)
+  }
+
+  /// Largest dimension we will derive from an aspect-ratio projection. Far beyond any real
+  /// frame, but small enough that the subsequent `evenCeil` (+1) cannot overflow `Int`.
+  private static let maxDerivedDimension = Int(Int32.max) - 1
+
+  /// Rounds a projected floating dimension to an `Int` clamped into `[1, maxDerivedDimension]`.
+  ///
+  /// A degenerate aspect projection can round to `0` (tripping `evenCeil`'s `> 0` precondition)
+  /// or, for an absurdly large requested axis, exceed `Int`'s range (an uncatchable trap in the
+  /// `Int(Double)` conversion). Both extremes are clamped rather than fatal — mirroring the
+  /// overflow-safe `CMTime` -> `Int64` conversion in `UpscalingExportSession`.
+  private static func clampedDimension(_ raw: Double) -> Int {
+    guard raw.isFinite, raw >= 1 else { return 1 }
+    return Int(min(raw.rounded(), Double(maxDerivedDimension)))
   }
 }
 

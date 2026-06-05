@@ -51,9 +51,18 @@ actor NonReentrantAsyncGate {
   }
 }
 
+/// Scoped wrapper around `NonReentrantAsyncGate`: acquires the gate, runs `operation`, and
+/// releases exactly once on every exit (normal return, early return, or thrown error),
+/// eliminating the manual acquire/release footgun where a missed `release()` deadlocks the
+/// stage. A failed acquire (the gate observed cancellation) throws `CancellationError` without
+/// releasing, since nothing was taken.
+///
+/// The `isolation:` parameter (SE-0420) runs `operation` on the caller's actor, so stateful
+/// backends can mutate their actor-isolated machine state inside the closure.
 func withNonReentrantGate<T>(
   _ gate: NonReentrantAsyncGate,
-  @_inheritActorContext operation: @Sendable () async throws -> T
+  isolation: isolated (any Actor)? = #isolation,
+  operation: () async throws -> T
 ) async throws -> T {
   guard await gate.acquire() else { throw CancellationError() }
   do {

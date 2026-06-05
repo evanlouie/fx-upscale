@@ -992,17 +992,14 @@ final class AttachmentTimeline: @unchecked Sendable {
   func attachments(for pts: CMTime) -> CFDictionary? {
     lock.lock()
     defer { lock.unlock() }
-    guard !storage.isEmpty else { return nil }
-    if let exact = storage.values.first(where: { $0.pts == pts }) {
-      return exact.attachments
-    }
+    // Single pass: an exact PTS match is by definition the latest source PTS ≤ query, so it can
+    // short-circuit; otherwise track the latest entry at or before `pts`.
     var best: Entry?
-    for entry in storage.values where entry.pts <= pts {
-      if let current = best {
-        if entry.pts > current.pts { best = entry }
-      } else {
-        best = entry
-      }
+    for entry in storage.values {
+      if entry.pts == pts { return entry.attachments }
+      guard entry.pts <= pts else { continue }
+      if let current = best, current.pts >= entry.pts { continue }
+      best = entry
     }
     return best?.attachments
   }
