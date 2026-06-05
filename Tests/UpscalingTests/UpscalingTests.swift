@@ -551,16 +551,35 @@ struct UpscalingFilterTests {
 
 // MARK: - Upscaler Tests
 
-@Suite("Upscaler Tests")
+/// Device probe for Metal + MetalFX availability, mirroring `Upscaler.init?`. Used as an
+/// `.enabled(if:)` condition so environments without a Metal/MetalFX device report the
+/// dependent tests as *skipped* rather than vacuously passing (a bare `return` would report
+/// the test as passed and could mask a constructor regression on a Metal-capable machine).
+func metalFXIsAvailable() -> Bool {
+  guard MTLCreateSystemDefaultDevice() != nil else { return false }
+  #if canImport(MetalFX)
+    return true
+  #else
+    return false
+  #endif
+}
+
+/// Opt-in gate for tests that may trigger a one-time on-device ML model download (the
+/// super-resolution round-trip). Off by default so `swift test` stays hermetic/offline; set the
+/// `FX_RUN_MODEL_DOWNLOAD` environment variable to exercise it.
+func modelDownloadTestsEnabled() -> Bool {
+  ProcessInfo.processInfo.environment["FX_RUN_MODEL_DOWNLOAD"] != nil
+    && VTSuperResolutionScalerConfiguration.isSupported
+}
+
+@Suite("Upscaler Tests", .enabled(if: metalFXIsAvailable()))
 struct UpscalerTests {
   @Test("Upscaler async API produces correct output size")
   func upscalerAsyncAPI() async throws {
     let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
 
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
 
     let inputBuffer = try makeTestPixelBuffer(size: inputSize)
     let outputBuffer = try await upscaler.processSingle(inputBuffer)
@@ -574,9 +593,7 @@ struct UpscalerTests {
     let inputSize = CGSize(width: 1920, height: 800)
     let outputSize = CGSize(width: 3840, height: 1600)
 
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
 
     let inputBuffer = try makeTestPixelBuffer(size: inputSize)
     let outputBuffer = try await upscaler.processSingle(inputBuffer)
@@ -588,12 +605,9 @@ struct UpscalerTests {
   @Test("Upscaler rejects mismatched input size")
   func upscalerRejectsMismatchedInputSize() async throws {
     let upscalerSize = CGSize(width: 640, height: 480)
-    guard
-      let upscaler = Upscaler(
-        inputSize: upscalerSize, outputSize: CGSize(width: 1280, height: 960))
-    else {
-      return
-    }
+    let upscaler = try #require(
+      Upscaler(
+        inputSize: upscalerSize, outputSize: CGSize(width: 1280, height: 960)))
     let wrongBuffer = try makeTestPixelBuffer(size: CGSize(width: 320, height: 240))
     // `CVPixelBuffer` is a CF type that isn't Sendable, and `processSingle` takes a `sending`
     // parameter. Rebinding via `nonisolated(unsafe)` releases the value from the test's
@@ -697,18 +711,16 @@ struct FrameProcessorChainTests {
     }
   }
 
-  @Test("Chain rejects adjacent size mismatch")
+  @Test("Chain rejects adjacent size mismatch", .enabled(if: metalFXIsAvailable()))
   func mismatchedStageSizes() async throws {
-    guard
-      let a = Upscaler(
+    let a = try #require(
+      Upscaler(
         inputSize: CGSize(width: 320, height: 240),
-        outputSize: CGSize(width: 640, height: 480)),
-      let b = Upscaler(
+        outputSize: CGSize(width: 640, height: 480)))
+    let b = try #require(
+      Upscaler(
         inputSize: CGSize(width: 800, height: 600),  // deliberately wrong for chain
-        outputSize: CGSize(width: 1600, height: 1200))
-    else {
-      return
-    }
+        outputSize: CGSize(width: 1600, height: 1200)))
     #expect(throws: FrameProcessorChain.Error.self) {
       _ = try FrameProcessorChain(
         inputSize: CGSize(width: 320, height: 240),
@@ -785,13 +797,11 @@ struct FrameProcessorChainTests {
     }
   }
 
-  @Test("Single-stage chain behaves like the backend")
+  @Test("Single-stage chain behaves like the backend", .enabled(if: metalFXIsAvailable()))
   func singleStagePassthrough() async throws {
     let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
     let chain = try FrameProcessorChain(
       inputSize: inputSize, outputSize: outputSize, stages: [upscaler])
     #expect(chain.inputSize == inputSize)
@@ -900,14 +910,12 @@ try VTMotionBlurProcessor.preflight(
     }
   }
 
-  @Test("Composes after a spatial upscaler in a chain")
+  @Test("Composes after a spatial upscaler in a chain", .enabled(if: metalFXIsAvailable()))
   func composesAfterSpatialUpscaler() async throws {
 let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
 
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
     let supported = try VTMotionBlurProcessor.supportedPixelFormats(frameSize: outputSize)
     guard supported.contains(kCVPixelFormatType_32BGRA) else {
       return
@@ -1068,7 +1076,7 @@ struct TemporalNoiseProcessorTests {
     }
   }
 
-  @Test("Composes before a spatial upscaler in a chain")
+  @Test("Composes before a spatial upscaler in a chain", .enabled(if: metalFXIsAvailable()))
   func composesBeforeSpatialUpscaler() async throws {
     let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
@@ -1079,9 +1087,7 @@ struct TemporalNoiseProcessorTests {
     }
     let denoise = try await VTTemporalNoiseProcessor(
       frameSize: inputSize, strength: 50, pixelFormat: kCVPixelFormatType_32BGRA)
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
     let chain = try FrameProcessorChain(
       inputSize: inputSize, outputSize: outputSize, stages: [denoise, upscaler])
 
@@ -1208,14 +1214,12 @@ struct FrameRateConverterTests {
     #expect(secondFlush.isEmpty)
   }
 
-  @Test("Chain composes after a spatial upscaler")
+  @Test("Chain composes after a spatial upscaler", .enabled(if: metalFXIsAvailable()))
   func composesAfterSpatialUpscaler() async throws {
     let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
 
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
     let supported = try VTFrameRateConverter.supportedPixelFormats(frameSize: outputSize)
     guard supported.contains(kCVPixelFormatType_32BGRA) else {
       return
@@ -1331,16 +1335,6 @@ struct TargetPTSArithmeticTests {
 
 @Suite("Export Session Tests", .serialized)
 struct ExportSessionTests {
-  /// Verifies Metal/MetalFX is available for export tests.
-  private func hasMetalSupport() -> Bool {
-    guard MTLCreateSystemDefaultDevice() != nil else { return false }
-    #if canImport(MetalFX)
-      return true
-    #else
-      return false
-    #endif
-  }
-
   /// Shared fixture: synthesizes a test video, computes a unique output URL under the temp
   /// directory, registers cleanup for both, and constructs an `UpscalingExportSession`
   /// configured by the arguments. The body receives the session, the output URL, and the
@@ -1421,9 +1415,8 @@ struct ExportSessionTests {
     #expect(session.progress.fileURL == url)
   }
 
-  @Test("Basic upscale produces correct output dimensions")
+  @Test("Basic upscale produces correct output dimensions", .enabled(if: metalFXIsAvailable()))
   func basicUpscale() async throws {
-    guard hasMetalSupport() else { return }
     let outputSize = CGSize(width: 640, height: 480)
     try await withExportFixture(outputSize: outputSize) { session, outputURL, _ in
       try await session.export()
@@ -1440,10 +1433,8 @@ struct ExportSessionTests {
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/8
-  @Test("Transformed video preserves transform")
+  @Test("Transformed video preserves transform", .enabled(if: metalFXIsAvailable()))
   func upscaleTransformedVideo() async throws {
-    guard hasMetalSupport() else { return }
-
     let rotationTransform = CGAffineTransform(rotationAngle: .pi / 2)
     try await withExportFixture(transform: rotationTransform) { session, outputURL, _ in
       try await session.export()
@@ -1465,10 +1456,8 @@ struct ExportSessionTests {
   }
 
   /// https://github.com/finnvoor/fx-upscale/commit/e6666afdb9a5ce1eda38437bec25b0743b740360
-  @Test("Missing color info doesn't crash")
+  @Test("Missing color info doesn't crash", .enabled(if: metalFXIsAvailable()))
   func upscaleMissingColorInfo() async throws {
-    guard hasMetalSupport() else { return }
-
     try await withExportFixture { session, outputURL, _ in
       try await session.export()
       #expect(FileManager.default.fileExists(atPath: outputURL.path))
@@ -1564,10 +1553,8 @@ struct ExportSessionTests {
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/7
-  @Test("Audio track is preserved")
+  @Test("Audio track is preserved", .enabled(if: metalFXIsAvailable()))
   func audioFormatMaintained() async throws {
-    guard hasMetalSupport() else { return }
-
     try await withExportFixture(includeAudio: true) { session, outputURL, asset in
       try await session.export()
 
@@ -1581,10 +1568,8 @@ struct ExportSessionTests {
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/6
-  @Test("Metadata is preserved")
+  @Test("Metadata is preserved", .enabled(if: metalFXIsAvailable()))
   func maintainMetadata() async throws {
-    guard hasMetalSupport() else { return }
-
     try await withExportFixture(creator: "TestCreator") { session, outputURL, _ in
       try await session.export()
 
@@ -1614,10 +1599,8 @@ struct ExportSessionTests {
   }
 
   /// https://github.com/finnvoor/fx-upscale/issues/4
-  @Test("Export progress is reported")
+  @Test("Export progress is reported", .enabled(if: metalFXIsAvailable()))
   func exportProgress() async throws {
-    guard hasMetalSupport() else { return }
-
     try await withExportFixture(duration: 1.0, frameRate: 15) { session, outputURL, _ in
       #expect(session.progress.fileURL == outputURL)
 
@@ -1628,10 +1611,8 @@ struct ExportSessionTests {
     }
   }
 
-  @Test("Output file already exists throws error")
+  @Test("Output file already exists throws error", .enabled(if: metalFXIsAvailable()))
   func outputExistsError() async throws {
-    guard hasMetalSupport() else { return }
-
     try await withExportFixture { session, outputURL, _ in
       // Create a zero-byte file at the output URL *before* export, so the pre-flight check
       // inside `export()` throws `outputURLAlreadyExists`.
@@ -1643,10 +1624,8 @@ struct ExportSessionTests {
     }
   }
 
-  @Test("keyFrameInterval parameter is honored without error")
+  @Test("keyFrameInterval parameter is honored without error", .enabled(if: metalFXIsAvailable()))
   func keyFrameIntervalAccepted() async throws {
-    guard hasMetalSupport() else { return }
-
     // Introspecting actual IDR intervals from the muxed output is non-trivial (requires
     // parsing raw NALUs or using AVAssetReader with `trackSample`.attachments to find
     // `kCMSampleAttachmentKey_NotSync`). The lighter contract this test pins down is the
@@ -1671,10 +1650,8 @@ struct ExportSessionTests {
     }
   }
 
-  @Test("quality parameter is honored without error")
+  @Test("quality parameter is honored without error", .enabled(if: metalFXIsAvailable()))
   func qualityAccepted() async throws {
-    guard hasMetalSupport() else { return }
-
     // Export the same source at two quality levels and confirm both succeed. We don't assert
     // a strict "low < high" byte-size relationship because VT's quality-to-bitrate mapping is
     // codec- and content-dependent, and on very short clips the size difference can be
@@ -1761,11 +1738,10 @@ struct ExportSessionTests {
     #expect(!FileManager.default.fileExists(atPath: outputURL.path))
   }
 
-  @Test("Super-resolution path accepts PQ source and round-trips color metadata")
+  @Test(
+    "Super-resolution path accepts PQ source and round-trips color metadata",
+    .enabled(if: modelDownloadTestsEnabled()))
   func superResolutionRoundTripsPQ() async throws {
-    guard VTSuperResolutionScalerConfiguration.isSupported else {
-      return
-    }
     let supported = VTSuperResolutionScalerConfiguration.supportedScaleFactors.sorted()
     let factor = try #require(supported.first)
 
@@ -2056,10 +2032,8 @@ struct ExportSessionTests {
     #expect(timeline.attachments(for: CMTime(value: 900, timescale: timescale)) == nil)
   }
 
-  @Test("Cancelling mid-export cleans up the partial output")
+  @Test("Cancelling mid-export cleans up the partial output", .enabled(if: metalFXIsAvailable()))
   func cancelRemovesPartialOutput() async throws {
-    guard hasMetalSupport() else { return }
-
     // Deterministic approach: inject a `FrameProcessorBackend` via `chainFactory` that
     // signals when the export has reached the first per-frame processing call and then
     // suspends on `Task.sleep` — a cancellation-aware suspension point. The test awaits
@@ -2223,11 +2197,6 @@ struct SuperResolutionProcessingTests {
 
 @Suite("UpscalerKind Preflight")
 struct UpscalerKindPreflightTests {
-  /// Returns whether `VTSuperResolutionScaler` is available on this device.
-  private func hasVTSuperResolutionSupport() -> Bool {
-    VTSuperResolutionScalerConfiguration.isSupported
-  }
-
   @Test("Spatial preflight always succeeds for valid sizes")
   func spatialPreflightSucceeds() throws {
     try UpscalerKind.spatial.preflight(
@@ -2239,9 +2208,8 @@ struct UpscalerKindPreflightTests {
       outputSize: CGSize(width: 2002, height: 1126))
   }
 
-  @Test("Super-resolution preflight rejects non-integer scale factor")
+  @Test("Super-resolution preflight rejects non-integer scale factor", .enabled(if: VTSuperResolutionScalerConfiguration.isSupported))
   func superResolutionRejectsNonIntegerRatio() throws {
-    guard hasVTSuperResolutionSupport() else { return }
     #expect(throws: VTSuperResolutionUpscaler.Error.self) {
       // 1.5× is fractional — not in supportedScaleFactors.
       try UpscalerKind.superResolution.preflight(
@@ -2250,9 +2218,8 @@ struct UpscalerKindPreflightTests {
     }
   }
 
-  @Test("Super-resolution preflight rejects anisotropic scaling")
+  @Test("Super-resolution preflight rejects anisotropic scaling", .enabled(if: VTSuperResolutionScalerConfiguration.isSupported))
   func superResolutionRejectsAnisotropic() throws {
-    guard hasVTSuperResolutionSupport() else { return }
     #expect(throws: VTSuperResolutionUpscaler.Error.self) {
       // 2× width, 3× height.
       try UpscalerKind.superResolution.preflight(
@@ -2261,9 +2228,8 @@ struct UpscalerKindPreflightTests {
     }
   }
 
-  @Test("Super-resolution preflight rejects inputs above 1920x1080 on macOS")
+  @Test("Super-resolution preflight rejects inputs above 1920x1080 on macOS", .enabled(if: VTSuperResolutionScalerConfiguration.isSupported))
   func superResolutionRejectsOversizedInput() throws {
-    guard hasVTSuperResolutionSupport() else { return }
     #expect(throws: VTSuperResolutionUpscaler.Error.self) {
       try UpscalerKind.superResolution.preflight(
         inputSize: CGSize(width: 3840, height: 2160),
@@ -2271,9 +2237,8 @@ struct UpscalerKindPreflightTests {
     }
   }
 
-  @Test("Super-resolution preflight accepts the device's supported scale factors")
+  @Test("Super-resolution preflight accepts the device's supported scale factors", .enabled(if: VTSuperResolutionScalerConfiguration.isSupported))
   func superResolutionAcceptsSupportedFactor() throws {
-    guard hasVTSuperResolutionSupport() else { return }
     // Pick the smallest supported factor so the resulting output fits under the 1920×1080
     // input cap with room to spare. Devices in the wild currently advertise factors like
     // [4], so don't hard-code 2×.
@@ -2370,6 +2335,19 @@ struct DimensionCalculationTests {
       inputSize: CGSize(width: 1080, height: 2400),
       requestedWidth: nil, requestedHeight: 1)
     #expect(tall == CGSize(width: 2, height: 2))
+  }
+
+  @Test("Absurdly large derived dimensions clamp instead of trapping")
+  func derivedHugeAxisIsClamped() throws {
+    // A 2.39:1 source with an enormous --height would project a width beyond `Int`'s range;
+    // the `Int(Double)` conversion used to trap uncatchably. It must clamp to a finite, even
+    // value instead of aborting the process.
+    let out = try DimensionCalculation.calculateOutputDimensions(
+      inputSize: CGSize(width: 3840, height: 1606),
+      requestedWidth: nil, requestedHeight: 5_000_000_000_000_000_000)
+    #expect(out.width > 0)
+    #expect(Int(out.width) % 2 == 0)
+    #expect(Int(out.height) % 2 == 0)
   }
 
   @Test("Non-positive requested width throws")
@@ -2535,14 +2513,12 @@ struct PipelineMetricsTests {
 
   // MARK: FrameProcessorChain metrics integration
 
-  @Test("Chain populates metrics collector during processing")
+  @Test("Chain populates metrics collector during processing", .enabled(if: metalFXIsAvailable()))
   func chainPopulatesMetrics() async throws {
     let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
 
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
 
     let collector = PipelineMetricsCollector()
     let chain = try FrameProcessorChain(
@@ -2563,14 +2539,12 @@ struct PipelineMetricsTests {
     #expect(snapshot.framesEmitted == 1)
   }
 
-  @Test("Chain without collector works normally")
+  @Test("Chain without collector works normally", .enabled(if: metalFXIsAvailable()))
   func chainWithoutCollector() async throws {
     let inputSize = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
 
-    guard let upscaler = Upscaler(inputSize: inputSize, outputSize: outputSize) else {
-      return
-    }
+    let upscaler = try #require(Upscaler(inputSize: inputSize, outputSize: outputSize))
 
     let chain = try FrameProcessorChain(
       inputSize: inputSize, outputSize: outputSize,
@@ -2601,15 +2575,12 @@ struct PipelineMetricsTests {
 
   // MARK: displayName
 
-  @Test("Upscaler has expected display name")
+  @Test("Upscaler has expected display name", .enabled(if: metalFXIsAvailable()))
   func upscalerDisplayName() throws {
-    let u = Upscaler(
-      inputSize: CGSize(width: 320, height: 240),
-      outputSize: CGSize(width: 640, height: 480)
-    )
-    guard let upscaler = u else {
-      return
-    }
+    let upscaler = try #require(
+      Upscaler(
+        inputSize: CGSize(width: 320, height: 240),
+        outputSize: CGSize(width: 640, height: 480)))
     #expect(upscaler.displayName == "MetalFX spatial")
   }
 
@@ -2735,13 +2706,11 @@ struct PipelineChannelTests {
 
 @Suite("Pipeline processAll Tests")
 struct PipelineProcessAllTests {
-  @Test("processAll produces same output as sequential process for single stage")
+  @Test("processAll produces same output as sequential process for single stage", .enabled(if: metalFXIsAvailable()))
   func singleStageEquivalence() async throws {
     let size = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
-    guard let backend = Upscaler(inputSize: size, outputSize: outputSize) else {
-      return
-    }
+    let backend = try #require(Upscaler(inputSize: size, outputSize: outputSize))
     let chain = try FrameProcessorChain(
       inputSize: size, outputSize: outputSize, stages: [backend])
 
@@ -2828,13 +2797,11 @@ struct PipelineProcessAllTests {
     #expect(snapshot[1].completesSource == true)
   }
 
-  @Test("processAll records metrics")
+  @Test("processAll records metrics", .enabled(if: metalFXIsAvailable()))
   func metricsRecording() async throws {
     let size = CGSize(width: 320, height: 240)
     let outputSize = CGSize(width: 640, height: 480)
-    guard let backend = Upscaler(inputSize: size, outputSize: outputSize) else {
-      return
-    }
+    let backend = try #require(Upscaler(inputSize: size, outputSize: outputSize))
     let collector = PipelineMetricsCollector()
     let chain = try FrameProcessorChain(
       inputSize: size, outputSize: outputSize, stages: [backend],
@@ -3210,7 +3177,7 @@ struct CILanczosDownsamplerTests {
 
 // MARK: - Chain Integration with Lanczos
 
-@Suite("Chain with Lanczos")
+@Suite("Chain with Lanczos", .enabled(if: metalFXIsAvailable()))
 struct ChainWithLanczosTests {
   @Test("Scaler + Lanczos produces final size from source")
   func scalerThenLanczos() async throws {
@@ -3218,11 +3185,8 @@ struct ChainWithLanczosTests {
     let scalerOutputSize = CGSize(width: 640, height: 480)
     let finalSize = CGSize(width: 480, height: 360)
 
-    guard
-      let upscaler = Upscaler(inputSize: sourceSize, outputSize: scalerOutputSize)
-    else {
-      return
-    }
+    let upscaler = try #require(
+      Upscaler(inputSize: sourceSize, outputSize: scalerOutputSize))
     let downsampler = try CILanczosDownsampler(
       inputSize: scalerOutputSize, outputSize: finalSize)
 
@@ -3244,13 +3208,10 @@ struct ChainWithLanczosTests {
 
   @Test("Lanczos inputSize must match upstream outputSize or chain init fails")
   func chainRejectsSizeMismatch() async throws {
-    guard
-      let upscaler = Upscaler(
+    let upscaler = try #require(
+      Upscaler(
         inputSize: CGSize(width: 320, height: 240),
-        outputSize: CGSize(width: 640, height: 480))
-    else {
-      return
-    }
+        outputSize: CGSize(width: 640, height: 480)))
     let downsampler = try CILanczosDownsampler(
       inputSize: CGSize(width: 800, height: 600),
       outputSize: CGSize(width: 400, height: 300))
@@ -3269,14 +3230,94 @@ struct ChainWithLanczosTests {
     let scalerOutputSize = CGSize(width: 640, height: 480)
     let finalSize = scalerOutputSize
 
-    guard
-      let upscaler = Upscaler(inputSize: sourceSize, outputSize: scalerOutputSize)
-    else {
-      return
-    }
+    let upscaler = try #require(
+      Upscaler(inputSize: sourceSize, outputSize: scalerOutputSize))
     let chain = try FrameProcessorChain(
       inputSize: sourceSize, outputSize: finalSize, stages: [upscaler])
     #expect(chain.inputSize == sourceSize)
     #expect(chain.outputSize == finalSize)
   }
+}
+
+// MARK: - Temporal Noise Error Messages
+
+/// Device-independent coverage for the `unsupportedPixelFormat` message (DRY-2 parity fix),
+/// including the empty-supported-set "none" branch that all four VT backends share.
+@Suite("Temporal Noise Error Messages")
+struct TemporalNoiseErrorMessageTests {
+  @Test("unsupportedPixelFormat lists the supported formats")
+  func listsSupportedFormats() throws {
+    let error = VTTemporalNoiseProcessor.Error.unsupportedPixelFormat(
+      kCVPixelFormatType_32RGBA,
+      supported: [kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
+    let message = try #require(error.errorDescription)
+    #expect(message.contains("doesn't support pixel format"))
+    #expect(!message.contains("none"))
+    #expect(message.hasSuffix("."))
+  }
+
+  @Test("unsupportedPixelFormat with an empty supported set reads 'none'")
+  func emptySupportedSetReadsNone() throws {
+    let error = VTTemporalNoiseProcessor.Error.unsupportedPixelFormat(
+      kCVPixelFormatType_32RGBA, supported: [])
+    let message = try #require(error.errorDescription)
+    #expect(message.contains("Supported formats: none."))
+  }
+}
+
+// MARK: - Non-Reentrant Gate
+
+/// Direct coverage for `withNonReentrantGate` (DRY-1): the release-exactly-once invariants on
+/// return and throw, plus mutual exclusion. A lost release would deadlock the second acquire,
+/// so these would hang (and fail) rather than pass on a regression.
+@Suite("Non-Reentrant Gate")
+struct NonReentrantGateTests {
+  private struct GateProbeError: Error {}
+
+  @Test("Gate is re-acquirable after the operation returns")
+  func releasesOnReturn() async throws {
+    let gate = NonReentrantAsyncGate()
+    let first = try await withNonReentrantGate(gate) { 1 }
+    #expect(first == 1)
+    let second = try await withNonReentrantGate(gate) { 2 }
+    #expect(second == 2)
+  }
+
+  @Test("Gate is re-acquirable after the operation throws")
+  func releasesOnThrow() async throws {
+    let gate = NonReentrantAsyncGate()
+    await #expect(throws: GateProbeError.self) {
+      try await withNonReentrantGate(gate) { throw GateProbeError() }
+    }
+    let value = try await withNonReentrantGate(gate) { 42 }
+    #expect(value == 42)
+  }
+
+  @Test("Gate serializes overlapping operations to one at a time")
+  func serializesConcurrentOperations() async throws {
+    let gate = NonReentrantAsyncGate()
+    let tracker = ConcurrencyTracker()
+    await withTaskGroup(of: Void.self) { group in
+      for _ in 0..<8 {
+        group.addTask {
+          try? await withNonReentrantGate(gate) {
+            await tracker.enter()
+            try? await Task.sleep(for: .milliseconds(2))
+            await tracker.leave()
+          }
+        }
+      }
+    }
+    #expect(await tracker.maxConcurrent == 1)
+  }
+}
+
+private actor ConcurrencyTracker {
+  private var current = 0
+  private(set) var maxConcurrent = 0
+  func enter() {
+    current += 1
+    maxConcurrent = max(maxConcurrent, current)
+  }
+  func leave() { current -= 1 }
 }

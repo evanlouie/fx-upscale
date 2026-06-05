@@ -1,3 +1,4 @@
+import ArgumentParser
 import Foundation
 import Testing
 @testable import fx_upscale
@@ -56,8 +57,25 @@ struct FXUpscaleCLITests {
     FileManager.default.createFile(atPath: input.path, contents: Data())
 
     let result = try runCLI([input.path] + testCase.arguments)
-    #expect(result.exitCode == 64)
+    #expect(result.exitCode == ExitCode.validationFailure.rawValue)
     #expect(result.output.contains(testCase.message))
+  }
+
+  @Test("Validation errors are written to stderr, not stdout")
+  func validationErrorsGoToStderr() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("fx-upscale-cli-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let input = directory.appendingPathComponent("sample.mp4")
+    FileManager.default.createFile(atPath: input.path, contents: Data())
+
+    let result = try runCLI([input.path, "--scale", "1"])
+    #expect(result.exitCode == ExitCode.validationFailure.rawValue)
+    // ArgumentParser routes validation diagnostics to stderr; nothing should leak to stdout.
+    #expect(result.stderr.contains("--scale must be an integer ≥ 2"))
+    #expect(!result.stdout.contains("--scale must be an integer ≥ 2"))
   }
 
   @Test("Progress renderer degrades cleanly in narrow terminals")
@@ -74,6 +92,22 @@ struct FXUpscaleCLITests {
     let lines = ProgressBar.renderLines(terminalWidth: 20, fraction: 0.95, snapshot: nil)
     #expect(lines.count == 1)
     #expect(visibleText(lines[0]).contains("[█████████▌]"))
+  }
+
+  @Test("Progress renderer fills every cell at 100%")
+  func progressRendererFullBarAtCompletion() {
+    // fraction 1.0 → completed == barCols (10); no partial glyph, no trailing pad.
+    let lines = ProgressBar.renderLines(terminalWidth: 20, fraction: 1.0, snapshot: nil)
+    #expect(lines.count == 1)
+    #expect(visibleText(lines[0]).contains("[██████████]"))
+  }
+
+  @Test("Progress renderer shows an empty bar at 0%")
+  func progressRendererEmptyBarAtStart() {
+    // fraction 0.0 → ten empty cells between the brackets.
+    let lines = ProgressBar.renderLines(terminalWidth: 20, fraction: 0.0, snapshot: nil)
+    #expect(lines.count == 1)
+    #expect(visibleText(lines[0]).contains("[          ]"))
   }
 
   @Test("--force does not remove a directory at the output path")
@@ -104,7 +138,10 @@ struct CLIValidationCase: Sendable, CustomTestStringConvertible {
 
 private struct CLIResult {
   var exitCode: Int32
-  var output: String
+  var stdout: String
+  var stderr: String
+  /// Combined stream view for assertions that don't care about routing.
+  var output: String { stdout + stderr }
 }
 
 private func visibleText(_ string: String) -> String {
@@ -116,28 +153,55 @@ private func runCLI(_ arguments: [String]) throws -> CLIResult {
   process.executableURL = try fxUpscaleExecutableURL()
   process.arguments = arguments
 
-  let pipe = Pipe()
-  process.standardOutput = pipe
-  process.standardError = pipe
+  // Route stdout/stderr to separate temp files rather than pipes: a file sink can't fill a
+  // 64KB pipe buffer, so the child never blocks on write while we wait — no drain deadlock,
+  // and the two streams stay distinguishable for routing assertions.
+  let ioDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("fx-upscale-cli-io-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: ioDirectory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: ioDirectory) }
+  let outURL = ioDirectory.appendingPathComponent("stdout")
+  let errURL = ioDirectory.appendingPathComponent("stderr")
+  FileManager.default.createFile(atPath: outURL.path, contents: nil)
+  FileManager.default.createFile(atPath: errURL.path, contents: nil)
+  let outHandle = try FileHandle(forWritingTo: outURL)
+  let errHandle = try FileHandle(forWritingTo: errURL)
+  process.standardOutput = outHandle
+  process.standardError = errHandle
 
   try process.run()
   process.waitUntilExit()
+  try? outHandle.close()
+  try? errHandle.close()
 
-  let data = pipe.fileHandleForReading.readDataToEndOfFile()
+  let outData = (try? Data(contentsOf: outURL)) ?? Data()
+  let errData = (try? Data(contentsOf: errURL)) ?? Data()
   return CLIResult(
     exitCode: process.terminationStatus,
-    output: String(decoding: data, as: UTF8.self))
+    stdout: String(decoding: outData, as: UTF8.self),
+    stderr: String(decoding: errData, as: UTF8.self))
 }
 
 private func fxUpscaleExecutableURL() throws -> URL {
-  let executable = packageRootURL()
-    .appendingPathComponent(".build")
-    .appendingPathComponent("debug")
-    .appendingPathComponent("fx-upscale")
-  guard FileManager.default.isExecutableFile(atPath: executable.path) else {
-    throw TestFixtureError("fx-upscale executable was not built at \(executable.path)")
+  if let override = ProcessInfo.processInfo.environment["FX_UPSCALE_EXECUTABLE"],
+    FileManager.default.isExecutableFile(atPath: override)
+  {
+    return URL(fileURLWithPath: override)
   }
-  return executable
+  // Honor whichever build configuration produced the binary so `swift test` and
+  // `swift test -c release` both resolve it.
+  let buildDir = packageRootURL().appendingPathComponent(".build")
+  for configuration in ["debug", "release"] {
+    let candidate =
+      buildDir
+      .appendingPathComponent(configuration)
+      .appendingPathComponent("fx-upscale")
+    if FileManager.default.isExecutableFile(atPath: candidate.path) {
+      return candidate
+    }
+  }
+  throw TestFixtureError(
+    "fx-upscale executable was not built under \(buildDir.path) (debug/ or release/)")
 }
 
 private func sampleVideoURL() throws -> URL {

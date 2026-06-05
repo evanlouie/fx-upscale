@@ -30,7 +30,10 @@ let package = Package(
     ),
     .testTarget(
       name: "FXUpscaleCLITests",
-      dependencies: ["fx-upscale"]
+      dependencies: [
+        "fx-upscale",
+        .product(name: "ArgumentParser", package: "swift-argument-parser"),
+      ]
     ),
   ]
 )
